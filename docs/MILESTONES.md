@@ -1,0 +1,18 @@
+| Milestone                             | Nơi làm        | Mục tiêu                                                     | Điều kiện PASS                                                                 |
+| ------------------------------------- | -------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| **M0 – Pivot Skeleton**               | Local          | Tạo cấu trúc `pivot/`, registration, config rỗng hợp lệ      | Import package không lỗi, không sửa ngoài `pivot/`                             |
+| **M1 – Robot Model Audit**            | Local          | Xác nhận base, 12 leg joints, 4 wheel joints, 4 wheel bodies | Có bảng mapping FL/FR/HL/HR chính xác, không còn magic index                   |
+| **M2 – Robot & Actuator Config**      | Local          | Tạo `robot_cfg.py`, load USD, tách leg/wheel actuator        | Config parse được, 16 controlled joints đúng tên                               |
+| **M3 – Pivot Environment Wiring**     | Local          | Tạo `balance_env_cfg.py`, action/obs/scene/contact config    | Env config import được, action dim dự kiến = 16                                |
+| **M4 – Server Simulation Smoke Test** | Server         | Spawn 1 robot trong Isaac Lab                                | Robot đứng đúng, không NaN, joint/body IDs đúng                                |
+| **M5 – Action & Contact Validation**  | Server         | Kiểm tra từng actuator và từng wheel contact                 | 12 leg actions + 4 wheel actions đúng chiều; FL/FR/HL/HR contact đúng          |
+| **M6 – Two-Wheel Reset**              | Local → Server | Implement reset về pose FL+HR support, FR+HL lifted          | Reset 100–500 lần không penetration lớn, không NaN, phần lớn reset recoverable |
+| **M7 – Balance MDP**                  | Local          | Implement reward + termination tối thiểu                     | Có support/lift/balance/drift/action-rate/torque terms; không reward thừa      |
+| **M8 – Balance PPO Smoke Test**       | Server         | Chạy PPO quy mô nhỏ                                          | 16 env, 5–20 iterations chạy ổn, reward finite, không crash                    |
+| **M9 – Balance Learnability**         | Server         | Chứng minh task thực sự học được                             | Episode length tăng, FL+HR contact ratio tăng, FR+HL air ratio tăng            |
+| **M10 – Balance Baseline**            | Server         | Train policy balance usable                                  | Giữ 2 bánh ổn định đủ lâu ở nhiều reset seeds                                  |
+| **M11 – Rotate Task**                 | Local          | Tạo `rotate_env_cfg.py` kế thừa Balance                      | `vx=vy=0`, yaw command hoạt động, thêm yaw reward                              |
+| **M12 – Rotate Smoke Test**           | Server         | Kiểm tra pipeline rotation                                   | 16–256 env chạy ổn, actual yaw phản ứng đúng dấu command                       |
+| **M13 – Rotate Curriculum**           | Server         | Train từ yaw nhỏ đến yaw mục tiêu                            | Track được ±0.2 → ±0.5 → ±1.0 rad/s mà không mất balance                       |
+| **M14 – Robustness**                  | Server         | Thêm randomization nhẹ                                       | Policy vẫn ổn với reset noise/friction/mass/CoM nhẹ                            |
+| **M15 – Final Pivot Baseline**        | Server         | Chốt checkpoint chuẩn trước Phase 4→2 wheel                  | Có model + config + metrics + video + commit hash tái lập được                 |
