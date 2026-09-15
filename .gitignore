@@ -44,3 +44,4 @@ deep_robotics_model/
 deep_robotics_model*
 
 *.zip
+*/build/*
