@@ -2,7 +2,7 @@
 
 ## Scope
 
-You are working on a new reinforcement-learning task for a wheeled quadruped robot.
+You are working on the Pivot reinforcement-learning task for a wheeled quadruped robot.
 
 All implementation work MUST stay inside:
 
@@ -31,7 +31,7 @@ Existing code outside `pivot/` may be imported and reused, but must not be edite
 
 Implement RL environments for a wheeled quadruped that performs in-place rotation while balancing on two diagonal wheels.
 
-The development sequence is:
+Development sequence:
 
 ```text
 Phase A:
@@ -49,71 +49,65 @@ Future Phase C:
 → rotate
 ```
 
-Only Phase A and Phase B are in scope now.
+Only Phase A and Phase B are currently in scope.
 
-Do NOT implement the 4-wheel → 2-wheel transition yet.
+Do NOT implement the 4-wheel → 2-wheel transition unless explicitly requested.
 
 ---
 
 # Target Contact Configuration
 
-Initial target support pair:
+Initial support pair:
 
 ```text
 FL + HR = support wheels
-
 FR + HL = lifted wheels
 ```
 
-The task must keep this pairing explicit.
+Do not automatically alternate diagonal pairs in the initial implementation.
 
-Do not alternate diagonal pairs automatically in the first implementation.
+Robot names and ordering must come from:
 
-Use constants rather than scattering wheel names throughout the code.
+```text
+pivot/config/wheeled/vqr/robot_cfg.py
+```
+
+Use its constants rather than inventing or duplicating names.
 
 ---
 
-# Required Directory Structure
-
-Target structure:
+# Required Structure
 
 ```text
 pivot/
 ├── __init__.py
-│
 ├── mdp/
 │   ├── __init__.py
 │   ├── rewards.py
 │   ├── observations.py
 │   ├── events.py
 │   └── terminations.py
-│
 └── config/
     ├── __init__.py
-    │
     └── wheeled/
         ├── __init__.py
-        │
         └── vqr/
             ├── __init__.py
             ├── robot_cfg.py
             ├── balance_env_cfg.py
             ├── rotate_env_cfg.py
-            │
             └── agents/
                 ├── __init__.py
                 └── rsl_rl_ppo_cfg.py
 ```
 
-Avoid unnecessary files.
-
-Do not duplicate generic implementation that can safely be imported from the existing velocity task.
+Avoid unnecessary files and unnecessary duplication.
 
 ---
 
-# Existing Framework
+# Framework
 
-The repository already uses:
+Keep the existing stack:
 
 ```text
 Isaac Sim
@@ -123,155 +117,293 @@ RSL-RL
 PPO
 ```
 
-Keep this stack.
-
-Do not introduce another RL framework.
-
-Do not implement custom PPO unless explicitly requested.
+Do not introduce another RL framework or a custom PPO implementation unless explicitly requested.
 
 ---
 
-# Robot Model
+# CRITICAL: Command Execution Contract
 
-The user already has:
+This section is authoritative for every agent working in this directory.
 
-```text
-URDF
-USD
-```
+Agents MUST NOT invent launch commands, absolute environment paths, Python executables, task IDs, or script paths.
 
-Prefer loading the USD directly.
+## 1. Repository root
 
-Do not perform runtime URDF conversion unless necessary.
-
-Because files outside `pivot/` cannot be modified, define the robot-specific `ArticulationCfg` inside:
+All project commands must be executed from the repository root: the directory containing both:
 
 ```text
-pivot/config/wheeled/vqr/robot_cfg.py
+scripts/
+source/
 ```
+
+Before running repository scripts, verify the current directory with:
+
+```bash
+pwd
+ls scripts source
+```
+
+If `scripts` and `source` are not both present, do not run training or play commands until the repository root is located.
+
+Do NOT assume a fixed repository path such as:
+
+```text
+/home/robotics/...
+/home/tuanpm/...
+~/IsaacLab/...
+```
+
+The checkout path differs between local and server machines.
+
+## 2. Python environment
+
+Use the `python` executable from the environment that is already activated by the user/session.
+
+Before simulator or training commands, inspect it with:
+
+```bash
+which python
+python --version
+```
+
+This repository expects Python 3.11 with the installed Isaac Lab environment.
+
+Do NOT guess or automatically run a machine-specific activation command such as:
+
+```bash
+conda activate <invented-env-name>
+source /home/.../conda.sh
+```
+
+unless that exact environment/path is already provided by the user or current shell context.
+
+Do NOT use system `/usr/bin/python` when the active Isaac Lab environment provides another interpreter.
+
+## 3. Package import
+
+The normal installation method is editable installation:
+
+```bash
+python -m pip install -e source/rl_training
+```
+
+Do not reinstall the package on every validation run.
+
+Do not add arbitrary `PYTHONPATH` overrides by default.
+
+Only use a temporary `PYTHONPATH` override when diagnosing an existing editable-install mismatch, and state clearly why it is needed.
+
+## 4. Canonical task-registry check
+
+Before training a newly added task, first verify that Gym registration is visible with the repository's existing tool:
+
+```bash
+python scripts/tools/list_envs.py
+```
+
+Confirm the exact expected task ID appears.
+
+Current Pivot task IDs are:
+
+```text
+Pivot-TwoWheelBalance-v0
+Pivot-TwoWheelRotate-v0
+```
+
+Do NOT silently substitute old experimental IDs such as:
+
+```text
+Pivot-VQR-Wheel-v0
+```
+
+unless the user explicitly asks to work on that legacy task.
+
+## 5. Canonical RSL-RL training command
+
+The only normal single-GPU training entrypoint for this repository is:
+
+```bash
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task=<TASK_ID> \
+  --headless
+```
+
+For M1 smoke testing:
+
+```bash
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task=Pivot-TwoWheelBalance-v0 \
+  --num_envs=16 \
+  --max_iterations=2 \
+  --headless
+```
+
+For M2 smoke testing:
+
+```bash
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task=Pivot-TwoWheelRotate-v0 \
+  --num_envs=16 \
+  --max_iterations=2 \
+  --headless
+```
+
+Only add:
+
+```text
+--device cuda:0
+```
+
+when the target machine/device is known or the user explicitly requests it.
+
+Do NOT hard-code `cuda:0` inside environment or PPO config merely because a validation machine uses GPU 0.
+
+Do NOT launch 1024/4096 environments before the small smoke test passes.
+
+## 6. Canonical play command
+
+Use:
+
+```bash
+python scripts/reinforcement_learning/rsl_rl/play.py \
+  --task=<TASK_ID> \
+  --num_envs=1
+```
+
+Add checkpoint arguments only when a real checkpoint path/run is known.
+
+Do not invent checkpoint files or log directories.
+
+## 7. Canonical resume pattern
+
+When the user explicitly asks to resume training, use the repository-supported form:
+
+```bash
+python scripts/reinforcement_learning/rsl_rl/train.py \
+  --task=<TASK_ID> \
+  --resume \
+  --load_run=<RUN_NAME> \
+  --checkpoint=<CHECKPOINT> \
+  --headless
+```
+
+Do not infer `<RUN_NAME>` or `<CHECKPOINT>` if they have not been discovered from the actual logs.
+
+## 8. Multi-GPU
+
+Do not use distributed training unless explicitly requested.
+
+When it is requested, follow the repository pattern:
+
+```bash
+python -m torch.distributed.run \
+  --nnodes=1 \
+  --nproc_per_node=<NUM_GPUS> \
+  scripts/reinforcement_learning/rsl_rl/train.py \
+  --task=<TASK_ID> \
+  --headless \
+  --distributed
+```
+
+Do not invent `torchrun` arguments or assume the number of GPUs.
+
+## 9. Isaac Lab launcher usage
+
+For repository training/play, prefer the repository scripts above.
+
+Do NOT replace them with guessed commands such as:
+
+```bash
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py ...
+python -m <guessed.module> ...
+isaac-sim python ...
+```
+
+unless the user explicitly asks for an IsaacLab-source-tree launch or the repository's standard `python` invocation has been proven unavailable.
+
+The repository README uses direct `python` invocation from the activated Isaac Lab environment; follow that convention.
+
+## 10. One-off validation scripts
+
+Short inline Python diagnostics are allowed, but they must obey these rules:
+
+1. launch `AppLauncher` before importing modules that require the running Isaac Sim application;
+2. import `rl_training.tasks` before querying Gym task registration when needed;
+3. close the environment and simulation app cleanly;
+4. do not present an unexecuted diagnostic as a passed validation;
+5. do not claim CUDA/PhysX runtime success if the current machine cannot create a CUDA scene.
+
+## 11. Never claim a command passed unless it actually ran
+
+Reports must distinguish:
+
+```text
+STRUCTURAL PASS
+IMPORT PASS
+CPU/STATIC CHECK PASS
+SIMULATOR RUNTIME PASS
+PPO SMOKE PASS
+```
+
+If the current machine lacks GPU/driver access, report the runtime test as BLOCKED rather than PASS.
+
+## 12. Before giving the user a command
+
+Verify all of the following:
+
+```text
+script path exists in this repository
+exact task ID is registered
+CLI flag is supported by that script
+command assumes the repository root as cwd
+no invented absolute path is embedded
+environment/device assumptions are stated rather than guessed
+```
+
+If uncertain, inspect the repository first. Do not guess.
 
 ---
 
-# Phase 0 — Model Audit
+# Robot Model and Configuration
 
-Before implementing RL logic, inspect the robot model and determine the exact names of:
+Prefer the existing USD directly. Do not perform runtime URDF conversion unless necessary.
 
-```text
-base link
-
-12 leg joints
-
-4 wheel joints
-
-FL wheel body
-FR wheel body
-HL wheel body
-HR wheel body
-```
-
-The implementation must use the actual names from the model.
-
-Never invent joint names if they can be obtained from the USD or URDF.
-
-Centralize them in `robot_cfg.py`.
-
-Example structure:
-
-```python
-BASE_LINK_NAME = "..."
-
-LEG_JOINT_NAMES = [
-    ...
-]
-
-WHEEL_JOINT_NAMES = [
-    ...
-]
-
-WHEEL_BODY_NAMES = [
-    ...
-]
-
-SUPPORT_WHEEL_NAMES = [
-    "FL wheel body",
-    "HR wheel body",
-]
-
-LIFTED_WHEEL_NAMES = [
-    "FR wheel body",
-    "HL wheel body",
-]
-```
-
-Do not hard-code these values repeatedly elsewhere.
-
----
-
-# Robot Configuration
-
-Create the robot configuration in:
+The robot-specific articulation configuration belongs in:
 
 ```text
 config/wheeled/vqr/robot_cfg.py
 ```
 
-The robot should be a floating-base articulation.
+The robot is floating-base.
 
-Required actuator separation:
+Actuators are separated into:
 
 ```text
 leg actuators
 wheel actuators
 ```
 
-Leg joints should use position-based PD control.
+Legs use position-based PD control.
+Wheels use velocity control.
 
-Wheel joints should use velocity control.
+Use real/existing actuator limits when available. Do not invent aggressive torque or velocity limits.
 
-Conceptually:
+Before changing robot names, inspect the actual USD/URDF and current `robot_cfg.py`.
 
-```text
-Legs:
-    position command
-    stiffness > 0
-    damping > 0
-
-Wheels:
-    velocity command
-    stiffness = 0
-    damping > 0
-```
-
-Use the robot's real or existing model actuator limits whenever available.
-
-Do not invent aggressive torque or velocity limits.
+Never invent joint/body names.
 
 ---
 
 # Action Space
 
-The policy action must contain:
+Policy action:
 
 ```text
 12 leg position residuals
 +
 4 wheel velocity targets
-```
-
-Total:
-
-```text
+=
 16 actions
-```
-
-Architecture:
-
-```text
-Policy
-   │
-   ├── 12 leg q targets
-   │
-   └── 4 wheel velocity targets
 ```
 
 Use:
@@ -280,401 +412,145 @@ Use:
 JointPositionActionCfg
 ```
 
-for leg joints and:
+for legs and:
 
 ```text
 JointVelocityActionCfg
 ```
 
-for wheel joints.
+for wheels.
 
-Initial conservative action scaling:
+Initial conservative scales:
 
 ```text
-leg position scale:
-approximately 0.15–0.20 rad
-
-wheel velocity scale:
-approximately 3–5 rad/s
+leg position: about 0.15–0.20 rad
+wheel velocity: about 3–5 rad/s
 ```
 
-These values may later be tuned.
-
-Do not use direct torque action in the initial task.
+Do not use direct torque actions for the initial tasks.
 
 ---
 
 # Actor Observation
 
-Actor observations should contain only quantities that are realistically deployable on the physical robot.
+Actor observations must be deployable on the physical robot.
 
-Recommended actor observations:
+Recommended terms:
 
 ```text
 base angular velocity
-
 projected gravity
-
-yaw-rate command
-
+yaw-rate command (Rotate only; Balance may omit/zero it)
 leg joint position
-
 leg joint velocity
-
 wheel velocity
-
 previous action
 ```
 
-The actor should NOT directly receive simulator-only quantities such as:
+Do NOT put simulator-only privileged quantities in the actor, including:
 
 ```text
 absolute world position
-
-ground-truth world orientation
-
 ground-truth contact force
-
 perfect base linear velocity
-
 future state
-
 reward information
 ```
 
-unless later explicitly justified for deployment.
+unless explicitly justified.
 
 ---
 
 # Critic Observation
 
-The critic may use privileged simulation information.
-
-Examples:
+The critic may use privileged simulation information, for example:
 
 ```text
 base linear velocity
-
 contact state
-
 contact forces
-
 base height
-
+wheel clearance
 additional simulator state
 ```
 
 Keep actor and critic observation groups separate.
-
-Prefer an asymmetric actor-critic setup.
+Prefer asymmetric actor-critic.
 
 ---
 
 # Phase A — Two-Wheel Balance
 
-Implement:
+Task:
 
 ```text
 Pivot-TwoWheelBalance-v0
 ```
 
-in:
+File:
 
 ```text
 balance_env_cfg.py
 ```
 
-This environment must focus only on balancing on the selected diagonal support pair.
-
-Commands:
-
-```text
-vx_cmd = 0
-
-vy_cmd = 0
-
-yaw_rate_cmd = 0
-```
-
-Do not train rotation yet.
-
----
-
-# Balance Initial State
-
-The Balance environment should reset close to a valid two-wheel configuration.
-
 Target:
 
 ```text
 FL = support/contact
-
 HR = support/contact
-
 FR = lifted
-
 HL = lifted
 ```
 
-The policy should initially learn:
+The Balance task focuses on balance/contact maintenance, not yaw rotation and not the 4-wheel → 2-wheel transition.
+
+Reset near a valid two-wheel state using small perturbations only:
 
 ```text
-balance
-+
-contact maintenance
-```
-
-It should NOT initially learn the entire transition from four-wheel stance.
-
-The two-wheel reset state can include a small nominal body lean if required by the robot geometry.
-
----
-
-# Reset Event
-
-Implement robot reset logic in:
-
-```text
-mdp/events.py
-```
-
-Reset close to the nominal two-wheel state.
-
-Apply only small randomization initially.
-
-Recommended reset noise:
-
-```text
-small joint position perturbation
-
-small roll perturbation
-
-small pitch perturbation
-
+small joint noise
+small roll/pitch noise
 random yaw
-
 small angular velocity
-
 near-zero wheel velocity
 ```
 
-Avoid large perturbations.
+Do not initially add large mass/CoM randomization, pushes, motor-strength randomization, large delay, or strong terrain randomization.
 
-Initial training should NOT use:
-
-```text
-large mass randomization
-
-large CoM randomization
-
-external pushes
-
-large motor-strength randomization
-
-large control delay
-
-strong terrain randomization
-```
-
-First make the nominal task learnable.
-
----
-
-# Balance Rewards
-
-Keep the initial reward set small.
-
-Prefer approximately 5–7 meaningful reward terms.
-
-Do not add dozens of weak or conflicting rewards.
-
-Required categories follow.
-
-## 1. Support contact
-
-Reward maintaining contact on:
+Balance rewards should remain small and purposeful, roughly 5–7 terms:
 
 ```text
-FL
-HR
+support contact
+lifted diagonal / clearance
+balance around nominal equilibrium
+roll/pitch angular stability
+planar drift
+small effort penalty
+action-rate penalty
 ```
 
-The reward should encourage stable support, not excessive impact force.
+Do not force roll=0 and pitch=0 if the physical diagonal equilibrium requires lean.
 
----
+Terminate only clearly unrecoverable states such as torso contact, inversion, excessive attitude error, collapsed height, or excessive drift.
 
-## 2. Lifted diagonal
-
-Encourage:
-
-```text
-FR not in contact
-
-HL not in contact
-```
-
-Also include minimum wheel clearance where appropriate.
-
-Contact state alone is insufficient because a policy may exploit it by keeping a wheel almost touching the ground.
-
----
-
-## 3. Balance
-
-Penalize excessive:
-
-```text
-roll
-
-pitch
-
-roll rate
-
-pitch rate
-```
-
-Do not force:
-
-```text
-roll = 0
-
-pitch = 0
-```
-
-with an extremely strong penalty.
-
-The physically valid two-wheel equilibrium may require body lean.
-
----
-
-## 4. Translational drift
-
-The robot should rotate or balance in place rather than drive away.
-
-For Balance, penalize:
-
-```text
-vx² + vy²
-```
-
-or equivalent planar linear velocity.
-
----
-
-## 5. Torque regularization
-
-Apply a small penalty to leg effort.
-
-Do not make torque minimization dominate balance.
-
----
-
-## 6. Action rate
-
-Penalize rapid changes:
-
-```text
-||a_t - a_(t-1)||²
-```
-
-Use this mainly for smoother and more deployable behavior.
-
----
-
-# Reward Design Principles
-
-Avoid sparse binary-only reward when a smooth formulation is easy to construct.
-
-Prefer continuous signals for:
-
-```text
-orientation error
-
-velocity error
-
-wheel clearance
-
-contact quality
-```
-
-Do not introduce reward terms simply because they exist in the velocity task.
-
-Every enabled reward must have a clear reason related to the pivot task.
-
----
-
-# Termination
-
-Implement custom terminations in:
-
-```text
-mdp/terminations.py
-```
-
-Terminate when clearly unrecoverable.
-
-Examples:
-
-```text
-base/body touches ground
-
-robot is inverted
-
-roll exceeds a large safety threshold
-
-pitch exceeds a large safety threshold
-
-base height collapses
-```
-
-Do NOT immediately terminate because a lifted wheel briefly touches the ground.
-
-Allow short recovery events.
-
-If required, only terminate lifted-wheel contact after it persists for a meaningful duration.
-
----
-
-# Contact Sensors
-
-Use Isaac Lab contact sensors to identify wheel support state.
-
-Verify body IDs before training.
-
-Never assume the wheel ordering returned by the simulator.
-
-Explicitly map:
-
-```text
-FL
-FR
-HL
-HR
-```
-
-to the corresponding body IDs.
-
-All contact-related rewards must be validated with a single robot before large-scale training.
+Do not immediately terminate a brief lifted-wheel touch.
 
 ---
 
 # Phase B — Two-Wheel Rotate
 
-Implement:
+Task:
 
 ```text
 Pivot-TwoWheelRotate-v0
 ```
 
-in:
+File:
 
 ```text
 rotate_env_cfg.py
 ```
 
-The Rotate environment should inherit from the Balance environment.
-
-Do not duplicate the entire Balance configuration.
+Rotate MUST inherit from Balance rather than duplicate it.
 
 Preferred pattern:
 
@@ -683,500 +559,245 @@ class VQRTwoWheelRotateEnvCfg(VQRTwoWheelBalanceEnvCfg):
     ...
 ```
 
-The Rotate task should change only what is required for rotation.
-
----
-
-# Rotate Command
-
-Use yaw-only commands.
-
-Set:
+Keep:
 
 ```text
-vx_cmd = 0
-
-vy_cmd = 0
+FL + HR support
+FR + HL lifted
+16D action space
+Balance reset
+Balance safety terminations
+asymmetric actor-critic
 ```
 
-and:
+Add only the behavior needed for rotation.
+
+Use yaw-only command input.
+Do not add pitch command, gesture phase, or sin/cos phase clock unless explicitly justified.
+
+Start with a conservative yaw-rate range and increase gradually, for example:
 
 ```text
-yaw_rate_cmd ≠ 0
+±0.3
+→ ±0.6
+→ ±1.0
+→ ±1.5 rad/s
 ```
 
-Initial command range:
+Add a yaw-rate tracking reward, for example:
 
 ```text
-[-1.0, 1.0] rad/s
+exp(-(actual_yaw_rate - commanded_yaw_rate)^2 / sigma^2)
 ```
 
-A curriculum is recommended.
+Balance/contact reward must remain strong enough that spinning while falling is not profitable.
 
-Example:
-
-```text
-Stage 1:
-|yaw_rate| <= 0.2 rad/s
-
-Stage 2:
-|yaw_rate| <= 0.5 rad/s
-
-Stage 3:
-|yaw_rate| <= 1.0 rad/s
-```
-
-Do not start with unnecessarily aggressive yaw commands.
-
----
-
-# Rotate Reward
-
-Reuse all valid Balance rewards.
-
-Add a yaw-rate tracking reward such as:
-
-```text
-exp(
-    -(actual_yaw_rate - commanded_yaw_rate)^2
-    / sigma^2
-)
-```
-
-Yaw tracking should become one of the primary positive rewards.
-
-Keep planar drift penalty enabled.
-
-The desired behavior is:
-
-```text
-maintain two-wheel balance
-+
-maintain FL-HR support
-+
-keep FR-HL lifted
-+
-track yaw rate
-+
-avoid translating away
-```
+A curriculum must not increase difficulty based only on episode survival. Use balance/contact/tracking quality where practical.
 
 ---
 
 # PPO Configuration
 
-Use RSL-RL PPO.
-
-Create configuration in:
+Use RSL-RL PPO in:
 
 ```text
 config/wheeled/vqr/agents/rsl_rl_ppo_cfg.py
 ```
 
-Use the existing wheeled M20 PPO configuration as a reference.
-
-Reasonable initial settings:
+Reasonable baseline:
 
 ```text
 num_steps_per_env = 24
-
 gamma = 0.99
-
 lambda = 0.95
-
 clip_param = 0.2
-
 learning_rate = 1e-3
-
-actor hidden dimensions:
-[512, 256, 128]
-
-critic hidden dimensions:
-[512, 256, 128]
-
-activation:
-ELU
+actor hidden dims = [512, 256, 128]
+critic hidden dims = [512, 256, 128]
+activation = ELU
 ```
 
-Do not perform extensive PPO hyperparameter tuning before verifying the environment.
+Do not tune PPO to hide incorrect physics, indexing, reset, contacts, observations, or rewards.
 
 ---
 
 # Environment Registration
 
-Register:
-
-```text
-Pivot-TwoWheelBalance-v0
-
-Pivot-TwoWheelRotate-v0
-```
-
-under:
+Register Pivot tasks under:
 
 ```text
 config/wheeled/vqr/__init__.py
 ```
 
-Use:
+using:
 
 ```text
 isaaclab.envs:ManagerBasedRLEnv
 ```
 
-as the entry point.
+Current task IDs:
 
-Ensure the parent `__init__.py` files import the required modules so Gym registration is executed.
+```text
+Pivot-TwoWheelBalance-v0
+Pivot-TwoWheelRotate-v0
+```
+
+Ensure parent `__init__.py` files import the modules required for registration.
 
 ---
 
 # Required Validation Order
 
-Do not immediately launch a large training run.
+Never jump directly to large-scale training.
 
-Validate in this order.
+Use this order:
 
-## Step 1 — Robot load
+```text
+1. task registry
+2. robot load
+3. joint/body mapping
+4. 16D action mapping
+5. wheel contact mapping
+6. reset pose
+7. random-action finite-value test
+8. 16-env PPO smoke test
+9. 256 envs
+10. 1024+ envs
+```
 
-Run one robot.
-
-Verify:
+For robot load verify:
 
 ```text
 USD loads
-
-articulation valid
-
-base is floating
-
+floating articulation valid
 joint count correct
-
-wheel joint count correct
-
+wheel count correct
 no NaN
-
-no invalid inertia failure
+no invalid-inertia failure
 ```
 
----
-
-## Step 2 — Joint mapping
-
-Print or inspect:
-
-```text
-joint names
-
-joint IDs
-
-body names
-
-body IDs
-```
-
-Confirm all 16 controlled joints.
-
----
-
-## Step 3 — Action mapping
-
-Manually verify:
-
-```text
-each leg action moves the intended joint
-
-each wheel velocity action rotates the intended wheel
-
-sign convention is correct
-```
-
----
-
-## Step 4 — Contact mapping
-
-Verify contact signals individually for:
+For contact mapping explicitly resolve and verify:
 
 ```text
 FL
-
 FR
-
 HL
-
 HR
 ```
 
-Do not continue if wheel contact IDs are incorrect.
+Never assume simulator body ordering.
 
----
-
-## Step 5 — Reset
-
-Verify the Balance environment repeatedly resets near the intended two-wheel configuration.
-
-No reset may produce:
+For reset validation check:
 
 ```text
-NaN
-
-invalid joint state
-
-extreme penetration
-
-explosive contact forces
-
-immediate unrecoverable pose
+FL + HR support contacts
+FR + HL lifted initially
+finite state/reward/observations
+reasonable penetration
+no explosive reset impulse
+no immediate unrecoverable pose
 ```
 
----
-
-## Step 6 — Random-action test
-
-Run a small number of environments using random actions.
-
-Check:
+For Rotate additionally check:
 
 ```text
-reward finite
-
-observations finite
-
-actions finite
-
-termination finite
-
-reset works
+yaw command sampling
+yaw-rate tracking signal
+actor observation dimension after command insertion
 ```
-
----
-
-## Step 7 — PPO smoke test
-
-Run approximately:
-
-```text
-16 environments
-
-1–2 iterations
-```
-
-before large-scale training.
-
-The purpose is only to verify the training pipeline.
-
----
-
-## Step 8 — Scale gradually
-
-Recommended sequence:
-
-```text
-16 envs
-↓
-256 envs
-↓
-1024+ envs
-```
-
-Only scale after the previous level is stable.
 
 ---
 
 # Required Metrics
 
-Do not judge training only from total episode reward.
+Do not evaluate training from total reward alone.
 
 Log or expose at least:
 
 ```text
 actual yaw rate
-
 commanded yaw rate
-
 yaw-rate tracking error
-
 base vx
-
 base vy
-
 roll
-
 pitch
-
 roll rate
-
 pitch rate
-
 FL contact status
-
 FR contact status
-
 HL contact status
-
 HR contact status
-
-FR wheel clearance
-
-HL wheel clearance
-
+FR clearance
+HL clearance
 episode length
-
 termination reason
 ```
 
-For Balance, yaw-related metrics can remain near zero.
-
+For Balance, yaw metrics may remain zero/unused.
 For Rotate, yaw tracking must be explicitly evaluated.
 
 ---
 
-# Debugging Priorities
+# Debugging Priority
 
-When training behaves incorrectly, debug in this order:
+When behavior is wrong, debug in this order:
 
 ```text
 1. robot model
-
 2. joint mapping
-
 3. action mapping
-
 4. contact mapping
-
 5. reset pose
-
 6. termination
-
 7. observation
-
 8. reward
-
 9. PPO
 ```
 
-Do not tune PPO to compensate for incorrect physics or incorrect indexing.
+Do not tune PPO to compensate for an environment bug.
 
 ---
 
 # Code Reuse
 
-Reuse existing generic MDP functions where appropriate.
+Reuse compatible generic MDP functions from the existing locomotion implementation where appropriate.
 
-For example, generic functions for:
-
-```text
-projected gravity
-
-angular velocity
-
-joint states
-
-previous action
-
-action-rate penalty
-
-yaw-rate tracking
-```
-
-may be imported from the existing locomotion implementation if compatible.
-
-Do not copy large amounts of generic code into `pivot/` without reason.
-
-However, pivot-specific logic such as:
+Pivot-specific logic such as:
 
 ```text
 diagonal support reward
-
 lifted-wheel clearance
-
 pivot termination
-
 two-wheel reset
 ```
 
 should live under `pivot/mdp/`.
 
----
-
-# Do Not Modify Existing Velocity Task
-
-The existing:
-
-```text
-tasks/manager_based/locomotion/velocity/
-```
-
-task is reference code only.
-
-Never modify it while implementing Pivot.
-
-If functionality needs to differ from Velocity, implement a Pivot-specific version.
+The existing velocity task is reference code only and must not be modified.
 
 ---
 
 # Out of Scope
 
-Do NOT implement the following yet:
+Unless explicitly requested, do NOT implement:
 
 ```text
 4-wheel → 2-wheel transition
-
 automatic diagonal switching
-
 rough terrain
-
 jumping
-
 external disturbance recovery
-
 large domain randomization
-
 recurrent policies
-
-transformer policies
-
+transformers
 imitation learning
-
 AMP
-
 direct torque policies
-
 custom RL algorithms
-
 hardware deployment
-
 ONNX export
 ```
-
-These are later phases.
-
----
-
-# Future Phase
-
-After both initial environments work, the next task will be approximately:
-
-```text
-Pivot-FourToTwoWheelRotate-v0
-```
-
-It will train:
-
-```text
-4-wheel stance
-
-→ CoM shift
-
-→ unload FR-HL
-
-→ lift FR-HL
-
-→ stabilize FL-HR support
-
-→ rotate
-```
-
-Do not preemptively implement this now.
 
 ---
 
@@ -1185,28 +806,20 @@ Do not preemptively implement this now.
 `Pivot-TwoWheelBalance-v0` is complete only when:
 
 ```text
+task appears in scripts/tools/list_envs.py
 environment registration works
-
 USD robot spawns correctly
-
 16 actions map correctly
-
 actor observations are valid
-
 critic observations are valid
-
 wheel contact mapping is verified
-
-two-wheel reset is stable
-
+two-wheel reset is valid
 reward values remain finite
-
 termination behaves correctly
-
-16-env PPO smoke test passes
-
-training shows increasing ability to maintain FL-HR support
+16-env PPO smoke test actually runs
 ```
+
+Do not report runtime/PPO PASS if the required simulator/GPU test was not executed.
 
 ---
 
@@ -1216,22 +829,15 @@ training shows increasing ability to maintain FL-HR support
 
 ```text
 it inherits from Balance
-
 yaw-only command is implemented
-
 yaw tracking reward is implemented
-
 FL-HR support remains enforced
-
 FR-HL lifted behavior remains enforced
-
 planar drift remains controlled
-
-PPO smoke test passes
-
+task appears in scripts/tools/list_envs.py
+16-env PPO smoke test actually runs
 yaw tracking metrics are logged
-
-the task can train without NaN or invalid simulation state
+training runs without NaN or invalid simulation state
 ```
 
 ---
@@ -1242,15 +848,10 @@ Prefer:
 
 ```text
 small changes
-
 clear names
-
 explicit constants
-
 inheritance
-
 reusable functions
-
 minimal duplication
 ```
 
@@ -1258,21 +859,19 @@ Avoid:
 
 ```text
 magic indices
-
 magic joint ordering
-
 duplicated configs
-
 huge reward lists
-
 silent exception handling
-
 hard-coded simulator body IDs
-
-unnecessary abstractions
+hard-coded machine paths
+hard-coded cuda:0 in task config
+invented task IDs
+invented CLI flags
+invented launch scripts
 ```
 
-When assumptions are unavoidable, document them directly next to the code.
+When an assumption is unavoidable, document it next to the code.
 
 ---
 
@@ -1280,29 +879,26 @@ When assumptions are unavoidable, document them directly next to the code.
 
 Implement one validated milestone at a time.
 
-For every milestone:
+For each milestone:
 
 ```text
-implement
-→ run minimal validation
+inspect existing code
+→ implement
+→ verify registry/import
+→ run minimal simulator validation when available
+→ run PPO smoke test when available
 → fix failures
-→ report result
+→ report exactly what was and was not executed
 → continue
 ```
 
-Do not implement all phases before testing the early ones.
+If a model name, task ID, script path, CLI flag, actuator property, contact mapping, environment, device, or checkpoint is uncertain, inspect the repository/current runtime instead of guessing.
 
-If a model, joint name, actuator property, or contact mapping is uncertain, inspect the existing URDF/USD or repository configuration instead of guessing.
-
-The immediate priority is:
+Most importantly:
 
 ```text
-correct model
-→ correct action mapping
-→ correct two-wheel reset
-→ correct contact reward
-→ Balance task
-→ Rotate task
+NEVER invent a command.
+NEVER invent an absolute path.
+NEVER invent a task ID.
+NEVER call a validation PASS if it was not executed successfully.
 ```
-
-Optimization and tuning come later.
