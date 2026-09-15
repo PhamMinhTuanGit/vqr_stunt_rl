@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import torch
 from typing import TYPE_CHECKING, Sequence
-
+from dataclasses import MISSING 
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.utils import configclass
 
@@ -185,3 +185,64 @@ class DiscreteCommandControllerCfg(CommandTermCfg):
     List of available discrete commands, where each element is an integer.
     Example: [10, 20, 30, 40, 50]
     """
+#Phần command cho task pivot 
+#
+class PivotCommand(CommandTerm):
+    """Lệnh: [yaw_rate*, pitch*, sin(phi), cos(phi)]"""
+    cfg: "PivotCommandCfg"
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env) #Khởi tạo các biến cần thiết 
+        self.robot = env.scene[cfg.asset_name] 
+        self._cmd  = torch.zeros(self.num_envs, 4, device=self.device)
+        self._freq = torch.zeros(self.num_envs, device=self.device)
+        self._phase = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_yaw_rate"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_pitch"]    = torch.zeros(self.num_envs, device=self.device)
+
+    def __str__(self):
+        return f"PivotCommand: yaw{self.cfg.ang_vel_z} pitch{self.cfg.pitch_target}"
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self._cmd                       # (N, 4) (4,4) 
+
+    @property
+    def pitch_cmd(self) -> torch.Tensor:
+        return self._cmd[:, 1]
+
+    def _resample_command(self, env_ids):
+        n = len(env_ids)
+        r = lambda rng: torch.empty(n, device=self.device).uniform_(*rng)
+        self._cmd[env_ids, 0] = r(self.cfg.ang_vel_z)
+        self._cmd[env_ids, 1] = r(self.cfg.pitch_target)
+        self._freq[env_ids]   = r(self.cfg.gesture_freq)
+        self._phase[env_ids]  = torch.rand(n, device=self.device) * 2 * math.pi
+        # một phần env yêu cầu đứng yên (yaw=0) để giữ kỹ năng thăng bằng thuần
+        zero = torch.rand(n, device=self.device) < self.cfg.rel_standing_envs
+        self._cmd[env_ids[zero], 0] = 0.0
+
+    def _update_command(self):
+        self._phase = (self._phase + 2 * math.pi * self._freq * self._env.step_dt) % (2 * math.pi) #(phi_k+1 = phi_k + 2*pi*f*dt)%(2*pi) chioa lấy phần dư của 2 pi lấy pha hiện tại
+        self._cmd[:, 2] = torch.sin(self._phase)
+        self._cmd[:, 3] = torch.cos(self._phase)
+
+    def _update_metrics(self):
+        self.metrics["error_yaw_rate"] += torch.abs(
+            self._cmd[:, 0] - self.robot.data.root_ang_vel_b[:, 2]) / self._env.max_episode_length
+        g = self.robot.data.projected_gravity_b
+        pitch = torch.atan2(-g[:, 0], -g[:, 2])
+        self.metrics["error_pitch"] += torch.abs(self._cmd[:, 1] - pitch) / self._env.max_episode_length
+
+    def _set_debug_vis_impl(self, debug_vis):   # bỏ qua cho gọn
+        pass
+
+
+@configclass
+class PivotCommandCfg(CommandTermCfg):
+    class_type: type = PivotCommand
+    asset_name: str = MISSING
+    ang_vel_z: tuple[float, float]    = (-3.0, 3.0)
+    pitch_target: tuple[float, float] = (0.9, 1.2)
+    gesture_freq: tuple[float, float] = (0.5, 1.5)
+    rel_standing_envs: float = 0.2

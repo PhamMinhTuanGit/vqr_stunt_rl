@@ -1,3 +1,4 @@
+
 # Copyright (c) 2025 Deep Robotics
 # SPDX-License-Identifier: BSD 3-Clause
 
@@ -1112,3 +1113,79 @@ def lin_vel_xy_l2_with_ang_z_command(
     # reward *= torch.sum(torch.square(env.command_manager.get_command(command_name)[:, 2:]), dim=1) > command_threshold
     # reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
+
+#Phần reward cho task pivot 
+# mdp/rewards.py
+
+
+
+def _pitch(env, asset_cfg=SceneEntityCfg("robot")):
+    g = env.scene[asset_cfg.name].data.projected_gravity_b
+    return torch.atan2(-g[:, 0], -g[:, 2])          # 0 = nằm ngang, + = ngửa mũi lên
+
+
+# ---------- 1. giữ tư thế wheelie ----------
+def pivot_pitch_tracking(env, std: float, command_name: str = "pivot"):
+    tgt = env.command_manager.get_command(command_name)[:, 1]
+    return torch.exp(-torch.square(_pitch(env) - tgt) / std**2)
+
+
+def front_wheels_height(env, target_h: float, asset_cfg: SceneEntityCfg):
+    """asset_cfg.body_names = ['fl_wheel', 'fr_wheel']"""
+    asset = env.scene[asset_cfg.name]
+    h = asset.data.body_pos_w[:, asset_cfg.body_ids, 2] - env.scene.env_origins[:, 2].unsqueeze(-1)
+    return torch.clamp(h.mean(dim=1) / target_h, max=1.0)
+
+
+def rear_only_contact(env, front_cfg: SceneEntityCfg, rear_cfg: SceneEntityCfg, thr: float = 1.0):
+    cs = env.scene.sensors
+    f = cs[front_cfg.name].data.net_forces_w_history[:, :, front_cfg.body_ids].norm(dim=-1).amax(dim=1)
+    r = cs[rear_cfg.name].data.net_forces_w_history[:, :, rear_cfg.body_ids].norm(dim=-1).amax(dim=1)
+    return (r > thr).all(dim=1).float() - (f > thr).any(dim=1).float()
+
+
+# ---------- 2. xoay tại chỗ ----------
+def pivot_yaw_tracking(env, std: float, command_name: str = "pivot"):
+    tgt = env.command_manager.get_command(command_name)[:, 0]
+    w   = env.scene["robot"].data.root_ang_vel_b[:, 2]
+    return torch.exp(-torch.square(w - tgt) / std**2)
+
+
+def stay_in_place(env, std: float, asset_cfg=SceneEntityCfg("robot")):
+    """'Tại chỗ' = phạt theo VỊ TRÍ world, KHÔNG dùng track_lin_vel (xem mục 6)."""
+    p = env.scene[asset_cfg.name].data.root_pos_w[:, :2] - env.scene.env_origins[:, :2]
+    return torch.exp(-torch.sum(torch.square(p), dim=1) / std**2)
+
+
+def flat_roll_only(env, asset_cfg=SceneEntityCfg("robot")):
+    """Thay cho flat_orientation_l2: CHỈ phạt roll, KHÔNG phạt pitch."""
+    return torch.square(env.scene[asset_cfg.name].data.projected_gravity_b[:, 1])
+
+
+# ---------- 3. động tác biểu diễn ----------
+def gesture_tracking(env, std: float, amp: float, command_name: str, asset_cfg: SceneEntityCfg):
+    """asset_cfg.joint_names = khớp hipy/knee của 2 chân trước (thứ tự: fl_hipy, fr_hipy, fl_knee, fr_knee)."""
+    asset = env.scene[asset_cfg.name]
+    cmd   = env.command_manager.get_command(command_name)
+    s, c  = cmd[:, 2:3], cmd[:, 3:4]
+    q0    = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    n     = len(asset_cfg.joint_ids) // 2
+    # 2 chân trước lệch pha 180° -> vẫy so le cho đẹp
+    ref   = q0 + amp * torch.cat([s, -s], dim=1).repeat(1, n)
+    q     = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    return torch.exp(-torch.sum(torch.square(q - ref), dim=1) / std**2)
+
+
+def front_wheel_spin(env, target_speed: float, asset_cfg: SceneEntityCfg):
+    """Cho 2 bánh trước quay tít khi lơ lửng — hiệu ứng biểu diễn (weight DƯƠNG)."""
+    v = env.scene[asset_cfg.name].data.joint_vel[:, asset_cfg.joint_ids]
+    return torch.exp(-torch.square(v.abs().mean(dim=1) - target_speed) / (0.3 * target_speed) ** 2)
+
+
+def pitch_collapsed(env, min_pitch: float, grace_s: float):
+    grace = int(grace_s / env.step_dt)
+    return (_pitch(env) < min_pitch) & (env.episode_length_buf > grace)
+
+def drifted_away(env, max_dist: float):
+    p = env.scene["robot"].data.root_pos_w[:, :2] - env.scene.env_origins[:, :2]
+    return p.norm(dim=1) > max_dist

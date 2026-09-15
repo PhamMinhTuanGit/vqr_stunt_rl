@@ -95,3 +95,11 @@ def command_levels_vel(
             base_velocity_ranges.lin_vel_y = new_vel_y.tolist()
 
     return torch.tensor(base_velocity_ranges.lin_vel_x[1], device=env.device)
+
+def pivot_yaw_curriculum(env, env_ids, command_name: str, max_yaw: float, step: float):
+    term = env.command_manager.get_term(command_name)
+    ok = env.episode_length_buf[env_ids].float().mean() > 0.8 * env.max_episode_length
+    if ok:
+        hi = min(term.cfg.ang_vel_z[1] + step, max_yaw)
+        term.cfg.ang_vel_z = (-hi, hi)
+    return torch.tensor(term.cfg.ang_vel_z[1], device=env.device)

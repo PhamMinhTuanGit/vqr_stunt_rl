@@ -76,3 +76,15 @@ class VQRWheelFlatPPORunnerCfg(VQRWheelRoughPPORunnerCfg):
 
         self.max_iterations = 5000
         self.experiment_name = "vqr_wheel_flat"
+
+
+@configclass
+class VQRWheelPivotPPORunnerCfg(VQRWheelRoughPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "vqr_wheel_pivot"
+        self.max_iterations  = 10000
+        self.num_steps_per_env = 24
+        self.algorithm.entropy_coef = 0.008      # cao hơn locomotion: cần explore tư thế lạ
+        self.algorithm.desired_kl = 0.01
+
