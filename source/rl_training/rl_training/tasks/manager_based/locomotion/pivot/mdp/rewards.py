@@ -108,6 +108,109 @@ def pivot_leg_effort_l2(
     return torch.sum(asset.data.applied_torque[:, asset_cfg.joint_ids].square(), dim=1)
 
 
+def pivot_track_yaw_rate(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward body-frame yaw rate tracking with an exponential kernel."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    yaw_rate_command = env.command_manager.get_command(command_name)[:, 2]
+    error = asset.data.root_ang_vel_b[:, 2] - yaw_rate_command
+    return torch.exp(-error.square() / std**2)
+
+
+def _scalar_command(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Return a scalar command as a one-dimensional environment batch."""
+    command = env.command_manager.get_command(command_name)
+    if command.shape[1] != 1:
+        raise ValueError(f"Command '{command_name}' must be scalar, received shape {tuple(command.shape)}.")
+    return command[:, 0]
+
+
+def _wheel_clearance(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    wheel_radius: float,
+) -> torch.Tensor:
+    """Return selected wheel-bottom heights relative to the local ground plane."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    ground_height = env.scene.env_origins[:, 2].unsqueeze(-1)
+    return wheel_height - ground_height - wheel_radius
+
+
+def m3_four_wheel_support(
+    env: ManagerBasedRLEnv,
+    lift_command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Reward four-wheel contact while the lift command is near zero."""
+    lift = _scalar_command(env, lift_command_name)
+    contact_score = _wheel_contact_state(env, sensor_cfg, threshold).float().mean(dim=1)
+    return (1.0 - lift) * contact_score
+
+
+def m3_diagonal_support(
+    env: ManagerBasedRLEnv,
+    lift_command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Reward FL-HR support in proportion to the commanded lift progress."""
+    lift = _scalar_command(env, lift_command_name)
+    support_score = _wheel_contact_state(env, sensor_cfg, threshold).float().mean(dim=1)
+    return lift * support_score
+
+
+def m3_lifted_diagonal(
+    env: ManagerBasedRLEnv,
+    lift_command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg,
+    wheel_radius: float,
+    target_clearance: float,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Reward both FR and HL being clear, using the weaker wheel's score."""
+    lift = _scalar_command(env, lift_command_name)
+    in_contact = _wheel_contact_state(env, sensor_cfg, threshold)
+    clearance = _wheel_clearance(env, asset_cfg, wheel_radius)
+    clearance_score = torch.clamp(clearance / target_clearance, min=0.0, max=1.0)
+    per_wheel_score = 0.5 * (~in_contact).float() + 0.5 * clearance_score
+    return lift * per_wheel_score.amin(dim=1)
+
+
+def m3_track_yaw_rate(
+    env: ManagerBasedRLEnv,
+    yaw_command_name: str,
+    lift_command_name: str,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Track yaw only as the policy is asked to enter two-wheel support."""
+    lift = _scalar_command(env, lift_command_name)
+    return lift * pivot_track_yaw_rate(env, yaw_command_name, std, asset_cfg)
+
+
+def m3_xy_displacement_dead_zone(
+    env: ManagerBasedRLEnv,
+    dead_zone: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize squared XY displacement beyond a radius around the reset pose."""
+    if not hasattr(env, "_pivot_reset_root_xy"):
+        raise RuntimeError("M3 reset XY buffer is unavailable; reset_four_wheel_standing must run first.")
+    asset: Articulation = env.scene[asset_cfg.name]
+    displacement = torch.linalg.vector_norm(
+        asset.data.root_pos_w[:, :2] - env._pivot_reset_root_xy,
+        dim=1,
+    )
+    return torch.clamp(displacement - dead_zone, min=0.0).square()
+
+
 # Global curriculum scalar in [0, 1], updated from terrain-level mean.
 gait_level: float = 0.0
 

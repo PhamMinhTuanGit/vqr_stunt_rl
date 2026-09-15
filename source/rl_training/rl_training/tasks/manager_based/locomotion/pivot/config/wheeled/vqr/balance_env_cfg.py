@@ -124,6 +124,8 @@ class ObservationsCfg:
             func=mdp.projected_gravity,
             noise=Unoise(n_min=-0.02, n_max=0.02),
         )
+        # M2 overrides this extension point; it remains disabled for M1.
+        yaw_rate_command = None
         leg_joint_pos = ObsTerm(
             func=mdp.joint_pos_rel,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES, preserve_order=True)},
@@ -151,6 +153,8 @@ class ObservationsCfg:
     class CriticCfg(ObsGroup):
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.25)
         projected_gravity = ObsTerm(func=mdp.projected_gravity)
+        # M2 overrides this extension point; it remains disabled for M1.
+        yaw_rate_command = None
         leg_joint_pos = ObsTerm(
             func=mdp.joint_pos_rel,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES, preserve_order=True)},

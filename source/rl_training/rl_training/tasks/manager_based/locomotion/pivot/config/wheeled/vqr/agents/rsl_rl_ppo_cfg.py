@@ -39,3 +39,17 @@ class VQRTwoWheelBalancePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class VQRTwoWheelRotatePPORunnerCfg(VQRTwoWheelBalancePPORunnerCfg):
+    """Use the M1 PPO settings while keeping M2 logs separate."""
+
+    experiment_name = "vqr_two_wheel_rotate"
+
+
+@configclass
+class VQRFourToTwoWheelRotatePPORunnerCfg(VQRTwoWheelRotatePPORunnerCfg):
+    """Reuse the M2 PPO settings while keeping M3 runs separate."""
+
+    experiment_name = "vqr_four_to_two_wheel_rotate"

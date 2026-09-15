@@ -42,3 +42,29 @@ gym.register(
         ),
     },
 )
+
+gym.register(
+    id="Pivot-TwoWheelRotate-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rotate_env_cfg:VQRTwoWheelRotateEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:VQRTwoWheelRotatePPORunnerCfg"
+        ),
+    },
+)
+
+gym.register(
+    id="Pivot-FourToTwoWheelRotate-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.four_to_two_rotate_env_cfg:VQRFourToTwoWheelRotateEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:VQRFourToTwoWheelRotatePPORunnerCfg"
+        ),
+    },
+)

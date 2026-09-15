@@ -84,6 +84,47 @@ def reset_two_wheel_diagonal(
     asset.write_joint_state_to_sim(joint_pos, joint_vel, joint_ids=joint_ids, env_ids=env_ids)
 
 
+def reset_four_wheel_standing(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    nominal_joint_positions: list[float],
+    leg_joint_count: int,
+    root_height: float,
+    joint_position_noise: tuple[float, float],
+    leg_velocity_noise: tuple[float, float],
+    wheel_velocity_noise: tuple[float, float],
+    roll_noise: tuple[float, float],
+    pitch_noise: tuple[float, float],
+    yaw_range: tuple[float, float],
+    angular_velocity_noise: tuple[float, float],
+    root_xy_noise: tuple[float, float] = (-0.01, 0.01),
+):
+    """Reset M3 around the audited four-wheel standing pose."""
+    reset_two_wheel_diagonal(
+        env=env,
+        env_ids=env_ids,
+        asset_cfg=asset_cfg,
+        nominal_joint_positions=nominal_joint_positions,
+        leg_joint_count=leg_joint_count,
+        root_height=root_height,
+        nominal_roll=0.0,
+        nominal_pitch=0.0,
+        joint_position_noise=joint_position_noise,
+        leg_velocity_noise=leg_velocity_noise,
+        wheel_velocity_noise=wheel_velocity_noise,
+        roll_noise=roll_noise,
+        pitch_noise=pitch_noise,
+        yaw_range=yaw_range,
+        angular_velocity_noise=angular_velocity_noise,
+        root_xy_noise=root_xy_noise,
+    )
+    asset: Articulation = env.scene[asset_cfg.name]
+    if not hasattr(env, "_pivot_reset_root_xy"):
+        env._pivot_reset_root_xy = torch.zeros((env.num_envs, 2), device=asset.device)
+    env._pivot_reset_root_xy[env_ids] = asset.data.root_pos_w[env_ids, :2]
+
+
 def randomize_rigid_body_inertia(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor | None,

@@ -9,13 +9,179 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING, Sequence
 from dataclasses import MISSING 
+from isaaclab.assets import Articulation
 from isaaclab.managers import CommandTerm, CommandTermCfg
+from isaaclab.sensors import ContactSensor
 from isaaclab.utils import configclass
 
 import rl_training.tasks.manager_based.locomotion.velocity.mdp as mdp
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
+
+
+class EpisodeLiftCommand(CommandTerm):
+    """Expose a scheduled lift request without writing actions or robot state."""
+
+    cfg: "EpisodeLiftCommandCfg"
+
+    def __init__(self, cfg: "EpisodeLiftCommandCfg", env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        if not 0.0 <= cfg.hold_time_s < cfg.ramp_end_time_s:
+            raise ValueError("Expected 0 <= hold_time_s < ramp_end_time_s for lift command.")
+        self._command = torch.zeros((self.num_envs, 1), device=self.device)
+        self._robot: Articulation = env.scene[cfg.asset_name]
+        self._contact_sensor: ContactSensor = env.scene.sensors[cfg.contact_sensor_name]
+        self._wheel_contact_ids = self._contact_sensor.find_bodies(
+            cfg.wheel_body_names, preserve_order=True
+        )[0]
+        self._support_contact_ids = self._contact_sensor.find_bodies(
+            cfg.support_wheel_names, preserve_order=True
+        )[0]
+        self._lifted_contact_ids = self._contact_sensor.find_bodies(
+            cfg.lifted_wheel_names, preserve_order=True
+        )[0]
+        self._lifted_body_ids = self._robot.find_bodies(
+            cfg.lifted_wheel_names, preserve_order=True
+        )[0]
+        if len(self._wheel_contact_ids) != 4 or len(self._lifted_contact_ids) != 2:
+            raise ValueError("M3 metrics require four ordered wheels and two lifted wheels.")
+
+        metric_names = (
+            "fl_contact",
+            "fr_contact",
+            "hl_contact",
+            "hr_contact",
+            "fr_clearance",
+            "hl_clearance",
+            "four_wheel_support_score",
+            "fl_hr_support_score",
+            "fr_lifted_score",
+            "hl_lifted_score",
+            "minimum_lifted_score",
+            "lift_cmd",
+            "yaw_rate_cmd",
+            "actual_yaw_rate",
+            "yaw_error",
+            "xy_displacement",
+            "planar_velocity",
+        )
+        for name in metric_names:
+            self.metrics[name] = torch.zeros(self.num_envs, device=self.device)
+        self._metric_step_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+    def __str__(self) -> str:
+        return (
+            "EpisodeLiftCommand:\n"
+            f"\tHold time: {self.cfg.hold_time_s} s\n"
+            f"\tRamp end: {self.cfg.ramp_end_time_s} s"
+        )
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self._command
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
+        """Log per-episode metric means and restart the lift schedule."""
+        if env_ids is None or isinstance(env_ids, slice):
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        step_count = torch.clamp(self._metric_step_counter[env_ids].float(), min=1.0)
+        extras = {
+            name: torch.mean(values[env_ids] / step_count).item()
+            for name, values in self.metrics.items()
+        }
+        for values in self.metrics.values():
+            values[env_ids] = 0.0
+        self._metric_step_counter[env_ids] = 0
+        self.command_counter[env_ids] = 0
+        self._resample(env_ids)
+        return extras
+
+    def _update_metrics(self):
+        wheel_forces = self._contact_sensor.data.net_forces_w[:, self._wheel_contact_ids]
+        wheel_contacts = (
+            torch.linalg.vector_norm(wheel_forces, dim=-1) > self.cfg.contact_threshold
+        ).float()
+        support_forces = self._contact_sensor.data.net_forces_w[:, self._support_contact_ids]
+        support_contacts = (
+            torch.linalg.vector_norm(support_forces, dim=-1) > self.cfg.contact_threshold
+        ).float()
+        lifted_forces = self._contact_sensor.data.net_forces_w[:, self._lifted_contact_ids]
+        lifted_contacts = (
+            torch.linalg.vector_norm(lifted_forces, dim=-1) > self.cfg.contact_threshold
+        )
+
+        lifted_height = self._robot.data.body_pos_w[:, self._lifted_body_ids, 2]
+        ground_height = self._env.scene.env_origins[:, 2].unsqueeze(-1)
+        lifted_clearance = lifted_height - ground_height - self.cfg.wheel_radius
+        clearance_score = torch.clamp(
+            lifted_clearance / self.cfg.target_clearance, min=0.0, max=1.0
+        )
+        lifted_scores = 0.5 * (~lifted_contacts).float() + 0.5 * clearance_score
+
+        yaw_command = self._env.command_manager.get_command(self.cfg.yaw_command_name)[:, 2]
+        actual_yaw_rate = self._robot.data.root_ang_vel_b[:, 2]
+        if hasattr(self._env, "_pivot_reset_root_xy"):
+            xy_displacement = torch.linalg.vector_norm(
+                self._robot.data.root_pos_w[:, :2] - self._env._pivot_reset_root_xy,
+                dim=1,
+            )
+        else:
+            xy_displacement = torch.zeros(self.num_envs, device=self.device)
+        planar_velocity = torch.linalg.vector_norm(self._robot.data.root_lin_vel_b[:, :2], dim=1)
+
+        for index, name in enumerate(("fl_contact", "fr_contact", "hl_contact", "hr_contact")):
+            self.metrics[name] += wheel_contacts[:, index]
+        self.metrics["fr_clearance"] += lifted_clearance[:, 0]
+        self.metrics["hl_clearance"] += lifted_clearance[:, 1]
+        self.metrics["four_wheel_support_score"] += wheel_contacts.mean(dim=1)
+        self.metrics["fl_hr_support_score"] += support_contacts.mean(dim=1)
+        self.metrics["fr_lifted_score"] += lifted_scores[:, 0]
+        self.metrics["hl_lifted_score"] += lifted_scores[:, 1]
+        self.metrics["minimum_lifted_score"] += lifted_scores.amin(dim=1)
+        self.metrics["lift_cmd"] += self._command[:, 0]
+        self.metrics["yaw_rate_cmd"] += yaw_command
+        self.metrics["actual_yaw_rate"] += actual_yaw_rate
+        self.metrics["yaw_error"] += torch.abs(actual_yaw_rate - yaw_command)
+        self.metrics["xy_displacement"] += xy_displacement
+        self.metrics["planar_velocity"] += planar_velocity
+        self._metric_step_counter += 1
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        self._command[env_ids] = 0.0
+
+    def _update_command(self):
+        episode_time = self._env.episode_length_buf.float() * self._env.step_dt
+        ramp_duration = self.cfg.ramp_end_time_s - self.cfg.hold_time_s
+        self._command[:, 0] = torch.clamp(
+            (episode_time - self.cfg.hold_time_s) / ramp_duration,
+            min=0.0,
+            max=1.0,
+        )
+
+
+@configclass
+class EpisodeLiftCommandCfg(CommandTermCfg):
+    """Configuration for the M3 episode-time lift schedule."""
+
+    class_type: type = EpisodeLiftCommand
+    hold_time_s: float = 0.5
+    ramp_end_time_s: float = 2.0
+    asset_name: str = "robot"
+    contact_sensor_name: str = "contact_forces"
+    wheel_body_names: list[str] = MISSING
+    support_wheel_names: list[str] = MISSING
+    lifted_wheel_names: list[str] = MISSING
+    yaw_command_name: str = "yaw_rate_cmd"
+    wheel_radius: float = MISSING
+    target_clearance: float = 0.05
+    contact_threshold: float = 1.0
+
+    def __post_init__(self):
+        # CommandManager samples this interval with torch.uniform_, which does
+        # not accept infinity.  This finite interval is far beyond any episode
+        # duration, so the term is reset only when the environment resets.
+        self.resampling_time_range = (1.0e6, 1.0e6)
 
 
 class UniformThresholdVelocityCommand(mdp.UniformVelocityCommand):

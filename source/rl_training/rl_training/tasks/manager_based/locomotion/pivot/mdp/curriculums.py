@@ -103,3 +103,79 @@ def pivot_yaw_curriculum(env, env_ids, command_name: str, max_yaw: float, step: 
         hi = min(term.cfg.ang_vel_z[1] + step, max_yaw)
         term.cfg.ang_vel_z = (-hi, hi)
     return torch.tensor(term.cfg.ang_vel_z[1], device=env.device)
+
+
+def pivot_yaw_rate_levels(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    command_name: str,
+    levels: Sequence[float],
+    support_reward_name: str,
+    lifted_reward_name: str,
+    balance_reward_name: str,
+    yaw_reward_name: str,
+    support_threshold: float,
+    lifted_threshold: float,
+    balance_threshold: float,
+    yaw_threshold: float,
+    min_evaluated_episodes: int,
+    required_success_rate: float,
+) -> dict[str, torch.Tensor]:
+    """Increase yaw range after a window passes all four M2 performance checks."""
+    command_term = env.command_manager.get_term(command_name)
+
+    if not hasattr(env, "_pivot_yaw_curriculum_stage"):
+        current_limit = float(command_term.cfg.ranges.ang_vel_z[1])
+        stage = min(range(len(levels)), key=lambda index: abs(float(levels[index]) - current_limit))
+        env._pivot_yaw_curriculum_stage = stage
+        env._pivot_yaw_curriculum_evaluated = 0
+        env._pivot_yaw_curriculum_successes = 0
+        env._pivot_yaw_curriculum_last_success_rate = 0.0
+
+    if isinstance(env_ids, slice):
+        selected_env_ids = torch.arange(env.num_envs, device=env.device)
+    else:
+        selected_env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+
+    episode_steps = env.episode_length_buf[selected_env_ids]
+    valid = episode_steps > 0
+    if torch.any(valid):
+        completed_env_ids = selected_env_ids[valid]
+        episode_duration = episode_steps[valid].float() * env.step_dt
+
+        def normalized_score(reward_name: str) -> torch.Tensor:
+            reward_weight = env.reward_manager.get_term_cfg(reward_name).weight
+            weighted_sum = env.reward_manager._episode_sums[reward_name][completed_env_ids]
+            return weighted_sum / (episode_duration * reward_weight)
+
+        support_score = normalized_score(support_reward_name)
+        lifted_score = normalized_score(lifted_reward_name)
+        balance_score = normalized_score(balance_reward_name)
+        yaw_score = normalized_score(yaw_reward_name)
+        successful = (
+            (support_score >= support_threshold)
+            & (lifted_score >= lifted_threshold)
+            & (balance_score >= balance_threshold)
+            & (yaw_score >= yaw_threshold)
+        )
+
+        env._pivot_yaw_curriculum_evaluated += len(completed_env_ids)
+        env._pivot_yaw_curriculum_successes += int(successful.sum().item())
+
+    if env._pivot_yaw_curriculum_evaluated >= min_evaluated_episodes:
+        success_rate = env._pivot_yaw_curriculum_successes / env._pivot_yaw_curriculum_evaluated
+        env._pivot_yaw_curriculum_last_success_rate = success_rate
+        if success_rate >= required_success_rate and env._pivot_yaw_curriculum_stage < len(levels) - 1:
+            env._pivot_yaw_curriculum_stage += 1
+        env._pivot_yaw_curriculum_evaluated = 0
+        env._pivot_yaw_curriculum_successes = 0
+
+    yaw_limit = float(levels[env._pivot_yaw_curriculum_stage])
+    command_term.cfg.ranges.ang_vel_z = (-yaw_limit, yaw_limit)
+    return {
+        "stage": torch.tensor(env._pivot_yaw_curriculum_stage, device=env.device),
+        "yaw_limit": torch.tensor(yaw_limit, device=env.device),
+        "window_success_rate": torch.tensor(
+            env._pivot_yaw_curriculum_last_success_rate, device=env.device
+        ),
+    }

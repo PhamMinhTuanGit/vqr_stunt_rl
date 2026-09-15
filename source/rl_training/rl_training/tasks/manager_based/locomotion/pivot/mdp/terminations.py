@@ -74,3 +74,16 @@ def pivot_drifted_away(
     asset: Articulation = env.scene[asset_cfg.name]
     displacement = asset.data.root_pos_w[:, :2] - env.scene.env_origins[:, :2]
     return torch.linalg.vector_norm(displacement, dim=1) > maximum_distance
+
+
+def m3_drifted_from_reset(
+    env: ManagerBasedRLEnv,
+    maximum_distance: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate M3 after excessive XY displacement from its randomized reset pose."""
+    if not hasattr(env, "_pivot_reset_root_xy"):
+        raise RuntimeError("M3 reset XY buffer is unavailable; reset_four_wheel_standing must run first.")
+    asset: Articulation = env.scene[asset_cfg.name]
+    displacement = asset.data.root_pos_w[:, :2] - env._pivot_reset_root_xy
+    return torch.linalg.vector_norm(displacement, dim=1) > maximum_distance

@@ -59,3 +59,8 @@ def wheel_clearance(
     wheel_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
     ground_height = env.scene.env_origins[:, 2].unsqueeze(-1)
     return wheel_height - ground_height - wheel_radius
+
+
+def yaw_rate_command(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Return only the deployable yaw-rate component of a velocity command."""
+    return env.command_manager.get_command(command_name)[:, 2:3]
