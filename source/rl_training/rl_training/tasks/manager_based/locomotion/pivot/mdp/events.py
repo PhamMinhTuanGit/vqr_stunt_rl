@@ -17,6 +17,73 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
 
+def reset_two_wheel_diagonal(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    nominal_joint_positions: list[float],
+    leg_joint_count: int,
+    root_height: float,
+    nominal_roll: float,
+    nominal_pitch: float,
+    joint_position_noise: tuple[float, float],
+    leg_velocity_noise: tuple[float, float],
+    wheel_velocity_noise: tuple[float, float],
+    roll_noise: tuple[float, float],
+    pitch_noise: tuple[float, float],
+    yaw_range: tuple[float, float],
+    angular_velocity_noise: tuple[float, float],
+    root_xy_noise: tuple[float, float] = (-0.01, 0.01),
+):
+    """Reset directly into the fixed FL-HR two-wheel support configuration."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    num_envs = len(env_ids)
+    num_joints = len(nominal_joint_positions)
+
+    if isinstance(asset_cfg.joint_ids, slice):
+        joint_ids = slice(None)
+        selected_joint_count = asset.num_joints
+        indexing_env_ids = env_ids
+    else:
+        joint_ids = asset_cfg.joint_ids
+        selected_joint_count = len(joint_ids)
+        indexing_env_ids = env_ids[:, None]
+    if selected_joint_count != num_joints:
+        raise ValueError(
+            f"Two-wheel reset expected {num_joints} joints, but SceneEntityCfg resolved {selected_joint_count}."
+        )
+
+    joint_pos = torch.tensor(nominal_joint_positions, device=asset.device).repeat(num_envs, 1)
+    joint_pos[:, :leg_joint_count] += math_utils.sample_uniform(
+        *joint_position_noise, (num_envs, leg_joint_count), asset.device
+    )
+    joint_limits = asset.data.soft_joint_pos_limits[indexing_env_ids, joint_ids]
+    joint_pos.clamp_(joint_limits[..., 0], joint_limits[..., 1])
+
+    joint_vel = torch.zeros((num_envs, num_joints), device=asset.device)
+    joint_vel[:, :leg_joint_count] = math_utils.sample_uniform(
+        *leg_velocity_noise, (num_envs, leg_joint_count), asset.device
+    )
+    joint_vel[:, leg_joint_count:] = math_utils.sample_uniform(
+        *wheel_velocity_noise, (num_envs, num_joints - leg_joint_count), asset.device
+    )
+
+    root_pos = env.scene.env_origins[env_ids].clone()
+    root_pos[:, :2] += math_utils.sample_uniform(*root_xy_noise, (num_envs, 2), asset.device)
+    root_pos[:, 2] += root_height
+    roll = nominal_roll + math_utils.sample_uniform(*roll_noise, (num_envs,), asset.device)
+    pitch = nominal_pitch + math_utils.sample_uniform(*pitch_noise, (num_envs,), asset.device)
+    yaw = math_utils.sample_uniform(*yaw_range, (num_envs,), asset.device)
+    root_quat = math_utils.quat_from_euler_xyz(roll, pitch, yaw)
+
+    root_vel = torch.zeros((num_envs, 6), device=asset.device)
+    root_vel[:, 3:] = math_utils.sample_uniform(*angular_velocity_noise, (num_envs, 3), asset.device)
+
+    asset.write_root_pose_to_sim(torch.cat((root_pos, root_quat), dim=-1), env_ids=env_ids)
+    asset.write_root_velocity_to_sim(root_vel, env_ids=env_ids)
+    asset.write_joint_state_to_sim(joint_pos, joint_vel, joint_ids=joint_ids, env_ids=env_ids)
+
+
 def randomize_rigid_body_inertia(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor | None,

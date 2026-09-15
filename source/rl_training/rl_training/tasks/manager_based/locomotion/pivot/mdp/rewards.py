@@ -23,6 +23,91 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+def _wheel_contact_state(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float,
+) -> torch.Tensor:
+    """Resolve contact only through the body IDs selected by ``sensor_cfg``."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids]
+    return torch.linalg.vector_norm(forces, dim=-1) > threshold
+
+
+def pivot_support_contact(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Reward the fraction of selected support wheels currently in contact."""
+    return _wheel_contact_state(env, sensor_cfg, threshold).float().mean(dim=1)
+
+
+def pivot_lifted_wheels(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg,
+    wheel_radius: float,
+    minimum_clearance: float,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Reward lifted wheels for both no contact and positive ground clearance."""
+    in_contact = _wheel_contact_state(env, sensor_cfg, threshold)
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    ground_height = env.scene.env_origins[:, 2].unsqueeze(-1)
+    clearance = wheel_height - ground_height - wheel_radius
+    clearance_score = torch.clamp(clearance / minimum_clearance, min=0.0, max=1.0)
+    return 0.5 * (~in_contact).float().mean(dim=1) + 0.5 * clearance_score.mean(dim=1)
+
+
+def pivot_balance(
+    env: ManagerBasedRLEnv,
+    nominal_roll: float,
+    nominal_pitch: float,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward roll and pitch near the configured two-wheel equilibrium."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    roll, pitch, _ = math_utils.euler_xyz_from_quat(asset.data.root_quat_w)
+    roll_error = math_utils.wrap_to_pi(roll - nominal_roll)
+    pitch_error = math_utils.wrap_to_pi(pitch - nominal_pitch)
+    return torch.exp(-(roll_error.square() + pitch_error.square()) / std**2)
+
+
+def pivot_angular_stability(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize body-frame roll and pitch rates."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.sum(asset.data.root_ang_vel_b[:, :2].square(), dim=1)
+
+
+def pivot_planar_drift(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize body-frame planar base velocity."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.sum(asset.data.root_lin_vel_b[:, :2].square(), dim=1)
+
+
+def pivot_action_rate_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Penalize changes in the complete 16-dimensional action."""
+    return torch.sum(torch.square(env.action_manager.action - env.action_manager.prev_action), dim=1)
+
+
+def pivot_leg_effort_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize applied effort only on the explicitly selected leg joints."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.sum(asset.data.applied_torque[:, asset_cfg.joint_ids].square(), dim=1)
+
+
 # Global curriculum scalar in [0, 1], updated from terrain-level mean.
 gait_level: float = 0.0
 

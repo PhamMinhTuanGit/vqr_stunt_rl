@@ -1,4 +1,8 @@
-"""Wheeled VQR model configuration for the pivot task."""
+"""Wheeled VQR model and environment configurations for pivot tasks."""
+
+import gymnasium as gym
+
+from . import agents
 
 from .robot_cfg import (
     ARTICULATION_BODY_NAMES,
@@ -25,3 +29,16 @@ __all__ = [
     "WHEEL_BODY_NAMES",
     "WHEEL_JOINT_NAMES",
 ]
+
+
+gym.register(
+    id="Pivot-TwoWheelBalance-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.balance_env_cfg:VQRTwoWheelBalanceEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:VQRTwoWheelBalancePPORunnerCfg"
+        ),
+    },
+)

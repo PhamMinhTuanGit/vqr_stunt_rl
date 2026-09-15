@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import ContactSensor
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
@@ -35,3 +36,26 @@ def phase(env: ManagerBasedRLEnv, cycle_time: float) -> torch.Tensor:
     phase = env.episode_length_buf[:, None] * env.step_dt / cycle_time
     phase_tensor = torch.cat([torch.sin(2 * torch.pi * phase), torch.cos(2 * torch.pi * phase)], dim=-1)
     return phase_tensor
+
+
+def wheel_contact_state(
+    env: ManagerBasedEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Return one binary contact value per explicitly resolved wheel body."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids]
+    return (torch.linalg.vector_norm(forces, dim=-1) > threshold).float()
+
+
+def wheel_clearance(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg,
+    wheel_radius: float,
+) -> torch.Tensor:
+    """Return wheel-bottom clearance above the flat ground plane."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    ground_height = env.scene.env_origins[:, 2].unsqueeze(-1)
+    return wheel_height - ground_height - wheel_radius
