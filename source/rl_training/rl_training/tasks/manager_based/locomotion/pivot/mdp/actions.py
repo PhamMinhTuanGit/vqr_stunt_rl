@@ -33,6 +33,10 @@ class SoftLimitJointPositionAction(JointPositionAction):
     def process_actions(self, actions: torch.Tensor):
         super().process_actions(actions)
         limits = self._asset.data.soft_joint_pos_limits[:, self._soft_limit_asset_ids]
+        if self.cfg.joint_limit_margin is not None:
+            limits = self._asset.data.joint_pos_limits[:, self._soft_limit_asset_ids].clone()
+            limits[..., 0] += self.cfg.joint_limit_margin
+            limits[..., 1] -= self.cfg.joint_limit_margin
         self._processed_actions[:, self._soft_limit_action_ids] = torch.clamp(
             self._processed_actions[:, self._soft_limit_action_ids],
             min=limits[..., 0],
@@ -46,3 +50,5 @@ class SoftLimitJointPositionActionCfg(JointPositionActionCfg):
 
     class_type: type = SoftLimitJointPositionAction
     soft_limit_joint_names: list[str] = MISSING
+    # Optional absolute safety margin; asset/actuator limits stay unchanged.
+    joint_limit_margin: float | None = None

@@ -46,6 +46,12 @@ cmake --build build -j
 ./build/static_equilibrium
 ./build/validate_static_equilibrium \
   output/static_equilibrium_FL_HR.yaml
+./build/static_equilibrium_aligned
+./build/validate_static_equilibrium \
+  output/static_equilibrium_FL_HR_aligned.yaml
+./build/static_equilibrium_sideways
+./build/validate_static_equilibrium \
+  output/static_equilibrium_FL_HR_sideways.yaml
 ctest --test-dir build --output-on-failure
 ```
 
@@ -276,6 +282,61 @@ recomputes the M-TO1A tread geometry, all 22 dynamics residuals, support
 geometry, friction and torque utilization, and joint margins, then compares
 those results with the saved YAML. CTest target
 `independent_static_validation` covers this saved M-TO2 pose.
+
+## M-TO2R stance-wheel alignment re-solve
+
+M-TO2R warm-starts the complete decision vector—pose, 16 actuator torques, and
+both contact forces—from `output/static_equilibrium_FL_HR.yaml`. It retains all
+M-TO2 dynamics, contact, clearance, friction, torque, joint, orientation, and
+support-segment constraints. The objective also adds a documented HipX
+regularizer with weight `0.5`; feasibility is determined by explicit wheel-axis
+constraints, not by this penalty.
+
+For each stance wheel, the cylinder axis parsed by M-TO1A is rotated into WORLD
+by the Pinocchio wheel BODY placement. The body-frame axis is obtained with
+`R_WB^T a_W`. Sign-invariant squared-dot constraints limit each stance axis to
+`8 deg` from the body lateral axis and limit the FL-HR axis mismatch to `5 deg`.
+The absolute WORLD vertical component of each axis is also bounded by
+`sin(8 deg)`. These constraints remain active throughout the solve.
+
+The solver starts with a `2 mm` CoM-line tolerance. It may warm-start subsequent
+`5 mm` and `10 mm` attempts only if necessary and never relaxes beyond `10 mm`.
+The saved result records which attempts ran and the selected tolerance. It is
+written separately, without replacing the original M-TO2 result:
+
+```text
+output/static_equilibrium_FL_HR_aligned.yaml
+```
+
+The same standalone C++ validator recomputes the cylinder axes, body transform,
+three alignment errors, and all original M-TO2 quantities directly from the
+URDF and saved state. CTest target `independent_aligned_static_validation`
+provides the aligned-pose regression check.
+
+## M-TO2S sideways-support re-solve
+
+M-TO2S warm-starts the full M-TO2R solution and keeps every static-dynamics,
+geometry, friction, torque, joint, support-segment, and stance-wheel alignment
+constraint. It additionally expresses the physical FL and HR tread contacts in
+the base BODY frame and requires their support line to be nearly parallel to
+body Y: `|dy| >= 0.35 m` and a sign-invariant direction error no greater than
+`5 deg`. A `10 * dx^2` objective term complements, but does not replace, these
+hard constraints.
+
+The `|dx|` limit is tightened by warm-started continuation through `0.10`,
+`0.07`, `0.05`, and `0.03 m`. The solver first requires `30 mm` clearance for
+both swing wheels and uses `20 mm` only as an explicitly recorded fallback.
+The selected result uses a `5 mm` CoM-line tolerance and is saved separately:
+
+```text
+output/static_equilibrium_FL_HR_sideways.yaml
+```
+
+The independent C++ validator reconstructs the pose from this YAML, recomputes
+the physical contacts, BODY-frame support direction, complete 22-row dynamics,
+wheel alignment, forces, friction, torques, and margins directly from the URDF,
+and compares every saved metric. CTest target
+`independent_sideways_static_validation` is the saved-pose regression test.
 
 ## Remaining model limitation
 

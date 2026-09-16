@@ -11,53 +11,41 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.utils import configclass
 
 import rl_training.tasks.manager_based.locomotion.pivot.mdp as mdp
 import rl_training.tasks.manager_based.locomotion.pivot.mdp.actions as m3_actions
+from ....mdp import to_transition as transition
+from ....mdp.to_reference import load_leg_reference
 
 from .balance_env_cfg import (
     ActionsCfg,
     EventCfg,
-    NOMINAL_PITCH,
-    NOMINAL_ROLL,
     TerminationsCfg,
     TwoWheelBalanceSceneCfg,
-    WHEEL_RADIUS,
 )
 from .robot_cfg import (
     ARTICULATION_JOINT_NAMES,
     DEFAULT_JOINT_POS,
     LEG_JOINT_NAMES,
-    LIFTED_WHEEL_NAMES,
-    SUPPORT_WHEEL_NAMES,
     VQR_CFG,
     WHEEL_BODY_NAMES,
 )
-from .rotate_env_cfg import RotateObservationsCfg, VQRTwoWheelRotateEnvCfg, YawRateCommandsCfg
+from .rotate_env_cfg import RotateObservationsCfg, VQRTwoWheelRotateEnvCfg
 
 
 STANDING_ROOT_HEIGHT = VQR_CFG.init_state.pos[2]
 STANDING_JOINT_POSITIONS = [DEFAULT_JOINT_POS[name] for name in ARTICULATION_JOINT_NAMES]
 STANDING_LEG_POSITION_MAP = {name: DEFAULT_JOINT_POS[name] for name in LEG_JOINT_NAMES}
-LIFTED_HIP_Y_JOINT_NAMES = [LEG_JOINT_NAMES[5], LEG_JOINT_NAMES[6]]
-LIFTED_KNEE_JOINT_NAMES = [LEG_JOINT_NAMES[9], LEG_JOINT_NAMES[10]]
-M3_LEG_ACTION_SCALE = {name: 0.18 for name in LEG_JOINT_NAMES}
-M3_LEG_ACTION_SCALE.update({name: 0.40 for name in LIFTED_HIP_Y_JOINT_NAMES})
-M3_LEG_ACTION_SCALE.update({name: 0.75 for name in LIFTED_KNEE_JOINT_NAMES})
+# Standing-centered policy actions must reach every TO joint without a moving
+# action offset/controller. Read by name; add room for learned dynamic poses.
+TO_LEG_POSE = load_leg_reference(LEG_JOINT_NAMES)
+M3_LEG_ACTION_SCALE = {
+    name: max(0.25, abs(TO_LEG_POSE[name] - DEFAULT_JOINT_POS[name]) + 0.20)
+    for name in LEG_JOINT_NAMES
+}
 _M1_SCENE_TEMPLATE = TwoWheelBalanceSceneCfg(num_envs=1, env_spacing=2.5)
-
-
-def _place_term_after(group, term_name: str, preceding_term_name: str):
-    """Keep the documented command ordering in a derived observation group."""
-    term = group.__dict__.pop(term_name)
-    ordered_items = []
-    for name, value in group.__dict__.items():
-        ordered_items.append((name, value))
-        if name == preceding_term_name:
-            ordered_items.append((term_name, term))
-    group.__dict__.clear()
-    group.__dict__.update(ordered_items)
 
 
 @configclass
@@ -85,7 +73,7 @@ class FourWheelStartEventCfg(EventCfg):
 
     reset_two_wheel = None
     reset_four_wheel = EventTerm(
-        func=mdp.reset_four_wheel_standing,
+        func=transition.reset_transition_standing,
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg(
@@ -104,11 +92,12 @@ class FourWheelStartEventCfg(EventCfg):
             "root_xy_noise": (-0.01, 0.01),
         },
     )
+    push = EventTerm(func=transition.transition_push, mode="interval", interval_range_s=(5.0, 8.0))
 
 
 @configclass
 class FourToTwoActionsCfg(ActionsCfg):
-    """Give only the lifted diagonal enough leg range for the transition."""
+    """Standing-centered leg actions with room to approach TO and rebalance."""
 
     leg_positions = m3_actions.SoftLimitJointPositionActionCfg(
         asset_name="robot",
@@ -117,50 +106,39 @@ class FourToTwoActionsCfg(ActionsCfg):
         offset=STANDING_LEG_POSITION_MAP,
         use_default_offset=False,
         preserve_order=True,
-        soft_limit_joint_names=LIFTED_KNEE_JOINT_NAMES,
+        soft_limit_joint_names=LEG_JOINT_NAMES,
+        joint_limit_margin=0.05,
     )
 
 
 @configclass
-class FourToTwoCommandsCfg(YawRateCommandsCfg):
-    """M2 yaw command plus the M3 episode-time lift request."""
+class FourToTwoCommandsCfg:
+    """One yaw/transition command; no duplicate periodic phase."""
 
-    lift_cmd = mdp.EpisodeLiftCommandCfg(
-        hold_time_s=0.5,
-        ramp_end_time_s=2.0,
+    pivot = transition.TOPivotCommandCfg(
+        leg_joint_names=LEG_JOINT_NAMES,
         wheel_body_names=WHEEL_BODY_NAMES,
-        support_wheel_names=SUPPORT_WHEEL_NAMES,
-        lifted_wheel_names=LIFTED_WHEEL_NAMES,
-        wheel_radius=WHEEL_RADIUS,
-        target_clearance=0.05,
+        standing_positions=STANDING_LEG_POSITION_MAP,
     )
 
 
 @configclass
 class FourToTwoObservationsCfg(RotateObservationsCfg):
-    """Insert the deployable scalar lift command after the yaw command."""
+    """Expose yaw/lambda once, retaining deployable actor and privileged critic."""
 
     @configclass
     class PolicyCfg(RotateObservationsCfg.PolicyCfg):
-        lift_command = ObsTerm(
+        yaw_rate_command = ObsTerm(
             func=mdp.generated_commands,
-            params={"command_name": "lift_cmd"},
+            params={"command_name": "pivot"},
         )
-
-        def __post_init__(self):
-            super().__post_init__()
-            _place_term_after(self, "lift_command", "yaw_rate_command")
 
     @configclass
     class CriticCfg(RotateObservationsCfg.CriticCfg):
-        lift_command = ObsTerm(
+        yaw_rate_command = ObsTerm(
             func=mdp.generated_commands,
-            params={"command_name": "lift_cmd"},
+            params={"command_name": "pivot"},
         )
-
-        def __post_init__(self):
-            super().__post_init__()
-            _place_term_after(self, "lift_command", "yaw_rate_command")
 
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
@@ -170,57 +148,14 @@ class FourToTwoObservationsCfg(RotateObservationsCfg):
 class FourToTwoRewardsCfg:
     """M3 rewards staged by lift progress from four-wheel to diagonal support."""
 
-    four_wheel_support = RewTerm(
-        func=mdp.m3_four_wheel_support,
-        weight=1.0,
-        params={
-            "lift_command_name": "lift_cmd",
-            "sensor_cfg": SceneEntityCfg(
-                "contact_forces", body_names=WHEEL_BODY_NAMES, preserve_order=True
-            ),
-            "threshold": 1.0,
-        },
-    )
-    support_contact = RewTerm(
-        func=mdp.m3_diagonal_support,
-        weight=1.0,
-        params={
-            "lift_command_name": "lift_cmd",
-            "sensor_cfg": SceneEntityCfg(
-                "contact_forces", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
-            ),
-            "threshold": 1.0,
-        },
-    )
-    lifted_diagonal = RewTerm(
-        func=mdp.m3_lifted_diagonal,
-        weight=1.0,
-        params={
-            "lift_command_name": "lift_cmd",
-            "sensor_cfg": SceneEntityCfg(
-                "contact_forces", body_names=LIFTED_WHEEL_NAMES, preserve_order=True
-            ),
-            "asset_cfg": SceneEntityCfg(
-                "robot", body_names=LIFTED_WHEEL_NAMES, preserve_order=True
-            ),
-            "wheel_radius": WHEEL_RADIUS,
-            "target_clearance": 0.05,
-            "threshold": 1.0,
-        },
-    )
     balance = RewTerm(
         func=mdp.pivot_balance,
         weight=2.0,
-        params={"nominal_roll": NOMINAL_ROLL, "nominal_pitch": NOMINAL_PITCH, "std": 0.25},
+        params={"nominal_roll": 0.0, "nominal_pitch": 0.0, "std": 0.5},
     )
     yaw_rate_tracking = RewTerm(
-        func=mdp.m3_track_yaw_rate,
+        func=transition.transition_yaw_reward,
         weight=1.5,
-        params={
-            "yaw_command_name": "yaw_rate_cmd",
-            "lift_command_name": "lift_cmd",
-            "std": 0.30,
-        },
     )
     xy_displacement = RewTerm(
         func=mdp.m3_xy_displacement_dead_zone,
@@ -239,6 +174,15 @@ class FourToTwoRewardsCfg:
             )
         },
     )
+    # Replace the old abrupt lift schedule with a continuous 4->2 preference.
+    four_wheel_support = RewTerm(func=transition.scheduled_contact_reward, weight=3.0)
+    pose_reference = RewTerm(func=transition.to_pose_reward, weight=1.0)
+    survival = RewTerm(func=mdp.is_alive, weight=0.3)
+    failure = RewTerm(func=mdp.is_terminated, weight=-2.0)
+    leg_velocity = RewTerm(
+        func=mdp.joint_vel_l2, weight=-1.0e-4,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINT_NAMES, preserve_order=True)},
+    )
 
 
 @configclass
@@ -252,6 +196,11 @@ class FourToTwoTerminationsCfg(TerminationsCfg):
 
 
 @configclass
+class TransitionCurriculumCfg:
+    transition_levels = CurrTerm(func=transition.transition_levels)
+
+
+@configclass
 class VQRFourToTwoWheelRotateEnvCfg(VQRTwoWheelRotateEnvCfg):
     """M3: learn the transition from four-wheel standing before M2 rotation."""
 
@@ -262,7 +211,8 @@ class VQRFourToTwoWheelRotateEnvCfg(VQRTwoWheelRotateEnvCfg):
     actions: FourToTwoActionsCfg = FourToTwoActionsCfg()
     rewards: FourToTwoRewardsCfg = FourToTwoRewardsCfg()
     terminations: FourToTwoTerminationsCfg = FourToTwoTerminationsCfg()
-    curriculum = None
+    curriculum: TransitionCurriculumCfg = TransitionCurriculumCfg()
+    episode_length_s = 12.0
 
     def __post_init__(self):
         super().__post_init__()

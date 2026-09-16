@@ -135,3 +135,31 @@ static_optimization:
     acceptable_tolerance: 1.0e-7
     constraint_violation_tolerance: 1.0e-10
     max_iterations: 1500
+
+aligned_static_optimization:
+  initial_guess: ../output/static_equilibrium_FL_HR.yaml
+  hipx_weight: 0.5
+  wheel_body_alignment_limit_deg: 8.0
+  stance_wheel_parallel_limit_deg: 5.0
+  wheel_axle_horizontal_limit_deg: 8.0
+  com_tolerance_continuation_m: [0.002, 0.005, 0.010]
+  ipopt:
+    tolerance: 1.0e-9
+    acceptable_tolerance: 1.0e-7
+    constraint_violation_tolerance: 1.0e-10
+    max_iterations: 2500
+
+sideways_static_optimization:
+  initial_guess: ../output/static_equilibrium_FL_HR_aligned.yaml
+  eps_x_continuation_m: [0.10, 0.07, 0.05, 0.03]
+  y_separation_min_m: 0.35
+  support_direction_limit_deg: 5.0
+  com_tolerance_m: 0.005
+  preferred_swing_clearance_m: 0.030
+  fallback_swing_clearance_m: 0.020
+  dx_weight: 10.0
+  ipopt:
+    tolerance: 1.0e-9
+    acceptable_tolerance: 1.0e-7
+    constraint_violation_tolerance: 1.0e-10
+    max_iterations: 2500

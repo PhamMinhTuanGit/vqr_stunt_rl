@@ -69,6 +69,7 @@ struct SupportMetrics {
 };
 
 struct Result {
+  std::string milestone;
   Eigen::Vector3d base_position;
   Eigen::Vector3d base_rpy;
   Eigen::Vector3d com;
@@ -86,6 +87,23 @@ struct Result {
   double max_leg_utilization;
   double max_wheel_utilization;
   double quaternion_norm;
+  double wheel_body_angle_fl;
+  double wheel_body_angle_hr;
+  double wheel_parallel_angle;
+  double wheel_vertical_fl;
+  double wheel_vertical_hr;
+  Eigen::Vector3d support_fl_body;
+  Eigen::Vector3d support_hr_body;
+  Eigen::Vector3d saved_support_fl_body;
+  Eigen::Vector3d saved_support_hr_body;
+  Eigen::Vector3d com_body;
+  SupportMetrics support_body;
+  double support_distance_3d_world;
+  double support_distance_3d_body;
+  double support_dx_body;
+  double support_dy_body;
+  double support_angle_body_x;
+  double support_angle_body_y;
 };
 
 void require(bool condition, const std::string &message) {
@@ -180,10 +198,14 @@ void validateSet(const YAML::Node &root, const std::string &key,
 
 Result validate(const std::filesystem::path &yaml_path) {
   const YAML::Node root = YAML::LoadFile(yaml_path.string());
-  require(requireNode(root, "milestone", "root").as<std::string>() == "M-TO2",
-          "Saved result is not M-TO2");
+  const std::string milestone =
+      requireNode(root, "milestone", "root").as<std::string>();
+  const bool sideways = milestone == "M-TO2S";
+  const bool aligned = milestone == "M-TO2R" || sideways;
+  require(milestone == "M-TO2" || aligned,
+          "Saved result is neither M-TO2, M-TO2R, nor M-TO2S");
   require(requireNode(root, "result", "root").as<std::string>() == "PASS",
-          "Saved M-TO2 result is not PASS");
+          "Saved static-equilibrium result is not PASS");
   validateSet(root, "stance", {"FL", "HR"});
   validateSet(root, "swing", {"FR", "HL"});
 
@@ -273,6 +295,7 @@ Result validate(const std::filesystem::path &yaml_path) {
           "Pinocchio returned non-finite values");
 
   std::map<std::string, Eigen::Vector3d> contacts;
+  std::map<std::string, Eigen::Vector3d> wheel_axes_world;
   std::map<std::string, Eigen::MatrixXd> point_jacobians;
   for (const auto &[corner, frame_name] : kWheelFrames) {
     const auto frame_id = bodyFrameId(model, frame_name);
@@ -286,6 +309,7 @@ Result validate(const std::filesystem::path &yaml_path) {
     const Eigen::Vector3d contact =
         pose_optimization::treadContactPoint(center, axis, geometry.radius);
     contacts.emplace(corner, contact);
+    wheel_axes_world.emplace(corner, axis.normalized());
 
     Eigen::Matrix<double, 6, Eigen::Dynamic> frame_jacobian(6, model.nv);
     frame_jacobian.setZero();
@@ -345,8 +369,8 @@ Result validate(const std::filesystem::path &yaml_path) {
   require(residual_norm <= kDynamicsTolerance,
           "Full dynamics residual exceeds tolerance");
 
-  const double mu = scalar(requireNode(root, "constraints", "root"),
-                           "friction_coefficient", "constraints");
+  const auto constraints = requireNode(root, "constraints", "root");
+  const double mu = scalar(constraints, "friction_coefficient", "constraints");
   require(mu > 0.0, "Friction coefficient must be positive");
   auto friction = [mu](const Eigen::Vector3d &force,
                        const std::string &corner) {
@@ -368,11 +392,21 @@ Result validate(const std::filesystem::path &yaml_path) {
           "FL is off ground");
   require(std::abs(contacts.at("HR").z()) <= kGroundTolerance,
           "HR is off ground");
-  require(contacts.at("FR").z() >= kSwingClearance,
+  const double swing_clearance =
+      sideways ? scalar(constraints, "swing_clearance_m", "constraints")
+               : kSwingClearance;
+  require(swing_clearance >= kSwingClearance - kMetricTolerance,
+          "Invalid saved swing-clearance constraint");
+  require(contacts.at("FR").z() >= swing_clearance - kMetricTolerance,
           "FR clearance is too small");
-  require(contacts.at("HL").z() >= kSwingClearance,
+  require(contacts.at("HL").z() >= swing_clearance - kMetricTolerance,
           "HL clearance is too small");
-  require(std::abs(support.signed_error) <= kComTolerance,
+  const double com_tolerance =
+      scalar(constraints, "com_tolerance_m", "constraints");
+  require(com_tolerance > 0.0 &&
+              (!aligned || com_tolerance <= 0.010 + kMetricTolerance),
+          "Invalid saved CoM tolerance");
+  require(std::abs(support.signed_error) <= com_tolerance + kMetricTolerance,
           "CoM line error is too large");
   require(support.s >= kSegmentMargin &&
               support.s <= support.length - kSegmentMargin,
@@ -386,6 +420,192 @@ Result validate(const std::filesystem::path &yaml_path) {
   require(minimum != margins.end() &&
               minimum->minimum >= kJointSafetyMargin - kMetricTolerance,
           "Joint safety margin is violated");
+
+  double wheel_body_angle_fl = 0.0;
+  double wheel_body_angle_hr = 0.0;
+  double wheel_parallel_angle = 0.0;
+  double wheel_vertical_fl = 0.0;
+  double wheel_vertical_hr = 0.0;
+  Eigen::Vector3d support_fl_body = Eigen::Vector3d::Zero();
+  Eigen::Vector3d support_hr_body = Eigen::Vector3d::Zero();
+  Eigen::Vector3d saved_support_fl_body = Eigen::Vector3d::Zero();
+  Eigen::Vector3d saved_support_hr_body = Eigen::Vector3d::Zero();
+  Eigen::Vector3d com_body = Eigen::Vector3d::Zero();
+  SupportMetrics support_body{0.0, 0.0, 0.0};
+  double support_distance_3d_world = 0.0;
+  double support_distance_3d_body = 0.0;
+  double support_dx_body = 0.0;
+  double support_dy_body = 0.0;
+  double support_angle_body_x = 0.0;
+  double support_angle_body_y = 0.0;
+  if (aligned) {
+    const Eigen::Matrix3d world_from_body = quaternion.toRotationMatrix();
+    const Eigen::Vector3d lateral = Eigen::Vector3d::UnitY();
+    const Eigen::Vector3d fl_body =
+        world_from_body.transpose() * wheel_axes_world.at("FL");
+    const Eigen::Vector3d hr_body =
+        world_from_body.transpose() * wheel_axes_world.at("HR");
+    auto signInvariantAngleDegrees = [](const Eigen::Vector3d &first,
+                                        const Eigen::Vector3d &second) {
+      const double cosine = std::clamp(std::abs(first.dot(second)), 0.0, 1.0);
+      return std::acos(cosine) * 180.0 / std::acos(-1.0);
+    };
+    wheel_body_angle_fl = signInvariantAngleDegrees(fl_body, lateral);
+    wheel_body_angle_hr = signInvariantAngleDegrees(hr_body, lateral);
+    wheel_parallel_angle = signInvariantAngleDegrees(wheel_axes_world.at("FL"),
+                                                     wheel_axes_world.at("HR"));
+    wheel_vertical_fl = std::abs(wheel_axes_world.at("FL").z());
+    wheel_vertical_hr = std::abs(wheel_axes_world.at("HR").z());
+
+    const double body_limit =
+        scalar(constraints, "wheel_body_alignment_limit_deg", "constraints");
+    const double parallel_limit =
+        scalar(constraints, "stance_wheel_parallel_limit_deg", "constraints");
+    const double horizontal_limit =
+        scalar(constraints, "wheel_axle_horizontal_limit_deg", "constraints");
+    const double vertical_limit =
+        std::sin(horizontal_limit * std::acos(-1.0) / 180.0);
+    require(wheel_body_angle_fl <= body_limit + kMetricTolerance &&
+                wheel_body_angle_hr <= body_limit + kMetricTolerance,
+            "Independent wheel-to-body alignment check failed");
+    require(wheel_parallel_angle <= parallel_limit + kMetricTolerance,
+            "Independent FL-HR wheel-axis parallel check failed");
+    require(wheel_vertical_fl <= vertical_limit + kMetricTolerance &&
+                wheel_vertical_hr <= vertical_limit + kMetricTolerance,
+            "Independent wheel-axle horizontal check failed");
+
+    const auto saved_axes = requireNode(root, "wheel_axes", "root");
+    const auto saved_world = requireNode(saved_axes, "world", "wheel_axes");
+    const auto saved_body = requireNode(saved_axes, "body", "wheel_axes");
+    vectorNear(wheel_axes_world.at("FL"),
+               vector3(requireNode(saved_world, "FL", "wheel_axes.world"),
+                       "wheel_axes.world.FL"),
+               "FL WORLD wheel axis");
+    vectorNear(wheel_axes_world.at("HR"),
+               vector3(requireNode(saved_world, "HR", "wheel_axes.world"),
+                       "wheel_axes.world.HR"),
+               "HR WORLD wheel axis");
+    vectorNear(fl_body,
+               vector3(requireNode(saved_body, "FL", "wheel_axes.body"),
+                       "wheel_axes.body.FL"),
+               "FL body wheel axis");
+    vectorNear(hr_body,
+               vector3(requireNode(saved_body, "HR", "wheel_axes.body"),
+                       "wheel_axes.body.HR"),
+               "HR body wheel axis");
+    const auto saved_angles =
+        requireNode(saved_axes, "body_alignment_angle_deg", "wheel_axes");
+    near(wheel_body_angle_fl,
+         scalar(saved_angles, "FL", "wheel_axes.body_alignment_angle_deg"),
+         "FL wheel-to-body angle");
+    near(wheel_body_angle_hr,
+         scalar(saved_angles, "HR", "wheel_axes.body_alignment_angle_deg"),
+         "HR wheel-to-body angle");
+    near(wheel_parallel_angle,
+         scalar(saved_axes, "fl_hr_parallel_angle_deg", "wheel_axes"),
+         "FL-HR wheel-axis angle");
+    const auto saved_vertical =
+        requireNode(saved_axes, "vertical_component_abs", "wheel_axes");
+    near(wheel_vertical_fl,
+         scalar(saved_vertical, "FL", "wheel_axes.vertical_component_abs"),
+         "FL wheel-axis vertical component");
+    near(wheel_vertical_hr,
+         scalar(saved_vertical, "HR", "wheel_axes.vertical_component_abs"),
+         "HR wheel-axis vertical component");
+  }
+
+  if (sideways) {
+    const Eigen::Matrix3d world_from_body = quaternion.toRotationMatrix();
+    support_fl_body =
+        world_from_body.transpose() * (contacts.at("FL") - base_position);
+    support_hr_body =
+        world_from_body.transpose() * (contacts.at("HR") - base_position);
+    com_body = world_from_body.transpose() * (com - base_position);
+    support_body = supportMetrics(support_fl_body, support_hr_body, com_body);
+    support_distance_3d_world =
+        (contacts.at("HR") - contacts.at("FL")).norm();
+    support_distance_3d_body = (support_hr_body - support_fl_body).norm();
+    near(support_distance_3d_world, support_distance_3d_body,
+         "WORLD/BODY 3D support length invariance");
+    const Eigen::Vector2d delta =
+        (support_hr_body - support_fl_body).head<2>();
+    const double body_support_length = delta.norm();
+    require(std::isfinite(body_support_length) &&
+                body_support_length > kNormalizationTolerance,
+            "BODY-frame support line is degenerate");
+    support_dx_body = delta.x();
+    support_dy_body = delta.y();
+    const double direction_x = std::clamp(
+        std::abs(support_dx_body) / body_support_length, 0.0, 1.0);
+    const double direction_y = std::clamp(
+        std::abs(support_dy_body) / body_support_length, 0.0, 1.0);
+    support_angle_body_x =
+        std::acos(direction_x) * 180.0 / std::acos(-1.0);
+    support_angle_body_y =
+        std::acos(direction_y) * 180.0 / std::acos(-1.0);
+
+    const double dx_limit =
+        scalar(constraints, "support_dx_limit_m", "constraints");
+    const double y_separation =
+        scalar(constraints, "support_y_separation_min_m", "constraints");
+    const double direction_limit_deg =
+        scalar(constraints, "support_direction_limit_deg", "constraints");
+    require(dx_limit >= 0.030 - kMetricTolerance &&
+                dx_limit <= 0.100 + kMetricTolerance,
+            "Invalid saved BODY-frame dx limit");
+    require(std::abs(support_dx_body) <= dx_limit + kMetricTolerance,
+            "BODY-frame support dx constraint failed");
+    require(std::abs(support_dy_body) >= y_separation - kMetricTolerance,
+            "BODY-frame support y-separation constraint failed");
+    require(direction_x <=
+                std::sin(direction_limit_deg * std::acos(-1.0) / 180.0) +
+                    kMetricTolerance,
+            "BODY-frame support direction constraint failed");
+
+    const auto saved_contacts_body =
+        requireNode(root, "support_contacts_body", "root");
+    saved_support_fl_body =
+        vector3(requireNode(saved_contacts_body, "FL", "support_contacts_body"),
+                "support_contacts_body.FL");
+    saved_support_hr_body =
+        vector3(requireNode(saved_contacts_body, "HR", "support_contacts_body"),
+                "support_contacts_body.HR");
+    vectorNear(support_fl_body, saved_support_fl_body,
+               "FL BODY support contact");
+    vectorNear(support_hr_body, saved_support_hr_body,
+               "HR BODY support contact");
+
+    const auto saved_contacts_world =
+        requireNode(root, "physical_tread_contacts_world", "root");
+    const Eigen::Vector3d saved_fl_world =
+        vector3(requireNode(saved_contacts_world, "FL",
+                            "physical_tread_contacts_world"),
+                "physical_tread_contacts_world.FL");
+    const Eigen::Vector3d saved_hr_world =
+        vector3(requireNode(saved_contacts_world, "HR",
+                            "physical_tread_contacts_world"),
+                "physical_tread_contacts_world.HR");
+    vectorNear(world_from_body.transpose() * (saved_fl_world - base_position),
+               saved_support_fl_body,
+               "saved FL WORLD-to-BODY representation");
+    vectorNear(world_from_body.transpose() * (saved_hr_world - base_position),
+               saved_support_hr_body,
+               "saved HR WORLD-to-BODY representation");
+    const auto saved_line = requireNode(root, "support_line_body", "root");
+    near(support_dx_body, scalar(saved_line, "dx_m", "support_line_body"),
+         "BODY support dx");
+    near(support_dy_body, scalar(saved_line, "dy_m", "support_line_body"),
+         "BODY support dy");
+    near(direction_x,
+         scalar(saved_line, "direction_x_abs", "support_line_body"),
+         "BODY support direction x");
+    near(support_angle_body_x,
+         scalar(saved_line, "angle_wrt_body_x_deg", "support_line_body"),
+         "BODY support angle relative to X");
+    near(support_angle_body_y,
+         scalar(saved_line, "angle_wrt_body_y_deg", "support_line_body"),
+         "BODY support angle relative to Y");
+  }
 
   vectorNear(
       com, vector3(requireNode(root, "com_world_xyz", "root"), "com_world_xyz"),
@@ -445,16 +665,52 @@ Result validate(const std::filesystem::path &yaml_path) {
        "max wheel torque utilization");
 
   const auto continuation = requireNode(root, "continuation", "root");
-  require(continuation.IsSequence() && continuation.size() == 3,
-          "Continuation A/B/C records are incomplete");
-  for (std::size_t i = 0; i < 3; ++i) {
-    require(continuation[i]["name"].as<std::string>() ==
-                    std::string(1, static_cast<char>('A' + i)) &&
-                continuation[i]["success"].as<bool>(),
-            "Continuation stage record is invalid");
+  if (sideways) {
+    require(continuation.IsSequence() && continuation.size() > 0,
+            "M-TO2S continuation records are missing");
+    const double selected_eps =
+        scalar(constraints, "support_dx_limit_m", "constraints");
+    bool selected_attempt_found = false;
+    for (std::size_t i = 0; i < continuation.size(); ++i) {
+      const auto attempt = continuation[i];
+      const double eps = attempt["eps_x_m"].as<double>();
+      const double clearance = attempt["swing_clearance_m"].as<double>();
+      require(std::isfinite(eps) && eps >= 0.030 - kMetricTolerance &&
+                  eps <= 0.100 + kMetricTolerance,
+              "Invalid M-TO2S eps_x continuation record");
+      require(std::isfinite(clearance) &&
+                  clearance >= 0.020 - kMetricTolerance &&
+                  clearance <= 0.030 + kMetricTolerance,
+              "Invalid M-TO2S clearance continuation record");
+      if (attempt["success"].as<bool>() &&
+          std::abs(eps - selected_eps) <= kMetricTolerance &&
+          std::abs(clearance - swing_clearance) <= kMetricTolerance)
+        selected_attempt_found = true;
+    }
+    require(selected_attempt_found,
+            "Selected M-TO2S continuation result is not recorded as success");
+  } else if (aligned) {
+    require(continuation.IsSequence() && continuation.size() >= 1 &&
+                continuation.size() <= 3,
+            "M-TO2R CoM continuation records are incomplete");
+    const auto final_attempt = continuation[continuation.size() - 1];
+    require(final_attempt["success"].as<bool>(),
+            "Final M-TO2R continuation attempt did not succeed");
+    near(final_attempt["com_tolerance_m"].as<double>(), com_tolerance,
+         "selected CoM tolerance");
+  } else {
+    require(continuation.IsSequence() && continuation.size() == 3,
+            "Continuation A/B/C records are incomplete");
+    for (std::size_t i = 0; i < 3; ++i) {
+      require(continuation[i]["name"].as<std::string>() ==
+                      std::string(1, static_cast<char>('A' + i)) &&
+                  continuation[i]["success"].as<bool>(),
+              "Continuation stage record is invalid");
+    }
   }
 
-  return {base_position,
+  return {milestone,
+          base_position,
           base_rpy,
           com,
           contacts,
@@ -470,7 +726,24 @@ Result validate(const std::filesystem::path &yaml_path) {
           friction_hr,
           max_leg_utilization,
           max_wheel_utilization,
-          quaternion_norm};
+          quaternion_norm,
+          wheel_body_angle_fl,
+          wheel_body_angle_hr,
+          wheel_parallel_angle,
+          wheel_vertical_fl,
+          wheel_vertical_hr,
+          support_fl_body,
+          support_hr_body,
+          saved_support_fl_body,
+          saved_support_hr_body,
+          com_body,
+          support_body,
+          support_distance_3d_world,
+          support_distance_3d_body,
+          support_dx_body,
+          support_dy_body,
+          support_angle_body_x,
+          support_angle_body_y};
 }
 
 void printVector(const Eigen::Vector3d &value) {
@@ -480,7 +753,8 @@ void printVector(const Eigen::Vector3d &value) {
 
 void printResult(const Result &result) {
   std::cout << std::fixed << std::setprecision(12);
-  std::cout << "M-TO2 INDEPENDENT VALIDATION\n\nPASS/FAIL = PASS\n\n";
+  std::cout << result.milestone
+            << " INDEPENDENT VALIDATION\n\nPASS/FAIL = PASS\n\n";
   std::cout << "CoM = ";
   printVector(result.com);
   std::cout << '\n';
@@ -510,6 +784,56 @@ void printResult(const Result &result) {
   std::cout << "minimum joint-limit margin = " << result.minimum_margin.minimum
             << " (" << result.minimum_margin.name << ")\n";
   std::cout << "quaternion norm = " << result.quaternion_norm << '\n';
+  if (result.milestone == "M-TO2R" || result.milestone == "M-TO2S") {
+    std::cout << "wheel alignment FL vs body [deg] = "
+              << result.wheel_body_angle_fl << '\n';
+    std::cout << "wheel alignment HR vs body [deg] = "
+              << result.wheel_body_angle_hr << '\n';
+    std::cout << "FL-HR wheel-axis angle [deg] = "
+              << result.wheel_parallel_angle << '\n';
+    std::cout << "FL wheel-axis vertical component = "
+              << result.wheel_vertical_fl << '\n';
+    std::cout << "HR wheel-axis vertical component = "
+              << result.wheel_vertical_hr << '\n';
+    std::cout << "wheel-alignment constraints = PASS\n";
+  }
+  if (result.milestone == "M-TO2S") {
+    std::cout << "saved FL support contact in BODY = ";
+    printVector(result.saved_support_fl_body);
+    std::cout << '\n';
+    std::cout << "saved HR support contact in BODY = ";
+    printVector(result.saved_support_hr_body);
+    std::cout << '\n';
+    std::cout << "WORLD-to-BODY reconstructed FL = ";
+    printVector(result.support_fl_body);
+    std::cout << '\n';
+    std::cout << "WORLD-to-BODY reconstructed HR = ";
+    printVector(result.support_hr_body);
+    std::cout << '\n';
+    std::cout << "support length from WORLD XY = " << result.support.length
+              << '\n';
+    std::cout << "support length from BODY XY = "
+              << result.support_body.length << '\n';
+    std::cout << "support length from WORLD 3D = "
+              << result.support_distance_3d_world << '\n';
+    std::cout << "support length from BODY 3D = "
+              << result.support_distance_3d_body << '\n';
+    std::cout << "CoM signed line error from WORLD XY = "
+              << result.support.signed_error << '\n';
+    std::cout << "CoM signed line error from BODY XY = "
+              << result.support_body.signed_error << '\n';
+    std::cout << "s/L from WORLD XY = "
+              << result.support.s / result.support.length << '\n';
+    std::cout << "s/L from BODY XY = "
+              << result.support_body.s / result.support_body.length << '\n';
+    std::cout << "BODY support dx = " << result.support_dx_body << '\n';
+    std::cout << "BODY support dy = " << result.support_dy_body << '\n';
+    std::cout << "support angle wrt body X [deg] = "
+              << result.support_angle_body_x << '\n';
+    std::cout << "support angle wrt body Y [deg] = "
+              << result.support_angle_body_y << '\n';
+    std::cout << "sideways-support constraints = PASS\n";
+  }
   std::cout << std::scientific << "full dynamics residual infinity norm = "
             << result.residual_infinity_norm << '\n';
   std::cout

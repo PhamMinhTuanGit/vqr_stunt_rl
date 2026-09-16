@@ -52,6 +52,10 @@ set(VQR_KINEMATIC_OUTPUT_PATH
   "${CMAKE_CURRENT_SOURCE_DIR}/output/kinematic_equilibrium_FL_HR.yaml")
 set(VQR_STATIC_OUTPUT_PATH
   "${CMAKE_CURRENT_SOURCE_DIR}/output/static_equilibrium_FL_HR.yaml")
+set(VQR_ALIGNED_STATIC_OUTPUT_PATH
+  "${CMAKE_CURRENT_SOURCE_DIR}/output/static_equilibrium_FL_HR_aligned.yaml")
+set(VQR_SIDEWAYS_STATIC_OUTPUT_PATH
+  "${CMAKE_CURRENT_SOURCE_DIR}/output/static_equilibrium_FL_HR_sideways.yaml")
 
 foreach(_required_file IN ITEMS
     "${VQR_URDF_PATH}"
@@ -168,6 +172,26 @@ file(CHMOD "${CMAKE_CURRENT_BINARY_DIR}/static_equilibrium"
     GROUP_READ GROUP_EXECUTE
     WORLD_READ WORLD_EXECUTE)
 
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/apps/static_equilibrium_aligned.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/static_equilibrium_aligned"
+  @ONLY)
+file(CHMOD "${CMAKE_CURRENT_BINARY_DIR}/static_equilibrium_aligned"
+  PERMISSIONS
+    OWNER_READ OWNER_WRITE OWNER_EXECUTE
+    GROUP_READ GROUP_EXECUTE
+    WORLD_READ WORLD_EXECUTE)
+
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/apps/static_equilibrium_sideways.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/static_equilibrium_sideways"
+  @ONLY)
+file(CHMOD "${CMAKE_CURRENT_BINARY_DIR}/static_equilibrium_sideways"
+  PERMISSIONS
+    OWNER_READ OWNER_WRITE OWNER_EXECUTE
+    GROUP_READ GROUP_EXECUTE
+    WORLD_READ WORLD_EXECUTE)
+
 include(CTest)
 if(BUILD_TESTING)
   add_test(NAME vqr_model_audit COMMAND model_audit)
@@ -208,4 +232,28 @@ if(BUILD_TESTING)
       "${VQR_STATIC_OUTPUT_PATH}")
   set_tests_properties(independent_static_validation PROPERTIES
     DEPENDS solve_static_equilibrium)
+
+  add_test(NAME solve_aligned_static_equilibrium
+    COMMAND "${CMAKE_CURRENT_BINARY_DIR}/static_equilibrium_aligned")
+  add_test(NAME independent_aligned_static_validation
+    COMMAND validate_static_equilibrium
+      "${VQR_ALIGNED_STATIC_OUTPUT_PATH}")
+  set_tests_properties(independent_aligned_static_validation PROPERTIES
+    DEPENDS solve_aligned_static_equilibrium)
+
+  add_test(NAME solve_sideways_static_equilibrium
+    COMMAND "${CMAKE_CURRENT_BINARY_DIR}/static_equilibrium_sideways")
+  add_test(NAME independent_sideways_static_validation
+    COMMAND validate_static_equilibrium
+      "${VQR_SIDEWAYS_STATIC_OUTPUT_PATH}")
+  set_tests_properties(independent_sideways_static_validation PROPERTIES
+    DEPENDS solve_sideways_static_equilibrium)
+  add_test(NAME sideways_frame_consistency
+    COMMAND validate_static_equilibrium
+      "${VQR_SIDEWAYS_STATIC_OUTPUT_PATH}")
+  add_test(NAME sideways_frame_inconsistency_rejected
+    COMMAND "${VQR_PYTHON_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/sideways_frame_inconsistency_test.py"
+      --validator "$<TARGET_FILE:validate_static_equilibrium>"
+      --yaml "${VQR_SIDEWAYS_STATIC_OUTPUT_PATH}")
 endif()
