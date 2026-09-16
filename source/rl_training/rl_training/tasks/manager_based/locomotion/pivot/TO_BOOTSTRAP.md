@@ -103,3 +103,8 @@ the previously achieved level. Window counters restart. Old four-to-two
 checkpoints have different command/reward semantics and should not be treated
 as equivalent to new training runs. Reference path overrides should be paired
 with an audit of the standing-centered action scales for the new pose.
+
+To intentionally lock advancement at a selected starting level, set
+`env.commands.pivot.initial_level=N` and `env.commands.pivot.freeze_level=true`.
+The default is `false`, preserving automatic advancement. A frozen run still
+collects and logs window success statistics but never increments its level.

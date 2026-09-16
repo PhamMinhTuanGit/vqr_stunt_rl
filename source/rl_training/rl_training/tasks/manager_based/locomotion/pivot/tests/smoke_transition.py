@@ -17,6 +17,7 @@ try:
     import rl_training.tasks
     from isaaclab_tasks.utils import parse_env_cfg
     from rl_training.tasks.manager_based.locomotion.pivot.mdp.to_reference import pose_reference, contact_targets
+    from rl_training.tasks.manager_based.locomotion.pivot.mdp.to_transition import transition_levels
 
     task = "Pivot-FourToTwoWheelRotate-v0"
     assert task in gym.registry
@@ -36,6 +37,22 @@ try:
         torch.testing.assert_close(ref[2], term.target)
         assert torch.all(term.command[:, 1] == 0)
         assert torch.max((term.robot.data.joint_pos[:, term.joint_ids] - term.standing).abs()) < .04
+        # Exercise both branches of the explicit curriculum lock without
+        # waiting for 256 physical episodes.
+        original_successful = term.successful
+        term.successful = lambda ids: torch.ones(len(ids), device=raw.device, dtype=torch.bool)
+        term.level = 2
+        term.episode_level[:] = 2
+        term.steps[:] = 1
+        term.window_count = term.window_success = 0
+        term.cfg.freeze_level = True
+        transition_levels(raw, torch.arange(raw.num_envs, device=raw.device), min_episodes=1, success_rate=0.0)
+        assert term.level == 2
+        term.window_count = term.window_success = 0
+        term.cfg.freeze_level = False
+        transition_levels(raw, torch.arange(raw.num_envs, device=raw.device), min_episodes=1, success_rate=0.0)
+        assert term.level == 3
+        term.successful = original_successful
         # Exercise all levels and timings without requiring random actions to balance.
         for level in range(5):
             term.level = level

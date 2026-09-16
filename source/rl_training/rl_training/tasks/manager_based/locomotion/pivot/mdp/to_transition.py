@@ -163,6 +163,8 @@ class TOPivotCommandCfg(CommandTermCfg):
     contact_threshold: float = 1.0
     final_contact_success_ratio: float = 0.7
     yaw_success_error: float = 0.15
+    # New: explicitly freeze curriculum advancement when requested by a run.
+    freeze_level: bool = False
 
 
 def transition_levels(env, env_ids, command_name="pivot", min_episodes=256, success_rate=0.8):
@@ -171,9 +173,21 @@ def transition_levels(env, env_ids, command_name="pivot", min_episodes=256, succ
     ids = ids[(term.steps[ids] > 0) & (term.episode_level[ids] == term.level)]
     term.window_count += len(ids)
     term.window_success += int(term.successful(ids).sum().item())
+    # Old behavior (kept here as a reference): every successful window could
+    # advance the global level automatically.
+    # if term.window_count >= min_episodes:
+    #     term.last_success_rate = term.window_success / term.window_count
+    #     if term.last_success_rate >= success_rate:
+    #         term.level = min(term.level + 1, 4)
+    #     term.window_count = term.window_success = 0
+
+    # New behavior: an explicit freeze keeps the configured level fixed while
+    # still reporting the observed window success rate for diagnostics. The
+    # fallback keeps older externally-created command configs runnable.
     if term.window_count >= min_episodes:
         term.last_success_rate = term.window_success / term.window_count
-        if term.last_success_rate >= success_rate:
+        freeze_level = getattr(term.cfg, "freeze_level", False)
+        if not freeze_level and term.last_success_rate >= success_rate:
             term.level = min(term.level + 1, 4)
         term.window_count = term.window_success = 0
     return {"level": float(term.level), "window_success_rate": term.last_success_rate}

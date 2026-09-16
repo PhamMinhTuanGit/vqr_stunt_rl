@@ -119,6 +119,8 @@ class FourToTwoCommandsCfg:
         leg_joint_names=LEG_JOINT_NAMES,
         wheel_body_names=WHEEL_BODY_NAMES,
         standing_positions=STANDING_LEG_POSITION_MAP,
+        # New: default keeps automatic curriculum advancement enabled.
+        freeze_level=False,
     )
 
 
