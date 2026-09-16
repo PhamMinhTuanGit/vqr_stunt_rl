@@ -1,3 +1,5 @@
+#include "pose_optimization/wheel_contact_geometry.hpp"
+
 #include <pinocchio/algorithm/center-of-mass.hpp>
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/joint-configuration.hpp>
@@ -144,40 +146,6 @@ std::string urdfJointTypeName(int type) {
   }
 }
 
-double validateAndReadWheelRadius(const urdf::ModelInterfaceSharedPtr &urdf_model,
-                                  const std::string &link_name) {
-  const urdf::LinkConstSharedPtr link = urdf_model->getLink(link_name);
-  require(static_cast<bool>(link), "Missing URDF wheel link: " + link_name);
-  require(!link->collision_array.empty(),
-          "Wheel link has no collision geometry: " + link_name);
-
-  bool found_cylinder = false;
-  double radius = std::numeric_limits<double>::quiet_NaN();
-  for (const auto &collision : link->collision_array) {
-    require(static_cast<bool>(collision), "Null collision on wheel link: " + link_name);
-    require(static_cast<bool>(collision->geometry),
-            "Collision has no geometry on wheel link: " + link_name);
-    if (collision->geometry->type != urdf::Geometry::CYLINDER) {
-      continue;
-    }
-    const auto *cylinder =
-        static_cast<const urdf::Cylinder *>(collision->geometry.get());
-    require(near(collision->origin.position.x, 0.0) &&
-                near(collision->origin.position.y, 0.0) &&
-                near(collision->origin.position.z, 0.0),
-            "Wheel collision cylinder is offset from its BODY frame: " + link_name);
-    if (!found_cylinder) {
-      radius = cylinder->radius;
-      found_cylinder = true;
-    } else {
-      require(near(radius, cylinder->radius),
-              "Wheel link contains inconsistent cylinder radii: " + link_name);
-    }
-  }
-  require(found_cylinder, "Wheel link has no cylinder collision: " + link_name);
-  return radius;
-}
-
 template <typename Container>
 void printNameList(const Container &names) {
   for (std::size_t i = 0; i < names.size(); ++i) {
@@ -240,14 +208,34 @@ int main() {
 
     double wheel_radius = std::numeric_limits<double>::quiet_NaN();
     std::map<std::string, pinocchio::FrameIndex> wheel_frame_ids;
+    std::map<std::string, pose_optimization::WheelCollisionGeometry>
+        wheel_geometries;
+    std::map<std::string, Eigen::Vector3d> wheel_joint_axes_local;
     for (const auto &[corner, frame_name] : kWheelFrames) {
-      const double radius = validateAndReadWheelRadius(urdf_model, frame_name);
+      const auto geometry = pose_optimization::parseWheelCollisionGeometry(
+          urdf_model, frame_name);
+      const double radius = geometry.radius;
       if (!std::isfinite(wheel_radius)) {
         wheel_radius = radius;
       }
       require(near(radius, wheel_radius),
               "The four wheel collision radii are not identical");
       wheel_frame_ids.emplace(corner, bodyFrameId(model, frame_name));
+      wheel_geometries.emplace(corner, geometry);
+
+      const urdf::JointConstSharedPtr wheel_joint =
+          urdf_model->getJoint(frame_name);
+      require(static_cast<bool>(wheel_joint),
+              "Missing wheel joint for geometry: " + frame_name);
+      const Eigen::Vector3d joint_axis(
+          wheel_joint->axis.x, wheel_joint->axis.y, wheel_joint->axis.z);
+      require(joint_axis.allFinite() && joint_axis.norm() > 0.0,
+              "Invalid local wheel joint axis: " + frame_name);
+      require(geometry.cylinder_axis_in_wheel_frame.cross(
+                  joint_axis.normalized()).norm() < 2.0e-4,
+              "Wheel collision cylinder axis disagrees with joint axis: " +
+                  frame_name);
+      wheel_joint_axes_local.emplace(corner, joint_axis.normalized());
     }
     require(near(wheel_radius, kExpectedWheelRadius),
             "Wheel radius differs from the audited 0.091 m value");
@@ -301,11 +289,26 @@ int main() {
     require(nominal_com.allFinite(), "Nominal center of mass is not finite");
 
     std::map<std::string, Eigen::Vector3d> wheel_positions;
+    std::map<std::string, Eigen::Vector3d> wheel_axes_world;
+    std::map<std::string, Eigen::Vector3d> tread_contacts_world;
     for (const auto &[corner, frame_name] : kWheelFrames) {
-      const Eigen::Vector3d position =
-          data.oMf[wheel_frame_ids.at(corner)].translation();
-      require(position.allFinite(), "Non-finite FK for wheel frame: " + frame_name);
-      wheel_positions.emplace(corner, position);
+      const pinocchio::SE3 &world_from_wheel =
+          data.oMf[wheel_frame_ids.at(corner)];
+      const auto &geometry = wheel_geometries.at(corner);
+      const Eigen::Vector3d collision_center_world =
+          world_from_wheel.rotation() * geometry.origin_xyz +
+          world_from_wheel.translation();
+      const Eigen::Vector3d cylinder_axis_world =
+          world_from_wheel.rotation() *
+          geometry.cylinder_axis_in_wheel_frame;
+      const Eigen::Vector3d tread_contact_world =
+          pose_optimization::treadContactPoint(
+              collision_center_world, cylinder_axis_world, geometry.radius);
+      require(collision_center_world.allFinite(),
+              "Non-finite collision-center FK for wheel frame: " + frame_name);
+      wheel_positions.emplace(corner, collision_center_world);
+      wheel_axes_world.emplace(corner, cylinder_axis_world);
+      tread_contacts_world.emplace(corner, tread_contact_world);
     }
 
     std::cout << std::fixed << std::setprecision(9);
@@ -346,6 +349,19 @@ int main() {
                  "cylinder origin is [0,0,0] in each wheel BODY frame)\n";
     std::cout << "Explicit ground-contact frame: none\n";
     std::cout << "wheel radius [m]: " << wheel_radius << '\n';
+    std::cout << "Wheel collision geometry (origin and axis in wheel BODY frame):\n";
+    for (const auto &[corner, frame_name] : kWheelFrames) {
+      const auto &geometry = wheel_geometries.at(corner);
+      const Eigen::Vector3d &joint_axis = wheel_joint_axes_local.at(corner);
+      std::cout << "  " << corner << " frame=" << frame_name
+                << " origin_xyz=[" << geometry.origin_xyz.transpose() << "]"
+                << " origin_rpy=[" << geometry.origin_rpy.transpose() << "]"
+                << " radius=" << geometry.radius
+                << " length=" << geometry.length
+                << " cylinder_axis_local=["
+                << geometry.cylinder_axis_in_wheel_frame.transpose() << "]"
+                << " joint_axis_local=[" << joint_axis.transpose() << "]\n";
+    }
 
     std::cout << "\nURDF joint limits in Pinocchio joint order:\n";
     for (pinocchio::JointIndex id = 2; id < model.names.size(); ++id) {
@@ -386,12 +402,21 @@ int main() {
     std::cout << "Nominal Pinocchio q valid: PASS\n";
     std::cout << "Nominal CoM xyz [m]: [" << nominal_com.x() << ", "
               << nominal_com.y() << ", " << nominal_com.z() << "]\n";
-    std::cout << "Nominal wheel-frame FK xyz [m]:\n";
+    std::cout << "Nominal wheel collision-center FK xyz [m], WORLD frame "
+                 "(Pinocchio data.oMf):\n";
     for (const auto &[corner, unused_frame_name] : kWheelFrames) {
       (void)unused_frame_name;
       const Eigen::Vector3d &position = wheel_positions.at(corner);
       std::cout << "  " << corner << " = [" << position.x() << ", "
                 << position.y() << ", " << position.z() << "]\n";
+    }
+    std::cout << "Nominal physical tread contact xyz [m], WORLD frame:\n";
+    for (const auto &[corner, unused_frame_name] : kWheelFrames) {
+      (void)unused_frame_name;
+      const Eigen::Vector3d &axis = wheel_axes_world.at(corner);
+      const Eigen::Vector3d &contact = tread_contacts_world.at(corner);
+      std::cout << "  " << corner << " axis=[" << axis.transpose()
+                << "] contact=[" << contact.transpose() << "]\n";
     }
 
     std::cout << "\nVerification:\n";
@@ -402,10 +427,13 @@ int main() {
     std::cout << "  all four wheel BODY frames exist: PASS\n";
     std::cout << "  joint limits read: PASS\n";
     std::cout << "  nominal pose valid for Pinocchio: PASS\n";
+    std::cout << "  all four wheel collision geometries parsed: PASS\n";
+    std::cout << "  physical tread contact points finite: PASS\n";
     std::cout << "M-TO0 RESULT: PASS\n";
+    std::cout << "M-TO1A RESULT: PASS\n";
     return 0;
   } catch (const std::exception &error) {
-    std::cerr << "M-TO0 RESULT: FAIL\n";
+    std::cerr << "M-TO0/M-TO1A RESULT: FAIL\n";
     std::cerr << "Reason: " << error.what() << '\n';
     return 1;
   }

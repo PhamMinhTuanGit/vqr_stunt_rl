@@ -1,8 +1,9 @@
-# VQR pose optimization — M-TO0 model audit
+# VQR pose optimization — through M-TO2 static dynamics
 
-This directory currently implements **M-TO0 only**. It does not contain
-kinematic optimization, CasADi, IPOPT, contact-force optimization, RNEA
-equilibrium constraints, RL, or trajectory optimization.
+This directory implements **M-TO0** through **M-TO2**. M-TO1B is the
+configuration-only solve, M-TO1C independently validates that saved pose, and
+M-TO2 solves and independently validates static RNEA equilibrium on the FL-HR
+physical tread contacts. There is no RL or trajectory optimization here.
 
 ## Model provenance
 
@@ -30,15 +31,30 @@ USD and that its converter metadata still names this URDF.
 From this directory:
 
 ```bash
+# One-time repository-local dependency installation, if third_party/casadi is
+# absent. Do not install a second NumPy: Pinocchio uses the project's NumPy ABI.
+python -m pip install --target ../third_party/casadi --no-deps casadi==3.7.2
+
 cmake -S . -B build
 cmake --build build -j
 ./build/model_audit
+./build/wheel_contact_geometry_test
+./build/kinematic_equilibrium
+./build/kinematic_equilibrium --verify
+./build/validate_kinematic_equilibrium \
+  output/kinematic_equilibrium_FL_HR.yaml
+./build/static_equilibrium
+./build/validate_static_equilibrium \
+  output/static_equilibrium_FL_HR.yaml
 ctest --test-dir build --output-on-failure
 ```
 
 The build first uses a normally discoverable Pinocchio package. It also detects
 the `cmeel.prefix` layout used by the project's installed Pinocchio wheel, so
-the commands above do not need a machine-specific `CMAKE_PREFIX_PATH` here.
+the commands above do not need a machine-specific `CMAKE_PREFIX_PATH` here. The
+generated `build/kinematic_equilibrium` launcher selects the matching Python
+executable and Pinocchio binding, plus repository-local CasADi, without changing
+the active Conda environment.
 
 ## Audited conventions
 
@@ -49,10 +65,10 @@ the commands above do not need a machine-specific `CMAKE_PREFIX_PATH` here.
 - `FL_WHEEL`, `FR_WHEEL`, `HL_WHEEL`, and `HR_WHEEL` are selected specifically
   as Pinocchio `BODY` frames. A same-named joint frame also exists, so selecting
   by name without a frame type would be ambiguous.
-- Each wheel link has one cylinder collision of radius `0.091 m`, whose origin
-  is `[0, 0, 0]` in the wheel link. The selected BODY frames are consequently
-  **wheel-center frames**, not ground-contact frames. The URDF defines no
-  explicit ground-contact frame.
+- Each wheel link has one cylinder collision of radius `0.091 m` and length
+  `0.04 m`, whose origin is `xyz=[0,0,0]`, `rpy=[1.5709,0,0]` in the wheel
+  link. The selected BODY frames are consequently **wheel-center frames**, not
+  ground-contact frames. The URDF defines no explicit ground-contact frame.
 - The URDF provides `60 Nm` effort limits for all 12 leg joints. Its four
   continuous wheel joints have neither angular position limits nor effort
   limits. The Isaac Lab actuator config separately applies `20 Nm` to wheels;
@@ -108,20 +124,165 @@ HL center [m] = [-0.247794814,  0.236500000, 0.086164386]
 HR center [m] = [-0.247794814, -0.236500000, 0.086164386]
 ```
 
+These positions are translations from `data.oMf` after
+`updateFramePlacements`. In Pinocchio notation, `o` is the origin/universe
+frame, so the numbers are expressed in the **WORLD frame**. They are not
+wheel-local coordinates. Since every collision origin translation is zero,
+the reported wheel BODY origin and collision center coincide.
+
+## M-TO1A wheel contact geometry
+
+All four wheel collisions parse to the same geometry:
+
+| Wheel | BODY frame | Collision xyz | Collision rpy | Radius | Length | Cylinder axis in BODY frame | Joint axis in joint frame |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| FL | `FL_WHEEL` | `[0,0,0]` | `[1.5709,0,0]` | `0.091 m` | `0.04 m` | `[0,-0.999999995,-0.000103673]` | `[0,-1,0]` |
+| FR | `FR_WHEEL` | `[0,0,0]` | `[1.5709,0,0]` | `0.091 m` | `0.04 m` | `[0,-0.999999995,-0.000103673]` | `[0,-1,0]` |
+| HL | `HL_WHEEL` | `[0,0,0]` | `[1.5709,0,0]` | `0.091 m` | `0.04 m` | `[0,-0.999999995,-0.000103673]` | `[0,-1,0]` |
+| HR | `HR_WHEEL` | `[0,0,0]` | `[1.5709,0,0]` | `0.091 m` | `0.04 m` | `[0,-0.999999995,-0.000103673]` | `[0,-1,0]` |
+
+A URDF cylinder's intrinsic axis is its geometry-frame `+Z`. Applying the
+collision-origin rotation gives the physical cylinder axis above in the wheel
+BODY frame. It differs from exact `-Y` by about `1.04e-4 rad` because the URDF
+uses rounded `1.5709` rather than exact `pi/2`. M-TO1A preserves that parsed
+geometry instead of silently replacing it with the joint axis.
+
+The reusable helper accepts a collision center `c`, cylinder axis `a`, and
+radius `r`, with `c` and `a` expressed in the same gravity-aligned coordinate
+frame whose `+Z` is `ez` (normally WORLD). It normalizes `a` and computes:
+
+```text
+ez = [0, 0, 1]
+u = (I - a a^T) ez / ||(I - a a^T) ez||
+p_contact = c - r u
+```
+
+For WORLD-frame contact output, `c` is obtained by transforming the collision
+origin with `data.oMf`, and `a` is rotated to WORLD by the same frame placement.
+The helper rejects non-finite input, non-positive radius, zero axis, and a
+vertical axis (where the projected tread direction is undefined). It never
+assumes `wheel_center.z = radius`.
+
+At the nominal state the parsed geometry produces these WORLD-frame physical
+tread points:
+
+```text
+FL = [ 0.249005186,  0.236507510, -0.004835614] m
+FR = [ 0.249005186, -0.236492490, -0.004835614] m
+HL = [-0.247794814,  0.236507510, -0.004835614] m
+HR = [-0.247794814, -0.236492490, -0.004835614] m
+```
+
 The nominal center height is about `4.84 mm` below the collision radius. That
 does not change the audited convention: these are wheel-center BODY frames, and
 the repository's nominal base height is not being altered in M-TO0.
 
-The executable and CTest both pass all required checks: provenance, URDF load,
-positive mass, finite CoM, finite FK, four BODY frames, readable joint limits,
-and a finite normalized nominal Pinocchio configuration within bounded-joint
-limits.
+The audit and wheel-geometry tests cover the M-TO0 model checks, four
+successfully parsed wheel geometries, finite contact results, and the
+horizontal-axis identity `contact_z = center_z - radius`.
+
+## M-TO1B kinematic optimization
+
+The decision vector contains exactly `base_z`, `base_roll`, `base_pitch`, and
+the 12 leg joint positions. Base x/y/yaw are fixed to zero and all four wheel
+angles are explicitly fixed to nominal zero. The initial point is the audited
+M-TO0 standing state. Joint position bounds use the URDF limits with the
+configured `0.05 rad` margin, while roll and pitch are bounded to `25 deg`.
+
+Pinocchio evaluates free-flyer FK and CoM. The M-TO1A collision parser and tread
+contact helper are exported through a small C ABI library and invoked for all
+four wheels, so the optimizer never substitutes `wheel_center.z = radius`.
+CasADi wraps this Pinocchio geometry evaluation as a callback, computes central
+finite-difference Jacobians, and solves the NLP with IPOPT and a limited-memory
+Hessian. This split avoids mixing the old libstdc++ ABI of the CasADi wheel with
+the new ABI used by the installed Pinocchio/urdfdom libraries.
+
+The solve always runs the requested warm-started continuation:
+
+```text
+A: clearance 0 mm,  CoM tolerance 10 mm
+B: clearance 5 mm,  CoM tolerance 8 mm
+C: clearance 10 mm, CoM tolerance 5 mm
+D: clearance 20 mm, CoM tolerance 2 mm
+```
+
+IPOPT bound relaxation is disabled so the saved result lies on the feasible
+side of the literal clearance and CoM thresholds. The solver writes:
+
+```text
+output/kinematic_equilibrium_FL_HR.yaml
+```
+
+The YAML stores all 15 decision variables, fixed coordinates and wheel angles,
+the complete 27-element Pinocchio configuration, physical tread contact points,
+CoM, support-line metrics, joint-limit margin, objective, and per-stage solver
+status. `--verify` reloads that YAML and independently recomputes every reported
+geometry and acceptance constraint.
+
+## M-TO1C independent validation
+
+`validate_kinematic_equilibrium` is a standalone C++ executable with no CasADi
+or optimizer dependency. It requires every base coordinate, all 12 leg angles,
+all four wheel angles, and the complete saved Pinocchio configuration to be
+present in the M-TO1B YAML. It independently reconstructs free-flyer `q` from
+base RPY using `Rz(yaw) Ry(pitch) Rx(roll)` and reconstructs every continuous
+wheel coordinate as `[cos(theta), sin(theta)]`.
+
+The validator then runs Pinocchio FK and CoM directly, parses the wheel collision
+geometry again, and calls the M-TO1A physical tread-contact helper for every
+wheel. Its support-line implementation is local to the validator rather than
+shared with the solver. It checks all requested feasibility thresholds, finite
+values, quaternion/configuration normalization, every finite leg-joint limit,
+the continuous-wheel representations, and numerical agreement with the saved
+27-element `q`, CoM, four contact vectors, and reported metrics.
+
+CTest target `independent_kinematic_validation` is the saved-pose regression
+test. It only reads the existing output and does not invoke or mutate the
+optimizer solution.
+
+## M-TO2 static dynamics optimization
+
+The M-TO2 decision vector contains the M-TO1 pose variables, all 12 leg and
+four wheel actuator torques, and WORLD-frame contact forces at FL and HR. Base
+x/y/yaw and all wheel angles remain fixed at zero; velocity and acceleration
+are zero. The solver imposes all 22 Pinocchio equations
+
+```text
+rnea(q, 0, 0) = S^T tau + J_FL(q)^T f_FL + J_HR(q)^T f_HR
+```
+
+including floating-base and wheel rows. `S` is assembled from each named
+joint's Pinocchio `idx_v`, not from an assumed articulation order. Each contact
+Jacobian is the WORLD-aligned linear Jacobian of the physical tread material
+point returned by M-TO1A, rather than the wheel-center Jacobian. A finite-
+difference check of this point-Jacobian construction has maximum error below
+`1e-9`.
+
+The warm-started continuation applies dynamics and geometry in stage A,
+positive normal forces and the `mu = 0.6` friction pyramid in stage B, then all
+actuator limits in stage C. Leg limits are `60 Nm`. Wheel limits are `20 Nm`
+from the Isaac Lab actuator configuration; the wheel value is **not** a
+URDF-provided or hardware-verified limit. No final constraint is relaxed. The
+solver writes the complete result to:
+
+```text
+output/static_equilibrium_FL_HR.yaml
+```
+
+`validate_static_equilibrium` is a standalone C++ regression validator without
+CasADi or solver code. It independently reconstructs the normalized free-flyer
+and continuous-wheel configuration, reruns Pinocchio RNEA/FK/CoM/Jacobians,
+recomputes the M-TO1A tread geometry, all 22 dynamics residuals, support
+geometry, friction and torque utilization, and joint margins, then compares
+those results with the saved YAML. CTest target
+`independent_static_validation` covers this saved M-TO2 pose.
 
 ## Remaining model limitation
 
 There is no ambiguity in the audited URDF source, joint ordering, actuator
-mapping, wheel radius, or selected frame convention. There is, however, no
-explicit ground-contact frame in the URDF; later work must derive a contact
-point from the wheel-center frame and geometry. Also, `20 Nm` for each wheel is
-an Isaac Lab actuator setting only—the URDF supplies no wheel effort limit, so
-it is not independently established as a hardware torque rating.
+mapping, wheel dimensions, coordinate frame, or selected frame convention.
+There is no explicit ground-contact frame in the URDF; M-TO1A therefore derives
+the physical tread point from the parsed collision cylinder. Also, `20 Nm` for
+each wheel is an Isaac Lab actuator setting only—the URDF supplies no wheel
+effort limit, so it is not independently established as a hardware torque
+rating.
