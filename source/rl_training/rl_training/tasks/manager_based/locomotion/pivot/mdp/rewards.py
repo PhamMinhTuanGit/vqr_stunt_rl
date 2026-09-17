@@ -1527,6 +1527,22 @@ def support_midpoint_drift_reward(
 def _is_land(env, command_name: str) -> torch.Tensor:
     return _mode_gate(env, command_name) == LAND
 
+def rear_up_pitch_progress(env, command_name):
+    term = env.command_manager.get_term(command_name)
+
+    _, pitch, _ = math_utils.euler_xyz_from_quat(
+        env.scene["robot"].data.root_quat_w
+    )
+
+    target = term.pitch_command.clamp_min(0.1)
+
+    progress = torch.clamp(
+        pitch / target,
+        min=0.0,
+        max=1.0,
+    )
+
+    return progress * (term.mode == REAR_UP)
 
 def front_wheels_off_ground(
     env: ManagerBasedRLEnv,
