@@ -430,7 +430,7 @@ DELTA_THETA_IDX = 5
 TUCK_IDX = 6
 
 class PivotModeCommand(CommandTerm):
-    """Four-mode pivot command: mode one-hot(4) | omega_z* | delta_theta* | tuck*.
+    """Four-mode pivot command: mode one-hot(4) | omega_z* | delta_theta* | pose phase.
 
     The command term owns the time-based mode schedule and samples the
     continuous setpoints around it.  This keeps mode progression inside the
@@ -444,10 +444,19 @@ class PivotModeCommand(CommandTerm):
             cfg.ground_duration_s,
             cfg.rear_up_duration_s,
             cfg.balance_duration_s,
+            cfg.land_duration_s,
         ) <= 0.0:
             raise ValueError("Pivot mode durations must all be positive.")
+        self._support_body_ids = self.robot.find_bodies(
+            cfg.support_body_names, preserve_order=True
+        )[0]
+        if len(self._support_body_ids) != 2:
+            raise ValueError("Pivot support must resolve exactly HL_WHEEL and HR_WHEEL.")
         self._cmd = torch.zeros(self.num_envs, COMMAND_DIM, device=self.device)
+        self._sampled_omega_z = torch.zeros(self.num_envs, device=self.device)
         self._mode = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._support_anchor_xy = torch.zeros(self.num_envs, 2, device=self.device)
+        self._body_anchor_xy = torch.zeros(self.num_envs, 2, device=self.device)
         self.metrics["error_omega_z"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_delta_theta"] = torch.zeros(self.num_envs, device=self.device)
 
@@ -472,7 +481,33 @@ class PivotModeCommand(CommandTerm):
 
     @property
     def tuck_command(self) -> torch.Tensor:
+        """Compatibility alias for the deterministic standing/balance phase."""
         return self._cmd[:, TUCK_IDX]
+
+    @property
+    def pose_phase(self) -> torch.Tensor:
+        return self._cmd[:, TUCK_IDX]
+
+    @property
+    def pitch_command(self) -> torch.Tensor:
+        """Continuous pitch target: standing=0, balance=theta*+delta."""
+        from .theta_star import theta_star
+
+        balance_pitch = theta_star(self.omega_z_command) + self.delta_theta_command
+        return self.pose_phase * balance_pitch
+
+    @property
+    def support_anchor_xy(self) -> torch.Tensor:
+        """HL-HR midpoint frozen when GROUND transitions to REAR_UP."""
+        return self._support_anchor_xy
+
+    @property
+    def body_anchor_xy(self) -> torch.Tensor:
+        """Body-center anchor captured at reset and at LAND entry."""
+        return self._body_anchor_xy
+
+    def _support_midpoint_xy(self) -> torch.Tensor:
+        return self.robot.data.body_pos_w[:, self._support_body_ids, :2].mean(dim=1)
 
     # -- supervisor hooks -------------------------------------------------
     def set_mode(self, env_ids: torch.Tensor, modes: torch.Tensor) -> None:
@@ -489,25 +524,46 @@ class PivotModeCommand(CommandTerm):
         # mode from episode time in ``_update_command``.
         self._mode[env_ids] = GROUND
         # omega_z* <= |6| BALANCE / |3| GROUND (invariant I10) via clamp at write.
-        self._cmd[env_ids, OMEGA_Z_IDX] = r(self.cfg.omega_z_range).clamp_(
+        self._sampled_omega_z[env_ids] = r(self.cfg.omega_z_range).clamp_(
             -self.cfg.omega_z_limit, self.cfg.omega_z_limit
         )
         # delta_theta* in +/-8 deg around theta*(omega_z) (section 7).
         self._cmd[env_ids, DELTA_THETA_IDX] = r(self.cfg.delta_theta_range).clamp_(
             -self.cfg.delta_theta_limit, self.cfg.delta_theta_limit
         )
-        # tuck* in [0, 1]: 0 = open stance, 1 = fully tucked.
-        self._cmd[env_ids, TUCK_IDX] = r((0.0, 1.0))
+        # The seventh component is deterministic transition progress.  It is
+        # kept at zero here and updated from episode time every control step.
+        self._cmd[env_ids, TUCK_IDX] = 0.0
+        self._support_anchor_xy[env_ids] = self._support_midpoint_xy()[env_ids]
+        self._body_anchor_xy[env_ids] = self.robot.data.root_pos_w[env_ids, :2]
         # Keep the one-hot consistent with resampled modes.
         one_hot = torch.nn.functional.one_hot(self._mode[env_ids], NUM_MODES).to(self._cmd.dtype)
         self._cmd[env_ids, :NUM_MODES] = one_hot
         # A share of envs gets a pure hold (omega_z* = 0) to preserve the static
         # balance skill (S2 gate: r_xi > 0.7 for 20 s).
         hold = torch.rand(n, device=device) < self.cfg.rel_standing_envs
-        self._cmd[env_ids[hold], OMEGA_Z_IDX] = 0.0
+        self._sampled_omega_z[env_ids[hold]] = 0.0
+        self._cmd[env_ids, OMEGA_Z_IDX] = self._sampled_omega_z[env_ids].clamp(
+            -self.cfg.ground_omega_z_limit, self.cfg.ground_omega_z_limit
+        )
 
     def _update_command(self):
+        previous_mode = self._mode.clone()
         self._update_mode()
+
+        land_entry = (previous_mode != LAND) & (self._mode == LAND)
+        self._body_anchor_xy[land_entry] = self.robot.data.root_pos_w[land_entry, :2]
+
+        from .pivot_math import pose_phase_from_time
+
+        episode_time = self._env.episode_length_buf.float() * self._env.step_dt
+        self._cmd[:, TUCK_IDX] = pose_phase_from_time(
+            episode_time,
+            self.cfg.ground_duration_s,
+            self.cfg.rear_up_duration_s,
+            self.cfg.balance_duration_s,
+            self.cfg.land_duration_s,
+        )
 
         one_hot = torch.nn.functional.one_hot(
             self._mode,
@@ -517,34 +573,30 @@ class PivotModeCommand(CommandTerm):
         self._cmd[:, :NUM_MODES] = one_hot
 
         # I10
-        omega = self._cmd[:, OMEGA_Z_IDX]
+        omega = self._sampled_omega_z.clone()
 
         ground = self._mode == GROUND
-        balance = self._mode == BALANCE
-
         omega[ground] = torch.clamp(
             omega[ground], -self.cfg.ground_omega_z_limit, self.cfg.ground_omega_z_limit
         )
-
-        omega[balance] = torch.clamp(
-            omega[balance], -self.cfg.omega_z_limit, self.cfg.omega_z_limit
-        )
+        omega = torch.clamp(omega, -self.cfg.omega_z_limit, self.cfg.omega_z_limit)
 
         self._cmd[:, OMEGA_Z_IDX] = omega
+
+        # Track the actual rear midpoint while all four wheels are on the
+        # ground, then freeze it for the rear-supported phases.  This avoids a
+        # false drift jump when GROUND finishes at a non-zero yaw angle.
+        ground_ids = self._mode == GROUND
+        self._support_anchor_xy[ground_ids] = self._support_midpoint_xy()[ground_ids]
 
     def _update_metrics(self):
         self.metrics["error_omega_z"] += torch.abs(
             self.omega_z_command - self.robot.data.root_ang_vel_b[:, 2]
         ) / self._env.max_episode_length
-        # Realized pitch offset around theta*(omega_z*) without environment-owned
-        # caches.  This is a metric only; rewards read state independently.
-        from .theta_star import theta_star
-
         g = self.robot.data.projected_gravity_b
         pitch = torch.atan2(-g[:, 0], -g[:, 2])
-        realized = pitch - theta_star(self.omega_z_command)
         self.metrics["error_delta_theta"] += torch.abs(
-            self.delta_theta_command - realized
+            pitch - self.pitch_command
         ) / self._env.max_episode_length
 
     def _set_debug_vis_impl(self, debug_vis):
@@ -592,6 +644,7 @@ class PivotModeCommand(CommandTerm):
 class PivotModeCommandCfg(CommandTermCfg):
     class_type: type = PivotModeCommand
     asset_name: str = MISSING
+    support_body_names: list[str] = MISSING
     # |omega_z*| capped per mode at runtime (I10): 3 GROUND, 6 BALANCE.
     omega_z_range: tuple[float, float] = (-6.0, 6.0)
     omega_z_limit: float = 6.0
@@ -602,4 +655,5 @@ class PivotModeCommandCfg(CommandTermCfg):
     ground_duration_s: float = 2.0
     rear_up_duration_s: float = 3.0
     balance_duration_s: float = 10.0
+    land_duration_s: float = 5.0
     mode_schedule: tuple[str, ...] = ("GROUND", "REAR_UP", "BALANCE", "LAND")

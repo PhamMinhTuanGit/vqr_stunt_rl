@@ -90,7 +90,7 @@ class VQRPhysicalParams:
     delta_theta_command_limit: float = _deg2rad(8.0)  # +/-8 deg around theta*
     # Pitch setpoint bias towards the front (invariant I5, 3-5 deg).
     pitch_setpoint_forward_bias_deg: float = 4.0
-    # Backflip penalty engages strictly beyond theta*(omega_z).
+    # Backflip penalty adds its configured margin to theta*(omega_z)+delta.
     grace_window: float = 0.5  # termination grace window [s]
     termination_drift: float = 0.20  # 10 s BALANCE drift target conversion [m]
 

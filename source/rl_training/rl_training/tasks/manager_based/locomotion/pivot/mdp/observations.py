@@ -85,7 +85,12 @@ def balance_signals(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Return [zeta, zeta_dot, xi] relative to selected support wheels."""
+    """Return simulator-ground-truth ``[zeta, zeta_dot, xi]`` about HL-HR.
+
+    Whole-body CoM positions/link velocities and the support-body velocities
+    are privileged simulator state.  A hardware deployment needs an estimator
+    before this actor term can be used unchanged.
+    """
 
     asset: Articulation = env.scene[asset_cfg.name]
 
@@ -115,6 +120,9 @@ def balance_signals(
     support_pos_w = asset.data.body_pos_w[
         :, asset_cfg.body_ids
     ].mean(dim=1)
+    support_vel_w = asset.data.body_lin_vel_w[
+        :, asset_cfg.body_ids
+    ].mean(dim=1)
 
     # ---------------------------------------------------------
     # 3. Heading
@@ -134,50 +142,21 @@ def balance_signals(
         forward_b,
     )
 
-    heading_xy = heading_w[:, :2]
-
-    heading_xy = heading_xy / torch.linalg.vector_norm(
-        heading_xy,
-        dim=-1,
-        keepdim=True,
-    ).clamp_min(1.0e-6)
-
     # ---------------------------------------------------------
-    # 4. Balance coordinates
+    # 4. Balance coordinates.  Differentiate the relative point and the
+    # rotating heading axis; use the audited rigid-body omega0 everywhere.
     # ---------------------------------------------------------
-    rel_pos_xy = (
-        com_pos_w[:, :2]
-        - support_pos_w[:, :2]
-    )
+    from ..config.wheeled.vqr.physical_params import VQR_PHYSICS
+    from .pivot_math import balance_coordinates
 
-    zeta = torch.sum(
-        rel_pos_xy * heading_xy,
-        dim=-1,
-    )
-
-    zeta_dot = torch.sum(
-        com_vel_w[:, :2] * heading_xy,
-        dim=-1,
-    )
-
-    h = (
-        com_pos_w[:, 2]
-        - support_pos_w[:, 2]
-    ).clamp_min(0.05)
-
-    omega0 = torch.sqrt(
-        torch.tensor(
-            9.81,
-            device=env.device,
-            dtype=h.dtype,
-        ) / h
-    )
-
-    xi = zeta + zeta_dot / omega0
-
-    return torch.stack(
-        (zeta, zeta_dot, xi),
-        dim=-1,
+    return balance_coordinates(
+        com_pos_w[:, :2],
+        com_vel_w[:, :2],
+        support_pos_w[:, :2],
+        support_vel_w[:, :2],
+        heading_w,
+        asset.data.root_ang_vel_w,
+        VQR_PHYSICS.omega0,
     )
     
 def wheel_contact_flags(
@@ -185,14 +164,18 @@ def wheel_contact_flags(
     sensor_cfg: SceneEntityCfg,
     threshold: float = 1.0,
 ) -> torch.Tensor:
-    """Return stateless contact flags for explicitly selected wheel bodies."""
+    """Return simulator contact flags for explicitly selected wheel bodies.
+
+    This actor observation depends on Isaac contact sensing; deployment needs
+    wheel-contact estimation or equivalent hardware sensing.
+    """
     sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     forces = sensor.data.net_forces_w[:, sensor_cfg.body_ids]
     return (torch.linalg.vector_norm(forces, dim=-1) > threshold).float()
 
 
 def pivot_command_obs(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    """The 7-D pivot command: mode one-hot | omega_z* | delta_theta* | tuck*."""
+    """The 7-D command: mode one-hot | omega_z* | delta_theta* | pose phase."""
     return env.command_manager.get_command(command_name)
 
 

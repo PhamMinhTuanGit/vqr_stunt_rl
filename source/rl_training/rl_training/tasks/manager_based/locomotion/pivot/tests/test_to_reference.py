@@ -44,6 +44,14 @@ class ReferenceTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             reference.load_leg_reference(NAMES[:-1])
 
+    def test_fl_hr_file_is_rejected_as_hl_hr_prior(self):
+        with self.assertRaisesRegex(ValueError, "validated HL-HR"):
+            reference.load_leg_reference(
+                NAMES,
+                expected_stance=("HL", "HR"),
+                expected_swing=("FL", "FR"),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

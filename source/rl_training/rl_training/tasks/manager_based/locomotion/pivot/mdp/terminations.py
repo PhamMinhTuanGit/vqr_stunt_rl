@@ -163,14 +163,12 @@ def pivot_tilt_exceeded(
     command_name: str = "pivot_mode",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """|roll| beyond limit or pitch beyond theta*+limit (grace applied by cfg)."""
-    from .theta_star import theta_star
-
+    """|roll| beyond limit or pitch beyond commanded target plus margin."""
     asset: Articulation = env.scene[asset_cfg.name]
     roll, pitch, _ = math_utils.euler_xyz_from_quat(asset.data.root_quat_w)
-    omega_z_command = env.command_manager.get_term(command_name).omega_z_command
+    term = env.command_manager.get_term(command_name)
     roll_bad = math_utils.wrap_to_pi(roll).abs() > roll_limit
-    pitch_bad = pitch > theta_star(omega_z_command) + pitch_limit_margin
+    pitch_bad = pitch > term.pitch_command + pitch_limit_margin
     return roll_bad | pitch_bad
 
 
@@ -178,15 +176,12 @@ def pivot_drift_exceeded(
     env: ManagerBasedRLEnv,
     maximum_drift: float,
     asset_cfg: SceneEntityCfg,
+    command_name: str = "pivot_mode",
 ) -> torch.Tensor:
-    """Planar drift of the configured support midpoint beyond the budget."""
-    from ..config.wheeled.vqr.physical_params import VQR_PHYSICS
+    """Mode-aware body-center or frozen HL-HR midpoint drift."""
+    from .rewards import _pivot_mode_drift
 
-    robot: Articulation = env.scene[asset_cfg.name]
-    mid = robot.data.body_pos_w[:, asset_cfg.body_ids, :2].mean(dim=1)
-    target = env.scene.env_origins[:, :2].clone()
-    target[:, 0] -= 0.5 * VQR_PHYSICS.wheelbase
-    drift = torch.linalg.vector_norm(mid - target, dim=-1)
+    drift = _pivot_mode_drift(env, command_name, asset_cfg)
     return drift > maximum_drift
 
 

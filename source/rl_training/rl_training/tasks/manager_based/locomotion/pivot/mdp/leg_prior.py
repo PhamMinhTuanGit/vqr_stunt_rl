@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Deep Robotics
 # SPDX-License-Identifier: BSD 3-Clause
 
-"""q_prior(mode, tuck*): leg priors centred on the audited TO reference (I3).
+"""Continuous leg-position prior for the four-mode HL-HR pivot task.
 
 The PD residual scale (0.3) and joint-limit clamping live in the action term
 (``actions.py``); this module only interpolates reference poses.
@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import torch
 
-from .to_reference import load_leg_reference, smoothstep
+from .pivot_math import blend_joint_prior
+from .to_reference import load_leg_reference
 
 # Cached module-level reference (12 joints), loaded once per process.
 _REFERENCE_CACHE: dict[str, dict[str, float]] = {}
@@ -26,16 +27,25 @@ def standing_pose(joint_names: list[str]) -> torch.Tensor:
 
 
 def balance_pose(joint_names: list[str], reference_path: str | None = None) -> torch.Tensor:
-    """Two-wheel balance pose from the validated FL-HR TO solution."""
-    # TODO: Replace this only after an HL-HR trajectory-optimization reference
-    # has been validated.  The four-mode task currently uses HL-HR support, so
-    # this existing FL-HR reference is a known bootstrap approximation.
-    key = reference_path or "default"
+    """Return a validated HL-HR pose, or the safe standing fallback.
+
+    The repository currently contains only FL-HR TO results.  Those are not
+    silently reused for this task.  Until an HL-HR result is supplied through
+    ``reference_path``, the residual controller is centred on the standing
+    pose; this is conservative, continuous, and directly checkable in Isaac
+    Sim, but leaves the policy residual responsible for discovering rear-up.
+    """
+    if reference_path is None:
+        return standing_pose(joint_names)
+
+    key = str(reference_path)
     if key not in _REFERENCE_CACHE:
-        if reference_path is None:
-            _REFERENCE_CACHE[key] = load_leg_reference(joint_names)
-        else:
-            _REFERENCE_CACHE[key] = load_leg_reference(joint_names, reference_path)
+        _REFERENCE_CACHE[key] = load_leg_reference(
+            joint_names,
+            reference_path,
+            expected_stance=("HL", "HR"),
+            expected_swing=("FL", "FR"),
+        )
     values = [_REFERENCE_CACHE[key][name] for name in joint_names]
     return torch.tensor(values, dtype=torch.float32).unsqueeze(0)
 
@@ -53,16 +63,12 @@ def q_prior(
     joint_names: list[str],
     reference_path: str | None = None,
 ) -> torch.Tensor:
-    """Mode-interpolated leg prior with the tuck blend (I3).
+    """Continuous prior driven by the command term's deterministic pose phase.
 
     mode: int tensor ``(N,)`` with GROUND=0, REAR_UP=1, BALANCE=2, LAND=3.
-    tuck_command: ``(N,)`` in [0, 1]; 0 = open stance, 1 = fully tucked.
-
-    Per-mode logic:
-      GROUND  : standing pose, tuck does not apply.
-      REAR_UP : blend standing -> balance pose driven by tuck (the lift).
-      BALANCE : balance pose.
-      LAND    : blend balance -> standing driven by tuck (the set-down).
+    The second argument keeps the existing API name for compatibility.  It is
+    no longer randomly sampled: 0=standing and 1=balance, with a C1 schedule
+    GROUND(0) -> REAR_UP(0..1) -> BALANCE(1) -> LAND(1..0).
     """
     standing = standing_pose(joint_names).to(
         device=mode.device, dtype=tuck_command.dtype
@@ -72,15 +78,8 @@ def q_prior(
     )  # (1, 12)
 
     n = mode.shape[0]
-    tuck = smoothstep(tuck_command.clamp(0.0, 1.0)).unsqueeze(-1)  # (N, 1)
-
-    standing = standing.expand(n, -1)
-    balance = balance.expand(n, -1)
-    rear_up = standing + tuck * (balance - standing)
-    land = balance + tuck * (standing - balance)
-
-    prior = standing
-    prior = torch.where((mode == REAR_UP).unsqueeze(-1), rear_up, prior)
-    prior = torch.where((mode == BALANCE).unsqueeze(-1), balance, prior)
-    prior = torch.where((mode == LAND).unsqueeze(-1), land, prior)
-    return prior
+    return blend_joint_prior(
+        standing.expand(n, -1),
+        balance.expand(n, -1),
+        tuck_command,
+    )

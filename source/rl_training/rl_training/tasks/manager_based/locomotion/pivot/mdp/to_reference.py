@@ -10,7 +10,12 @@ import yaml
 REFERENCE_PATH = "pose_optimization/output/static_equilibrium_FL_HR_sideways.yaml"
 
 
-def load_leg_reference(joint_names, reference_path=REFERENCE_PATH):
+def load_leg_reference(
+    joint_names,
+    reference_path=REFERENCE_PATH,
+    expected_stance=("FL", "HR"),
+    expected_swing=("FR", "HL"),
+):
     path = Path(reference_path).expanduser()
     if not path.is_absolute():
         roots = [p for p in Path(__file__).resolve().parents if (p / "scripts").is_dir() and (p / "source").is_dir()]
@@ -19,8 +24,14 @@ def load_leg_reference(joint_names, reference_path=REFERENCE_PATH):
         path = roots[0] / path
     with path.open(encoding="utf-8") as stream:
         saved = yaml.safe_load(stream)
-    if saved.get("result") != "PASS" or saved.get("stance") != ["FL", "HR"] or saved.get("swing") != ["FR", "HL"]:
-        raise ValueError("Expected validated FL-HR TO reference")
+    if (
+        saved.get("result") != "PASS"
+        or saved.get("stance") != list(expected_stance)
+        or saved.get("swing") != list(expected_swing)
+    ):
+        raise ValueError(
+            f"Expected validated {expected_stance[0]}-{expected_stance[1]} TO reference"
+        )
     positions = saved["variables"]["leg_joints"]
     if len(joint_names) != 12 or len(set(joint_names)) != 12 or set(positions) != set(joint_names):
         raise ValueError("TO reference must contain exactly the 12 named leg joints")

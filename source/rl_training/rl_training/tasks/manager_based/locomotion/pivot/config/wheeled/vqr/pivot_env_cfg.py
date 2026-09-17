@@ -42,7 +42,6 @@ GROUND = 0
 REAR_UP = 1
 BALANCE = 2
 LAND = 3
-FRONT_WHEEL_NAMES = WHEEL_BODY_NAMES[:2]
 REAR_SUPPORT_WHEEL_NAMES = WHEEL_BODY_NAMES[2:]
 
 
@@ -95,17 +94,22 @@ class PivotActionsCfg:
         command_name="pivot_mode",
         residual_scale=0.3,
         enforce_soft_limits=True,
+        # PPO's legacy clip_actions=100 is intentionally left untouched; cap
+        # the residual in the action term before applying the 0.3 gain.
+        clip={".*": (-1.0, 1.0)},
     )
     wheel_torques = mdp.JointEffortActionCfg(
         asset_name="robot",
         joint_names=WHEEL_JOINT_NAMES,
         scale=PHYS.wheel_peak_torque,
         preserve_order=True,
+        # JointAction clips after scaling, so these are physical Nm bounds.
+        clip={".*": (-PHYS.wheel_peak_torque, PHYS.wheel_peak_torque)},
     )
 
 
 ##
-# Commands: 7-D mode one-hot(4) | omega_z* | delta_theta* | tuck*
+# Commands: 7-D mode one-hot(4) | omega_z* | delta_theta* | pose phase
 ##
 
 
@@ -113,7 +117,10 @@ class PivotActionsCfg:
 class PivotCommandsCfg:
     pivot_mode = mdp.PivotModeCommandCfg(
         asset_name="robot",
-        resampling_time_range=(6.0, 10.0),
+        support_body_names=REAR_SUPPORT_WHEEL_NAMES,
+        # Sample once per episode; mid-episode resampling would move the
+        # frozen support anchor and invalidate the time-based FSM.
+        resampling_time_range=(1.0e6, 1.0e6),
         omega_z_range=(-PHYS.omega_z_limit_balance, PHYS.omega_z_limit_balance),
         omega_z_limit=PHYS.omega_z_limit_balance,
         ground_omega_z_limit=PHYS.omega_z_limit_ground,
@@ -123,6 +130,7 @@ class PivotCommandsCfg:
         ground_duration_s=2.0,
         rear_up_duration_s=3.0,
         balance_duration_s=10.0,
+        land_duration_s=5.0,
     )
 
 
@@ -133,6 +141,9 @@ class PivotCommandsCfg:
 
 @configclass
 class PivotPolicyObsCfg(ObsGroup):
+    # NOTE: balance_signals (whole-body CoM/link velocities) and wheel_contact
+    # are simulator ground truth.  Hardware deployment needs estimators for
+    # both; their dimensions are retained here to avoid changing the policy IO.
     base_ang_vel = ObsTerm(
         func=mdp.base_ang_vel, scale=0.25, noise=Unoise(n_min=-0.02, n_max=0.02)
     )
@@ -292,7 +303,7 @@ class PivotRewardsCfg:
             "std": 0.12,
         },
     )
-    # anchor rear-axle midpoint: 1.0/0.5/1.0/0.5
+    # GROUND/LAND: body-center drift; REAR_UP/BALANCE: frozen HL-HR midpoint.
     anchor = RewTerm(
         func=mdp.anchor_midpoint_reward,
         weight=1.0,
@@ -303,6 +314,28 @@ class PivotRewardsCfg:
             ),
         },
     )
+    # CoM/capture geometry about HL-HR only in rear-supported modes.
+    balance_alignment = RewTerm(
+        func=mdp.balance_midpoint_reward,
+        weight=1.0,
+        params={
+            "command_name": "pivot_mode",
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=REAR_SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+        },
+    )
+    # Required contact pattern: four wheels in GROUND/LAND, HL-HR otherwise.
+    support_contact = RewTerm(
+        func=mdp.mode_wheel_contact_reward,
+        weight=1.0,
+        params={
+            "command_name": "pivot_mode",
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=WHEEL_BODY_NAMES, preserve_order=True
+            ),
+        },
+    )
     # front wheels clear: REAR_UP 1.5, BALANCE 1.0
     front_wheels_off = RewTerm(
         func=mdp.front_wheels_off_ground,
@@ -310,9 +343,14 @@ class PivotRewardsCfg:
         params={
             "command_name": "pivot_mode",
             "sensor_cfg": SceneEntityCfg(
-                "contact_forces", body_names=FRONT_WHEEL_NAMES, preserve_order=True
+                "contact_forces", body_names=WHEEL_BODY_NAMES, preserve_order=True
             ),
         },
+    )
+    pitch_tracking = RewTerm(
+        func=mdp.pitch_tracking_reward,
+        weight=1.0,
+        params={"command_name": "pivot_mode", "std": 0.15},
     )
     # roll -> 0: 0.5/1.0/1.0/1.0
     roll_flat = RewTerm(
@@ -331,15 +369,16 @@ class PivotRewardsCfg:
             ),
         },
     )
-    # instantaneous wheel torque beyond 3 Nm, mode weighted
+    # EMA wheel torque beyond 3 Nm; brief demands up to 24 Nm remain available.
     thermal = RewTerm(
-        func=mdp.thermal_excess_penalty,
+        func=mdp.SustainedWheelTorquePenalty,
         weight=-1.0,
         params={
             "command_name": "pivot_mode",
             "asset_cfg": SceneEntityCfg(
                 "robot", joint_names=WHEEL_JOINT_NAMES, preserve_order=True
             ),
+            "time_constant": PHYS.thermal_time_constant,
         },
     )
     # LAND peak normal force: 2.0 (budget 645 N = 2mg)
@@ -353,11 +392,27 @@ class PivotRewardsCfg:
             ),
         },
     )
+    landing_standing = RewTerm(
+        func=mdp.landing_standing_pose_reward,
+        weight=1.0,
+        params={
+            "command_name": "pivot_mode",
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=LEG_JOINT_NAMES, preserve_order=True
+            ),
+            "std": 0.25,
+        },
+    )
+    landing_low_descent = RewTerm(
+        func=mdp.landing_low_descent_reward,
+        weight=1.0,
+        params={"command_name": "pivot_mode", "std": 0.25},
+    )
     # I5: pitch beyond theta* x3 in REAR_UP/BALANCE
     backflip = RewTerm(
         func=mdp.backflip_excess_penalty,
         weight=-1.0,
-        params={"command_name": "pivot_mode"},
+        params={"command_name": "pivot_mode", "margin_rad": 0.10},
     )
     # smoothness
     action_rate = RewTerm(func=mdp.pivot_action_rate_l2, weight=-0.015)
@@ -396,6 +451,7 @@ class PivotTerminationsCfg:
         func=mdp.pivot_drift_exceeded,
         params={
             "maximum_drift": 0.20,
+            "command_name": "pivot_mode",
             "asset_cfg": SceneEntityCfg(
                 "robot", body_names=REAR_SUPPORT_WHEEL_NAMES, preserve_order=True
             ),
@@ -450,10 +506,22 @@ class PivotEnvCfg(ManagerBasedRLEnvCfg):
     sim = sim_utils.SimulationCfg(dt=PHYS.physics_dt, render_interval=decimation)
 
     def __post_init__(self):
+        scheduled_duration = (
+            self.commands.pivot_mode.ground_duration_s
+            + self.commands.pivot_mode.rear_up_duration_s
+            + self.commands.pivot_mode.balance_duration_s
+            + self.commands.pivot_mode.land_duration_s
+        )
+        if abs(self.episode_length_s - scheduled_duration) > self.sim.dt:
+            raise ValueError("Pivot mode durations must sum to episode_length_s.")
         self.sim.physics_material = self.scene.terrain.physics_material
         self.scene.contact_forces.update_period = self.sim.dt
         self.sim.physx.gpu_max_rigid_patch_count = 2**19
-        # Wheel effort 20 -> 24 Nm peak (spec section 2).
+        # This task commands wheel effort directly.  Remove the inherited PD
+        # velocity damping so applied wheel torque is the delayed/clipped
+        # effort target, and keep the audited 24 Nm peak.
+        self.scene.robot.actuators["wheels"].stiffness = 0.0
+        self.scene.robot.actuators["wheels"].damping = 0.0
         self.scene.robot.actuators["wheels"].effort_limit = PHYS.wheel_peak_torque
 
 

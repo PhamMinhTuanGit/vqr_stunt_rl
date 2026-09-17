@@ -55,7 +55,7 @@ class SoftLimitJointPositionActionCfg(JointPositionActionCfg):
 
 
 class PriorResidualJointPositionAction(JointPositionAction):
-    """Leg targets = q_prior(mode, tuck*) + 0.3 * residual (invariant I3).
+    """Leg targets = q_prior(mode, pose_phase) + 0.3 * residual.
 
     The residual scale is fixed at 0.3 by the specification: the policy only
     nudges around the mode-interpolated prior, never steers the whole pose.
@@ -82,13 +82,13 @@ class PriorResidualJointPositionAction(JointPositionAction):
         # Let JointAction store raw actions and apply cfg scale/offset/clip.
         super().process_actions(actions)
 
-        # Pull the mode and tuck from the pivot command term.
+        # Pull the mode and deterministic transition phase from the command.
         term = self.prior_command
         from .leg_prior import q_prior  # local import avoids a cycle
 
         prior = q_prior(
             term.mode,
-            term.tuck_command,
+            term.pose_phase,
             self._joint_names_ordered,
             getattr(self.cfg, "reference_path", None),
         ).to(device=self.device, dtype=self._processed_actions.dtype)
