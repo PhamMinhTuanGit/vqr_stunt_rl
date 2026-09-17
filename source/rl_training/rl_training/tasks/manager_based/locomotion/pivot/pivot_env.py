@@ -118,8 +118,8 @@ class PivotEnv(ManagerBasedRLEnv):
         robot = self.scene["robot"]
         cache = self.pivot_cache
 
-        com_pos_w = robot.data.body_com_pos_w[:, robot.root_idx]
-        com_vel_w = robot.data.body_com_vel_w[:, robot.root_idx]
+        com_pos_w = robot.data.root_com_pos_w
+        com_vel_w = robot.data.root_com_lin_vel_w
         rear_contact = robot.data.body_pos_w[:, self.pivot_rear_wheel_ids, :].mean(dim=1)
         heading = self._heading_w(robot)
 

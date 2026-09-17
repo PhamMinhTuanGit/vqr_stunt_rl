@@ -1402,7 +1402,7 @@ def drifted_away(env, max_dist: float):
 
 
 # ---------------------------------------------------------------------------
-# Four-mode pivot rewards (spec section 7): mode-gated, cache-fed (I8).
+# Four-mode pivot rewards: stateless ManagerBasedRLEnv terms.
 # ---------------------------------------------------------------------------
 
 GROUND = 0
@@ -1411,125 +1411,155 @@ BALANCE = 2
 LAND = 3
 
 
-def _pivot_balance_core(env: ManagerBasedRLEnv) -> tuple:
-    """(zeta, zeta_dot, xi) straight from the cache (invariants I1/I8)."""
-    from .observations import _pivot_cache
+def _pivot_balance_core(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute ``(zeta, zeta_dot, xi)`` directly from articulation state."""
+    from .observations import balance_signals
 
-    cache = _pivot_cache(env)
-    return cache.zeta, cache.zeta_dot, cache.xi
+    return balance_signals(env, asset_cfg).unbind(dim=-1)
 
 
 def _mode_gate(env, command_name: str) -> torch.Tensor:
-    """Current mode id per env from the 8-dim pivot command (section 7)."""
-    cmd = env.command_manager.get_command(command_name)
-    return cmd[:, :4].argmax(dim=-1)  # one-hot slot holding the mode
+    """Current mode id from the command term's public property."""
+    return env.command_manager.get_term(command_name).mode
 
 
-def mode_gated(term_func, weights: dict):
-    """Wrap ``term_func`` with per-mode weights; unlisted modes contribute 0.
-
-    The wrapped signature matches Isaac Lab reward terms: the first two
-    positional args (env, cfg params...) pass through untouched, and the
-    factory closes over ``command_name`` so cfg params stay keyword-safe.
-    """
-    weight_values = torch.tensor(list(weights.values()))
-
-    def wrapped(env, *args, **kwargs):
-        mode = _mode_gate(env, kwargs["command_name"])
-        out = term_func(env, *args, **kwargs)
-        gate = torch.zeros_like(mode, dtype=out.dtype)
-        for mode_id, weight in weights.items():
-            gate = torch.where(
-                mode == mode_id, torch.full_like(gate, weight, dtype=out.dtype), gate
-            )
-        return out * gate if out.dim() == 1 else out * gate.unsqueeze(-1)
-    return wrapped
+def _mode_weight(
+    mode: torch.Tensor,
+    weights: dict[int, float],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    gate = torch.zeros_like(mode, dtype=dtype)
+    for mode_id, weight in weights.items():
+        gate = torch.where(mode == mode_id, torch.full_like(gate, weight), gate)
+    return gate
 
 
-def capture_point_reward(env: ManagerBasedRLEnv, std: float = 0.12) -> torch.Tensor:
-    """exp(-xi^2 / sigma^2): the balance variable IS xi (I1)."""
-    _, _, xi = _pivot_balance_core(env)
-    return torch.exp(-xi.square() / std.square())
+def capture_point_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    std: float = 0.12,
+) -> torch.Tensor:
+    """Reward capture-point balance only during REAR_UP and BALANCE."""
+    _, _, xi = _pivot_balance_core(env, asset_cfg)
+    mode = _mode_gate(env, command_name)
+    gate = _mode_weight(mode, {REAR_UP: 1.5, BALANCE: 2.5}, xi.dtype)
+    return gate * torch.exp(-xi.square() / std**2)
 
 
 def omega_z_tracking(
-    env: ManagerBasedRLEnv, command_name: str, std: float = 0.5
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Yaw-rate tracking; gated OFF past xi_safe together with anchor (I4)."""
-    from .observations import _pivot_cache
-
-    cache = _pivot_cache(env)
-    cmd = env.command_manager.get_command(command_name)
-    target = cmd[:, 4]
-    gate = (cache.xi.abs() <= cache.xi_safe).to(target.dtype)
-    return gate * torch.exp(-(target - cache.omega_z).square() / std.square())
+    """Yaw tracking in GROUND and BALANCE, disabled in transition/landing."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    term = env.command_manager.get_term(command_name)
+    target = term.omega_z_command
+    error = target - asset.data.root_ang_vel_b[:, 2]
+    gate = _mode_weight(term.mode, {GROUND: 1.0, BALANCE: 1.5}, error.dtype)
+    return gate * torch.exp(-error.square() / std**2)
 
 
 def anchor_midpoint_reward(
-    env: ManagerBasedRLEnv, command_name: str
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    std: float = 0.20,
 ) -> torch.Tensor:
-    """Anchor drift of the rear-axle midpoint; OFF past xi_safe or LAND (I4)."""
-    from .observations import _pivot_cache
+    """Reward a small HL-HR support-midpoint drift with an exponential kernel."""
+    from ..config.wheeled.vqr.physical_params import VQR_PHYSICS
 
-    cache = _pivot_cache(env)
-    robot = env.scene["robot"]
-    cmd = env.command_manager.get_command(command_name)
-    mode = cmd[:, :4].argmax(dim=-1)
-    # Rear-axle midpoint wheel link indices resolved at env init.
-    rear_ids = getattr(env.unwrapped, "pivot_rear_wheel_ids", None)
-    if rear_ids is None:
-        rear_ids = torch.tensor([2, 3], device=robot.device)
-    mid = robot.data.body_pos_w[:, rear_ids, :2].mean(dim=1)
-    drift = (mid - env.scene.env_origins[:, :2]).norm(dim=-1)
-    gate = (cache.xi.abs() <= cache.xi_safe) & (~_is_land(env, command_name))
-    gate = gate.to(drift.dtype)
-    return gate * drift
+    robot: Articulation = env.scene[asset_cfg.name]
+    mode = _mode_gate(env, command_name)
+    mid = robot.data.body_pos_w[:, asset_cfg.body_ids, :2].mean(dim=1)
+    target = env.scene.env_origins[:, :2].clone()
+    target[:, 0] -= 0.5 * VQR_PHYSICS.wheelbase
+    drift = (mid - target).norm(dim=-1)
+    _, _, xi = _pivot_balance_core(env, asset_cfg)
+    safe = xi.abs() <= VQR_PHYSICS.xi_safe_fraction * VQR_PHYSICS.com_height_balance
+    gate = _mode_weight(
+        mode,
+        {GROUND: 1.0, REAR_UP: 0.5, BALANCE: 1.0, LAND: 0.5},
+        drift.dtype,
+    )
+    return safe.to(drift.dtype) * gate * torch.exp(-drift.square() / std**2)
 
 
 def _is_land(env, command_name: str) -> torch.Tensor:
-    cmd = env.command_manager.get_command(command_name)
-    return cmd[:, 3] > 0.5
+    return _mode_gate(env, command_name) == LAND
 
 
-def front_wheels_off_ground(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Fraction of the front wheel pair clear of the ground."""
-    from .observations import _pivot_cache
+def front_wheels_off_ground(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Reward front-wheel lift in REAR_UP/BALANCE, never in GROUND."""
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    forces = sensor.data.net_forces_w[:, sensor_cfg.body_ids]
+    off_ground = (torch.linalg.vector_norm(forces, dim=-1) <= threshold).float().mean(dim=-1)
+    mode = _mode_gate(env, command_name)
+    gate = _mode_weight(mode, {REAR_UP: 1.5, BALANCE: 1.0}, off_ground.dtype)
+    return gate * off_ground
 
-    cache = _pivot_cache(env)
-    front = cache.wheel_contact[:, :2]
-    return (front < 0.5).float().mean(dim=-1)
 
-
-def roll_flat_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """|roll| from the cache; roll is always driven toward zero."""
-    from .observations import _pivot_cache
-
-    cache = _pivot_cache(env)
-    return cache.roll.abs()
+def roll_flat_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward small roll error with an exponential kernel in every mode."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    roll, _, _ = math_utils.euler_xyz_from_quat(asset.data.root_quat_w)
+    gate = _mode_weight(
+        _mode_gate(env, command_name),
+        {GROUND: 0.5, REAR_UP: 1.0, BALANCE: 1.0, LAND: 1.0},
+        roll.dtype,
+    )
+    return gate * torch.exp(-math_utils.wrap_to_pi(roll).square() / std**2)
 
 
 def tuck_tracking(
-    env: ManagerBasedRLEnv, command_name: str
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    std: float = 0.25,
 ) -> torch.Tensor:
-    """Bám tuck*: exp(-||realized tuck - tuck*||^2 / std^2) in BALANCE."""
-    from .observations import _pivot_cache
+    """Track the mode/tuck leg prior through REAR_UP and BALANCE."""
+    from .leg_prior import q_prior
 
-    cache = _pivot_cache(env)
-    cmd = env.command_manager.get_command(command_name)
-    tuck_cmd = cmd[:, 7]
-    realized = getattr(env.unwrapped, "pivot_realized_tuck", None)
-    if realized is None:
-        return torch.zeros(env.num_envs, device=env.device)
-    return torch.exp(-torch.square(realized - tuck_cmd) / 0.25)
+    asset: Articulation = env.scene[asset_cfg.name]
+    term = env.command_manager.get_term(command_name)
+    joint_names = [asset.data.joint_names[index] for index in asset_cfg.joint_ids]
+    target = q_prior(term.mode, term.tuck_command, joint_names).to(asset.device)
+    error = (asset.data.joint_pos[:, asset_cfg.joint_ids] - target).square().mean(dim=-1)
+    gate = _mode_weight(term.mode, {REAR_UP: 0.5, BALANCE: 0.5}, error.dtype)
+    return gate * torch.exp(-error / std**2)
 
 
-def thermal_excess_penalty(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """max(0, EMA|tau_w| - 3 Nm)^2 averaged over wheels; cache-fed."""
-    from .observations import _pivot_cache
+def thermal_excess_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize instantaneous wheel effort above the continuous-torque limit."""
+    from ..config.wheeled.vqr.physical_params import VQR_PHYSICS
 
-    cache = _pivot_cache(env)
-    excess = torch.relu(cache.ema_wheel_torque - cache.physics.wheel_continuous_torque)
-    return excess.square().mean(dim=-1)
+    asset: Articulation = env.scene[asset_cfg.name]
+    effort = asset.data.applied_torque[:, asset_cfg.joint_ids].abs()
+    excess = torch.relu(effort - VQR_PHYSICS.wheel_continuous_torque).square().mean(dim=-1)
+    gate = _mode_weight(
+        _mode_gate(env, command_name),
+        {GROUND: 0.3, REAR_UP: 0.3, BALANCE: 0.5, LAND: 0.3},
+        excess.dtype,
+    )
+    return gate * excess
 
 
 def self_collision_analytic(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -1544,21 +1574,31 @@ def self_collision_analytic(env: ManagerBasedRLEnv) -> torch.Tensor:
     return torch.relu(target - clearance).square()
 
 
-def landing_peak_force(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """max F_n over wheels normalised by the 645 N landing budget."""
-    from .observations import _pivot_cache
+def landing_peak_force(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize peak wheel normal force only during LAND."""
+    from ..config.wheeled.vqr.physical_params import VQR_PHYSICS
 
-    cache = _pivot_cache(env)
-    sensor = env.scene.sensors["contact_forces"]
-    fn_peak = sensor.data.net_forces_w[:, :, 2].abs().amax(dim=-1)
-    return fn_peak / cache.physics.fn_peak_budget
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    fn_peak = sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2].abs().amax(dim=-1)
+    return 2.0 * _is_land(env, command_name).to(fn_peak.dtype) * fn_peak / VQR_PHYSICS.fn_peak_budget
 
 
 def backflip_excess_penalty(
-    env: ManagerBasedRLEnv, bias_rad: float = 0.0
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    bias_rad: float = 0.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """I5: pitch strictly beyond theta*(omega_z) (+ optional forward bias)."""
-    from .observations import _pivot_cache
+    from .theta_star import theta_star
 
-    cache = _pivot_cache(env)
-    return torch.relu(cache.pitch - (cache.theta_star + bias_rad))
+    asset: Articulation = env.scene[asset_cfg.name]
+    term = env.command_manager.get_term(command_name)
+    _, pitch, _ = math_utils.euler_xyz_from_quat(asset.data.root_quat_w)
+    excess = torch.relu(pitch - (theta_star(term.omega_z_command) + bias_rad))
+    gate = _mode_weight(term.mode, {REAR_UP: 3.0, BALANCE: 3.0}, excess.dtype)
+    return gate * excess

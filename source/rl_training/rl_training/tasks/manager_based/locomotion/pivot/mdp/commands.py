@@ -6,10 +6,11 @@
 
 from __future__ import annotations
 
+import math
+from dataclasses import MISSING
+from typing import TYPE_CHECKING, Sequence
+
 import torch
-import math 
-from typing import TYPE_CHECKING, Sequence, Any
-from dataclasses import MISSING 
 from isaaclab.assets import Articulation
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.sensors import ContactSensor
@@ -19,8 +20,6 @@ import rl_training.tasks.manager_based.locomotion.velocity.mdp as mdp
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
-
-MISSING: Any = MISSING
 
 class EpisodeLiftCommand(CommandTerm):
     """Expose a scheduled lift request without writing actions or robot state."""
@@ -425,7 +424,7 @@ REAR_UP = 1
 BALANCE = 2
 LAND = 3
 NUM_MODES = 4
-COMMAND_DIM = NUM_MODES + 3  # 8
+COMMAND_DIM = NUM_MODES + 3  # 7
 OMEGA_Z_IDX = 4
 DELTA_THETA_IDX = 5
 TUCK_IDX = 6
@@ -433,16 +432,22 @@ TUCK_IDX = 6
 class PivotModeCommand(CommandTerm):
     """Four-mode pivot command: mode one-hot(4) | omega_z* | delta_theta* | tuck*.
 
-    The supervisor (environment) owns the mode schedule; this term samples
-    the continuous setpoints around it and exposes the 8-dim command vector.
+    The command term owns the time-based mode schedule and samples the
+    continuous setpoints around it.  This keeps mode progression inside the
+    standard CommandManager lifecycle.
     """
 
     def __init__(self, cfg: "PivotModeCommandCfg", env):
         super().__init__(cfg, env)
         self.robot = env.scene[cfg.asset_name]
+        if min(
+            cfg.ground_duration_s,
+            cfg.rear_up_duration_s,
+            cfg.balance_duration_s,
+        ) <= 0.0:
+            raise ValueError("Pivot mode durations must all be positive.")
         self._cmd = torch.zeros(self.num_envs, COMMAND_DIM, device=self.device)
         self._mode = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self._omega_z_ramp = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_omega_z"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_delta_theta"] = torch.zeros(self.num_envs, device=self.device)
 
@@ -459,15 +464,15 @@ class PivotModeCommand(CommandTerm):
 
     @property
     def omega_z_command(self) -> torch.Tensor:
-        return self._cmd[:, NUM_MODES]
+        return self._cmd[:, OMEGA_Z_IDX]
 
     @property
     def delta_theta_command(self) -> torch.Tensor:
-        return self._cmd[:, NUM_MODES + 1]
+        return self._cmd[:, DELTA_THETA_IDX]
 
     @property
     def tuck_command(self) -> torch.Tensor:
-        return self._cmd[:, NUM_MODES + 2]
+        return self._cmd[:, TUCK_IDX]
 
     # -- supervisor hooks -------------------------------------------------
     def set_mode(self, env_ids: torch.Tensor, modes: torch.Tensor) -> None:
@@ -480,24 +485,26 @@ class PivotModeCommand(CommandTerm):
         n = len(env_ids)
         device = self.device
         r = lambda rng: torch.empty(n, device=device).uniform_(*rng)
-        # Continuous setpoints; the mode stays whatever the schedule/supervisor set.
+        # Every reset starts in GROUND.  The CommandManager later advances the
+        # mode from episode time in ``_update_command``.
+        self._mode[env_ids] = GROUND
         # omega_z* <= |6| BALANCE / |3| GROUND (invariant I10) via clamp at write.
-        self._cmd[env_ids, NUM_MODES] = r(self.cfg.omega_z_range).clamp_(
+        self._cmd[env_ids, OMEGA_Z_IDX] = r(self.cfg.omega_z_range).clamp_(
             -self.cfg.omega_z_limit, self.cfg.omega_z_limit
         )
         # delta_theta* in +/-8 deg around theta*(omega_z) (section 7).
-        self._cmd[env_ids, NUM_MODES + 1] = r(self.cfg.delta_theta_range).clamp_(
+        self._cmd[env_ids, DELTA_THETA_IDX] = r(self.cfg.delta_theta_range).clamp_(
             -self.cfg.delta_theta_limit, self.cfg.delta_theta_limit
         )
         # tuck* in [0, 1]: 0 = open stance, 1 = fully tucked.
-        self._cmd[env_ids, NUM_MODES + 2] = r((0.0, 1.0))
+        self._cmd[env_ids, TUCK_IDX] = r((0.0, 1.0))
         # Keep the one-hot consistent with resampled modes.
         one_hot = torch.nn.functional.one_hot(self._mode[env_ids], NUM_MODES).to(self._cmd.dtype)
         self._cmd[env_ids, :NUM_MODES] = one_hot
         # A share of envs gets a pure hold (omega_z* = 0) to preserve the static
         # balance skill (S2 gate: r_xi > 0.7 for 20 s).
         hold = torch.rand(n, device=device) < self.cfg.rel_standing_envs
-        self._cmd[env_ids[hold], NUM_MODES] = 0.
+        self._cmd[env_ids[hold], OMEGA_Z_IDX] = 0.0
 
     def _update_command(self):
         self._update_mode()
@@ -516,30 +523,28 @@ class PivotModeCommand(CommandTerm):
         balance = self._mode == BALANCE
 
         omega[ground] = torch.clamp(
-            omega[ground], -3.0, 3.0
+            omega[ground], -self.cfg.ground_omega_z_limit, self.cfg.ground_omega_z_limit
         )
 
         omega[balance] = torch.clamp(
-            omega[balance], -6.0, 6.0
+            omega[balance], -self.cfg.omega_z_limit, self.cfg.omega_z_limit
         )
 
         self._cmd[:, OMEGA_Z_IDX] = omega
 
     def _update_metrics(self):
         self.metrics["error_omega_z"] += torch.abs(
-            self._cmd[:, NUM_MODES] - self.robot.data.root_ang_vel_b[:, 2]
+            self.omega_z_command - self.robot.data.root_ang_vel_b[:, 2]
         ) / self._env.max_episode_length
-        # delta_theta error versus realized pitch offset around theta*: reads
-        # the cache when available (I8) and falls back to raw attitude otherwise.
-        cache = getattr(self._env.unwrapped, "pivot_cache", None)
-        if cache is not None and getattr(cache, "_updated", False):
-            realized = cache.pitch - cache.theta_star
-        else:
-            g = self.robot.data.projected_gravity_b
-            pitch = torch.atan2(g[:, 0], -g[:, 2])
-            realized = pitch  # theta* term unavailable pre-cache; coarse error only
+        # Realized pitch offset around theta*(omega_z*) without environment-owned
+        # caches.  This is a metric only; rewards read state independently.
+        from .theta_star import theta_star
+
+        g = self.robot.data.projected_gravity_b
+        pitch = torch.atan2(-g[:, 0], -g[:, 2])
+        realized = pitch - theta_star(self.omega_z_command)
         self.metrics["error_delta_theta"] += torch.abs(
-            self._cmd[:, NUM_MODES + 1] - realized
+            self.delta_theta_command - realized
         ) / self._env.max_episode_length
 
     def _set_debug_vis_impl(self, debug_vis):
@@ -590,9 +595,11 @@ class PivotModeCommandCfg(CommandTermCfg):
     # |omega_z*| capped per mode at runtime (I10): 3 GROUND, 6 BALANCE.
     omega_z_range: tuple[float, float] = (-6.0, 6.0)
     omega_z_limit: float = 6.0
-    delta_theta_range: tuple[float, float] = (-0.1396, 0.906)
-    delta_theta_limit: float = 0.906
+    ground_omega_z_limit: float = 3.0
+    delta_theta_range: tuple[float, float] = (-0.1396, 0.1396)
+    delta_theta_limit: float = 0.1396
     rel_standing_envs: float = 0.2
-    rear_up_duration_s = 
+    ground_duration_s: float = 2.0
+    rear_up_duration_s: float = 3.0
+    balance_duration_s: float = 10.0
     mode_schedule: tuple[str, ...] = ("GROUND", "REAR_UP", "BALANCE", "LAND")
-

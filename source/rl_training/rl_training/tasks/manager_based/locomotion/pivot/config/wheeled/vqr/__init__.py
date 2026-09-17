@@ -99,7 +99,7 @@ gym.register(
 
 gym.register(
     id="Pivot-VQR-Train-v0",
-    entry_point="rl_training.tasks.manager_based.locomotion.pivot.pivot_env:PivotEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.pivot_env_cfg:PivotEnvCfg",
@@ -111,7 +111,7 @@ gym.register(
 
 gym.register(
     id="Pivot-VQR-Play-v0",
-    entry_point="rl_training.tasks.manager_based.locomotion.pivot.pivot_env:PivotEnv",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.pivot_env_cfg:PivotEnvCfg_PLAY",

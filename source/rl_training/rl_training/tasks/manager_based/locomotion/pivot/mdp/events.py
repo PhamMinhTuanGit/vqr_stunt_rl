@@ -333,103 +333,47 @@ LAND = 3
 
 def pivot_reset_distribution(
     env,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    standing_positions: list | None = None,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    joint_position_noise: tuple[float, float] = (-0.02, 0.02),
+    joint_velocity_noise: tuple[float, float] = (-0.05, 0.05),
+    roll_pitch_noise: tuple[float, float] = (-0.02, 0.02),
+    yaw_range: tuple[float, float] = (0.0, 0.0),
 ):
-    """Sample reset states per the 30/25/30/15 spec buckets.
-
-    Buckets: 30% four-wheel standing, 25% mid-REAR_UP, 30% near-tipover
-    (zeta, zeta_dot ~ U[+/-xi_max]), 15% hard-state buffer replay.  The
-    fractions are fixed by spec; the standing bucket reuses the audited
-    four-wheel reset event.
-    """
-    asset = env.scene[asset_cfg.name]
-    device = asset.device
-    env_ids = env.reset_buf.nonzero(as_tuple=True)[0]
+    """Reset only ``env_ids`` around the valid four-wheel standing state."""
+    asset: Articulation = env.scene[asset_cfg.name]
     n = len(env_ids)
     if n == 0:
         return
 
-    fractions = torch.tensor([0.30, 0.25, 0.30, 0.15], device=device)
-    bucket = torch.multinomial(fractions, n, replacement=True)
-    standing = bucket == 0
-    mid = bucket == 1
-    near_tip = bucket == 2
-    hard = bucket == 3
+    root_state = asset.data.default_root_state[env_ids].clone()
+    root_state[:, :3] += env.scene.env_origins[env_ids]
+    roll = math_utils.sample_uniform(*roll_pitch_noise, (n,), asset.device)
+    pitch = math_utils.sample_uniform(*roll_pitch_noise, (n,), asset.device)
+    yaw = math_utils.sample_uniform(*yaw_range, (n,), asset.device)
+    root_state[:, 3:7] = math_utils.quat_from_euler_xyz(roll, pitch, yaw)
+    root_state[:, 7:] = 0.0
 
-    # -- standing bucket: audited four-wheel standing reset ------------------
-    if standing.any():
-        reset_four_wheel_standing(
-            env,
-            asset_cfg,
-            standing_positions=standing_positions,
-            env_ids=env_ids[standing],
-        )
+    if isinstance(asset_cfg.joint_ids, slice):
+        joint_ids = slice(None)
+        joint_pos = asset.data.default_joint_pos[env_ids].clone()
+        joint_vel = asset.data.default_joint_vel[env_ids].clone()
+    else:
+        joint_ids = asset_cfg.joint_ids
+        joint_pos = asset.data.default_joint_pos[env_ids[:, None], joint_ids].clone()
+        joint_vel = asset.data.default_joint_vel[env_ids[:, None], joint_ids].clone()
+    joint_pos += math_utils.sample_uniform(
+        *joint_position_noise, joint_pos.shape, asset.device
+    )
+    joint_vel += math_utils.sample_uniform(
+        *joint_velocity_noise, joint_vel.shape, asset.device
+    )
 
-    # -- mid rear-up bucket: pitch part-way toward theta* --------------------
-    if mid.any():
-        theta_star_0 = 0.5685  # 32.58 deg in rad; SSOT physical_params.theta_star_0
-        _write_root_with_pitch(
-            env,
-            asset,
-            env_ids[mid],
-            pitch_range=(0.25 * theta_star_0, 0.75 * theta_star_0),
-        )
-
-    # -- near-tip bucket: zeta/zeta_dot ~ U[+/-xi_max] ------------------------
-    if near_tip.any():
-        ids = env_ids[near_tip]
-        cache = getattr(env.unwrapped, "pivot_cache", None)
-        if cache is not None:
-            xi_max = cache.xi_max[ids]
-        else:
-            xi_max = 0.376 * torch.ones(len(ids), device=device)
-        zeta = (torch.rand(len(ids), device=device) * 2 - 1) * xi_max
-        zeta_dot = (torch.rand(len(ids), device=device) * 2 - 1) * xi_max
-        _write_root_with_pitch(
-            env, asset, ids, pitch_range=None, zeta=zeta, zeta_dot=zeta_dot
-        )
-
-    # -- hard-state replay bucket ---------------------------------------------
-    if hard.any():
-        ids = env_ids[hard]
-        buffer = getattr(env.unwrapped, "pivot_hard_states", None)
-        if buffer is not None and buffer.filled > 0:
-            frame = buffer.sample()
-            for name, tensor in frame.items():
-                writer = getattr(asset, f"write_{name}_to_sim", None)
-                if writer is not None:
-                    writer(tensor[ids], env_ids=ids)
-
-
-def _write_root_with_pitch(
-    env,
-    asset,
-    ids,
-    pitch_range,
-    zeta=None,
-    zeta_dot=None,
-):
-    """Place the base at the nominal height with sampled pitch/velocity (helper)."""
-    n = len(ids)
-    device = asset.device
-    pitch = None
-    if pitch_range is not None:
-        pitch = torch.empty(n, device=device).uniform_(*pitch_range)
-
-    root_state = asset.data.default_root_state.clone()
-    root_state[ids, :3] = env.scene.env_origins[ids]
-    root_state[ids, 2] = 0.45
-    if pitch is not None:
-        # Pure pitch about body-y with the xyzw quaternion layout.
-        root_state[ids, 3] = torch.sin(pitch / 2)
-        root_state[ids, 4] = 0.0
-        root_state[ids, 5] = 0.0
-        root_state[ids, 6] = torch.cos(pitch / 2)
-    if zeta is not None:
-        # Longitudinal rate along the heading direction (world x for reset).
-        root_state[ids, 7] = zeta_dot if zeta_dot is not None else 0.0
-    asset.write_root_link_to_sim(root_state[ids], env_ids=ids)
+    asset.write_root_pose_to_sim(root_state[:, :7], env_ids=env_ids)
+    asset.write_root_velocity_to_sim(root_state[:, 7:], env_ids=env_ids)
+    asset.write_joint_state_to_sim(
+        joint_pos, joint_vel, joint_ids=joint_ids, env_ids=env_ids
+    )
 
 
 def pivot_recover_reset(

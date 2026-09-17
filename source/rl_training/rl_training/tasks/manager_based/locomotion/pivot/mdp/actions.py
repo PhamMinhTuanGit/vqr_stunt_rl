@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Deep Robotics
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Action terms used only by the four-to-two-wheel pivot task."""
+"""Custom leg action terms shared by the pivot tasks."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ from dataclasses import MISSING
 
 import torch
 
-from isaaclab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg, JointActionCfg 
+from isaaclab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
 from isaaclab.utils import configclass
 
-MISSING: Any = MISSING  # type: ignore
+
 class SoftLimitJointPositionAction(JointPositionAction):
     """Clamp selected processed position targets to runtime soft joint limits."""
 
@@ -65,11 +65,11 @@ class PriorResidualJointPositionAction(JointPositionAction):
 
     def __init__(self, cfg: "PriorResidualJointPositionActionCfg", env):
         super().__init__(cfg, env)
-        self._scale = cfg.residual_scale
+        # Keep JointAction._scale intact: it represents cfg.scale and is used
+        # by the base action processing/IO descriptor.
+        self._residual_scale = cfg.residual_scale
         self._command_name = cfg.command_name
-        self._joint_names_ordered = [
-            self._joint_names[i] for i in range(len(self._joint_names))
-        ]
+        self._joint_names_ordered = list(self._joint_names)
 
     @property
     def prior_command(self):
@@ -79,22 +79,22 @@ class PriorResidualJointPositionAction(JointPositionAction):
         return self._raw_actions
 
     def process_actions(self, actions: torch.Tensor):
+        # Let JointAction store raw actions and apply cfg scale/offset/clip.
+        super().process_actions(actions)
+
         # Pull the mode and tuck from the pivot command term.
         term = self.prior_command
         from .leg_prior import q_prior  # local import avoids a cycle
 
-        mode = term.mode
-        tuck = term.tuck_command
         prior = q_prior(
-            mode,
-            tuck,
+            term.mode,
+            term.tuck_command,
             self._joint_names_ordered,
             getattr(self.cfg, "reference_path", None),
-        ).to(self._device)
-        # JointPositionAction applies (raw * scale + offset); fold the prior in
-        # as a dynamic offset and shrink the residual by the residual scale.
-        self._raw_actions = actions
-        self._processed_actions = prior + self._scale * actions * self.cfg.scale
+        ).to(device=self.device, dtype=self._processed_actions.dtype)
+        # Fold the prior in as a dynamic offset and shrink the already-scaled
+        # policy residual by the pivot residual scale.
+        self._processed_actions = prior + self._residual_scale * self._processed_actions
         # Optionally clamp to runtime soft limits like the soft-limit term.
         if self.cfg.enforce_soft_limits:
             limits = self._asset.data.soft_joint_pos_limits[:, self._joint_ids]

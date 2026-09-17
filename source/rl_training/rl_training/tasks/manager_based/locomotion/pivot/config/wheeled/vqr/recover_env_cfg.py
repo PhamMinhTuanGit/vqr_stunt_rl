@@ -101,6 +101,9 @@ class RecoverEnvCfg(PivotEnvCfg):
     events: RecoverEventCfg = RecoverEventCfg()
     rewards: RecoverRewardsCfg = RecoverRewardsCfg()
     terminations: RecoverTerminationsCfg = RecoverTerminationsCfg()
+    # Compatibility fields consumed only by the still-custom recovery env.
+    mu_hat_default: float = 1.0
+    history_length: int = 5
     # π_recover trains at 50 Hz like π_main but on the fallen distribution.
     episode_length_s = 8.0
 

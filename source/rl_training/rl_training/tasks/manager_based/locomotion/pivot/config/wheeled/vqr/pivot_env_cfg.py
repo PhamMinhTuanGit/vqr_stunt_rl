@@ -4,7 +4,8 @@
 """Four-mode pivot environment configuration (spec sections 7-9).
 
 GROUND -> REAR_UP -> BALANCE -> LAND (RECOVER via pi_recover), single policy.
-Reward weights follow the section-7 table; DR per section 9.
+Reward weights follow the section-7 table. Heavy DR/curriculum are disabled
+until the ManagerBased baseline is validated.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from __future__ import annotations
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -33,6 +33,7 @@ from .robot_cfg import (
     BASE_LINK_NAME,
     LEG_JOINT_NAMES,
     VQR_CFG,
+    WHEEL_BODY_NAMES,
     WHEEL_JOINT_NAMES,
 )
 
@@ -41,6 +42,8 @@ GROUND = 0
 REAR_UP = 1
 BALANCE = 2
 LAND = 3
+FRONT_WHEEL_NAMES = WHEEL_BODY_NAMES[:2]
+REAR_SUPPORT_WHEEL_NAMES = WHEEL_BODY_NAMES[2:]
 
 
 ##
@@ -93,19 +96,16 @@ class PivotActionsCfg:
         residual_scale=0.3,
         enforce_soft_limits=True,
     )
-    # I2: wheels are torque controlled, never velocity targets.
-    # Base JointAction applies processed actions as joint effort targets.
-    wheel_torques = mdp.JointActionCfg(
+    wheel_torques = mdp.JointEffortActionCfg(
         asset_name="robot",
         joint_names=WHEEL_JOINT_NAMES,
         scale=PHYS.wheel_peak_torque,
-        #use_default_offset=True,
         preserve_order=True,
     )
 
 
 ##
-# Commands: 8-dim mode one-hot(4) | omega_z* | delta_theta* | tuck*
+# Commands: 7-D mode one-hot(4) | omega_z* | delta_theta* | tuck*
 ##
 
 
@@ -116,14 +116,18 @@ class PivotCommandsCfg:
         resampling_time_range=(6.0, 10.0),
         omega_z_range=(-PHYS.omega_z_limit_balance, PHYS.omega_z_limit_balance),
         omega_z_limit=PHYS.omega_z_limit_balance,
+        ground_omega_z_limit=PHYS.omega_z_limit_ground,
         delta_theta_range=(-PHYS.delta_theta_command_limit, PHYS.delta_theta_command_limit),
         delta_theta_limit=PHYS.delta_theta_command_limit,
         rel_standing_envs=0.1,
+        ground_duration_s=2.0,
+        rear_up_duration_s=3.0,
+        balance_duration_s=10.0,
     )
 
 
 ##
-# Observations (section 7): policy group + privileged critic group (I8 readers)
+# Observations: policy group + privileged critic group
 ##
 
 
@@ -153,9 +157,22 @@ class PivotPolicyObsCfg(ObsGroup):
         scale=0.05,
     )
     previous_action = ObsTerm(func=mdp.last_action)
-    balance_signals = ObsTerm(func=mdp.balance_signals)
-
-    wheel_contact = ObsTerm(func=mdp.wheel_contact_flags)
+    balance_signals = ObsTerm(
+        func=mdp.balance_signals,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=REAR_SUPPORT_WHEEL_NAMES, preserve_order=True
+            )
+        },
+    )
+    wheel_contact = ObsTerm(
+        func=mdp.wheel_contact_flags,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=WHEEL_BODY_NAMES, preserve_order=True
+            )
+        },
+    )
     pivot_command = ObsTerm(
         func=mdp.pivot_command_obs, params={"command_name": "pivot_mode"}
     )
@@ -164,10 +181,8 @@ class PivotPolicyObsCfg(ObsGroup):
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot",
-                body_names=[
-                    "HL_WHEEL",
-                    "HR_WHEEL",
-                ],
+                body_names=REAR_SUPPORT_WHEEL_NAMES,
+                preserve_order=True,
             ),
         },
         history_length=5,
@@ -198,25 +213,47 @@ class PivotCriticObsCfg(ObsGroup):
         scale=0.05,
     )
     previous_action = ObsTerm(func=mdp.last_action)
-    balance_signals = ObsTerm(func=mdp.balance_signals)
-    ema_wheel_torque = ObsTerm(func=mdp.ema_wheel_torque)
-    wheel_contact = ObsTerm(func=mdp.wheel_contact_flags)
+    balance_signals = ObsTerm(
+        func=mdp.balance_signals,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=REAR_SUPPORT_WHEEL_NAMES, preserve_order=True
+            )
+        },
+    )
+    wheel_contact = ObsTerm(
+        func=mdp.wheel_contact_flags,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=WHEEL_BODY_NAMES, preserve_order=True
+            )
+        },
+    )
     pivot_command = ObsTerm(
         func=mdp.pivot_command_obs, params={"command_name": "pivot_mode"}
     )
-    history_stack = ObsTerm(
-        func=mdp.pivot_history_stack,
-        params={"command_name": "pivot_mode", "history_length": 5},
+    balance_history = ObsTerm(
+        func=mdp.balance_signals,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=REAR_SUPPORT_WHEEL_NAMES, preserve_order=True
+            )
+        },
+        history_length=5,
+        flatten_history_dim=True,
     )
     # Privileged terms (section 7).
     base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
     contact_force = ObsTerm(
         func=mdp.contact_forces_term,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces"), "threshold": 1.0},
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=WHEEL_BODY_NAMES, preserve_order=True
+            ),
+            "threshold": 1.0,
+        },
     )
-    mu_hat = ObsTerm(func=mdp.mu_hat_term, params={"default": 1.0})
     com_offset = ObsTerm(func=mdp.com_offset_term)
-    payload_mass = ObsTerm(func=mdp.payload_mass_term)
     action_delay = ObsTerm(func=mdp.action_delay_term)
 
     def __post_init__(self):
@@ -237,7 +274,7 @@ class PivotObservationsCfg:
 
 @configclass
 class PivotRewardsCfg:
-    # omega_z tracking: 1.0 GROUND, 0.3 REAR_UP, 1.5 BALANCE, 0.3 LAND
+    # omega_z tracking: GROUND 1.0, BALANCE 1.5
     omega_z = RewTerm(
         func=mdp.omega_z_tracking,
         weight=1.0,
@@ -247,34 +284,83 @@ class PivotRewardsCfg:
     capture_point = RewTerm(
         func=mdp.capture_point_reward,
         weight=1.0,
-        params={"std": 0.12},
+        params={
+            "command_name": "pivot_mode",
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=REAR_SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+            "std": 0.12,
+        },
     )
     # anchor rear-axle midpoint: 1.0/0.5/1.0/0.5
     anchor = RewTerm(
         func=mdp.anchor_midpoint_reward,
         weight=1.0,
-        params={"command_name": "pivot_mode"},
+        params={
+            "command_name": "pivot_mode",
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=REAR_SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+        },
     )
     # front wheels clear: REAR_UP 1.5, BALANCE 1.0
-    front_wheels_off = RewTerm(func=mdp.front_wheels_off_ground, weight=1.5)
+    front_wheels_off = RewTerm(
+        func=mdp.front_wheels_off_ground,
+        weight=1.0,
+        params={
+            "command_name": "pivot_mode",
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=FRONT_WHEEL_NAMES, preserve_order=True
+            ),
+        },
+    )
     # roll -> 0: 0.5/1.0/1.0/1.0
-    roll_flat = RewTerm(func=mdp.roll_flat_reward, weight=1.0)
-    # tuck* tracking in BALANCE: 0.5
-    tuck_tracking = RewTerm(
-        func=mdp.tuck_tracking,
-        weight=0.5,
+    roll_flat = RewTerm(
+        func=mdp.roll_flat_reward,
+        weight=1.0,
         params={"command_name": "pivot_mode"},
     )
-    # thermal: max(0, EMA|tau_w| - 3)^2 all modes
-    thermal = RewTerm(func=mdp.thermal_excess_penalty, weight=-1.0)
-    # analytic self-collision (I6): 1.0 all modes
-    self_collision = RewTerm(func=mdp.self_collision_analytic, weight=-1.0)
+    # leg-prior/tuck tracking through REAR_UP and BALANCE: 0.5
+    tuck_tracking = RewTerm(
+        func=mdp.tuck_tracking,
+        weight=1.0,
+        params={
+            "command_name": "pivot_mode",
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=LEG_JOINT_NAMES, preserve_order=True
+            ),
+        },
+    )
+    # instantaneous wheel torque beyond 3 Nm, mode weighted
+    thermal = RewTerm(
+        func=mdp.thermal_excess_penalty,
+        weight=-1.0,
+        params={
+            "command_name": "pivot_mode",
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=WHEEL_JOINT_NAMES, preserve_order=True
+            ),
+        },
+    )
     # LAND peak normal force: 2.0 (budget 645 N = 2mg)
-    landing_fn_peak = RewTerm(func=mdp.landing_peak_force, weight=-2.0)
+    landing_fn_peak = RewTerm(
+        func=mdp.landing_peak_force,
+        weight=-1.0,
+        params={
+            "command_name": "pivot_mode",
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=WHEEL_BODY_NAMES, preserve_order=True
+            ),
+        },
+    )
     # I5: pitch beyond theta* x3 in REAR_UP/BALANCE
-    backflip = RewTerm(func=mdp.backflip_excess_penalty, weight=-3.0)
+    backflip = RewTerm(
+        func=mdp.backflip_excess_penalty,
+        weight=-1.0,
+        params={"command_name": "pivot_mode"},
+    )
     # smoothness
-    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.015)
+    action_rate = RewTerm(func=mdp.pivot_action_rate_l2, weight=-0.015)
     joint_accel = RewTerm(
         func=mdp.joint_acc_l2,
         weight=-2.5e-7,
@@ -300,13 +386,25 @@ class PivotTerminationsCfg:
     fallen = DoneTerm(func=mdp.pivot_fallen)
     tilt = DoneTerm(
         func=mdp.pivot_tilt_exceeded,
-        params={"roll_limit": 0.6, "pitch_limit_margin": 0.35},
+        params={
+            "roll_limit": 0.6,
+            "pitch_limit_margin": 0.35,
+            "command_name": "pivot_mode",
+        },
     )
-    drift = DoneTerm(func=mdp.pivot_drift_exceeded, params={"maximum_drift": 0.20})
+    drift = DoneTerm(
+        func=mdp.pivot_drift_exceeded,
+        params={
+            "maximum_drift": 0.20,
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=REAR_SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+        },
+    )
 
 
 ##
-# Events (section 9): 30/25/30/15 reset distribution + DR + push
+# Events: simple standing reset; heavy DR/push deferred
 ##
 
 
@@ -321,65 +419,13 @@ class PivotEventCfg:
             )
         },
     )
-    randomize_friction = EventTerm(
-        func=mdp.randomize_rigid_body_material,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.3, 1.2),
-            "dynamic_friction_range": (0.25, 1.0),
-            "restitution_range": (0.0, 0.4),
-            "num_buckets": 1024,
-        },
-    )
-    randomize_mass = EventTerm(
-        func=mdp.randomize_rigid_body_mass,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "mass_distribution_params": (0.85, 1.15),
-            "operation": "scale",
-            "recompute_inertia": True,
-        },
-    )
-    randomize_com = EventTerm(
-        func=mdp.randomize_rigid_body_com,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=[BASE_LINK_NAME]),
-            "com_range": {"x": (-0.04, 0.04), "y": (-0.02, 0.02), "z": (-0.02, 0.02)},
-        },
-    )
-    randomize_actuator_gains = EventTerm(
-        func=mdp.randomize_actuator_gains,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-            "stiffness_distribution_params": (0.9, 1.1),
-            "damping_distribution_params": (0.9, 1.1),
-            "operation": "scale",
-            "distribution": "uniform",
-        },
-    )
-    push_robot = EventTerm(
-        func=mdp.push_by_setting_velocity,
-        mode="interval",
-        interval_range_s=(8.0, 12.0),
-        params={"velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}},
-    )
-
-
-##
-# Curriculum: stages S0-S6 (section 9)
-##
-
-
-@configclass
-class PivotCurriculumCfg:
-    pivot_stages = CurrTerm(
-        func=mdp.pivot_stages,
-        params={"command_name": "pivot_mode"},
-    )
+    # TODO: Re-enable DR/push only after the ManagerBased baseline smoke test
+    # is stable and each perturbation has an isolated validation.
+    randomize_friction = None
+    randomize_mass = None
+    randomize_com = None
+    randomize_actuator_gains = None
+    push_robot = None
 
 
 ##
@@ -396,11 +442,8 @@ class PivotEnvCfg(ManagerBasedRLEnvCfg):
     rewards: PivotRewardsCfg = PivotRewardsCfg()
     terminations: PivotTerminationsCfg = PivotTerminationsCfg()
     events: PivotEventCfg = PivotEventCfg()
-    curriculum: PivotCurriculumCfg = PivotCurriculumCfg()
-
-    # PivotEnv extras.
-    mu_hat_default: float = 1.0
-    history_length: int = 5
+    # TODO: Redesign the old curriculum around existing ManagerTerm metrics.
+    curriculum = None
 
     decimation = 4
     episode_length_s = 20.0
@@ -422,4 +465,3 @@ class PivotEnvCfg_PLAY(PivotEnvCfg):
         super().__post_init__()
         self.scene.num_envs = 16
         self.observations.policy.enable_corruption = False
-        self.events.push_robot = None

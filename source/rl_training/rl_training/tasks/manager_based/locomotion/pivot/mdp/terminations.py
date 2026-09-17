@@ -148,34 +148,45 @@ def pivot_fallen(env: ManagerBasedRLEnv) -> torch.Tensor:
     Fallen = pitch below the balance ceiling (nose-dived) or projected gravity
     indicates the torso is inverted/nearly inverted (|g_z| up with |g_xy| large).
     """
-    cache = _pivot_cache(env)
     robot = env.scene["robot"]
     g = robot.data.projected_gravity_b
     inverted = g[:, 2] > 0.0  # gravity pointing along +z body => upside down
-    nose_dive = cache.pitch < -0.35  # ~-20 deg Pitch below balance corridor
+    _, pitch, _ = math_utils.euler_xyz_from_quat(robot.data.root_quat_w)
+    nose_dive = pitch < -0.35  # ~-20 deg below the recoverable corridor
     return inverted | nose_dive
 
 
 def pivot_tilt_exceeded(
-    env: ManagerBasedRLEnv, roll_limit: float, pitch_limit_margin: float = 0.0
+    env: ManagerBasedRLEnv,
+    roll_limit: float,
+    pitch_limit_margin: float = 0.0,
+    command_name: str = "pivot_mode",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """|roll| beyond limit or pitch beyond theta*+limit (grace applied by cfg)."""
-    cache = _pivot_cache(env)
-    roll_bad = cache.roll.abs() > roll_limit
-    pitch_bad = cache.pitch > cache.theta_star + pitch_limit_margin
+    from .theta_star import theta_star
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    roll, pitch, _ = math_utils.euler_xyz_from_quat(asset.data.root_quat_w)
+    omega_z_command = env.command_manager.get_term(command_name).omega_z_command
+    roll_bad = math_utils.wrap_to_pi(roll).abs() > roll_limit
+    pitch_bad = pitch > theta_star(omega_z_command) + pitch_limit_margin
     return roll_bad | pitch_bad
 
 
 def pivot_drift_exceeded(
-    env: ManagerBasedRLEnv, maximum_drift: float
+    env: ManagerBasedRLEnv,
+    maximum_drift: float,
+    asset_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
-    """Planar drift of the rear-axle midpoint beyond the budget (20 cm / 10 s)."""
-    robot = env.scene["robot"]
-    rear_ids = getattr(env.unwrapped, "pivot_rear_wheel_ids", None)
-    if rear_ids is None:
-        rear_ids = torch.tensor([2, 3], device=robot.device)
-    mid = robot.data.body_pos_w[:, rear_ids, :2].mean(dim=1)
-    drift = torch.linalg.vector_norm(mid - env.scene.env_origins[:, :2], dim=-1)
+    """Planar drift of the configured support midpoint beyond the budget."""
+    from ..config.wheeled.vqr.physical_params import VQR_PHYSICS
+
+    robot: Articulation = env.scene[asset_cfg.name]
+    mid = robot.data.body_pos_w[:, asset_cfg.body_ids, :2].mean(dim=1)
+    target = env.scene.env_origins[:, :2].clone()
+    target[:, 0] -= 0.5 * VQR_PHYSICS.wheelbase
+    drift = torch.linalg.vector_norm(mid - target, dim=-1)
     return drift > maximum_drift
 
 

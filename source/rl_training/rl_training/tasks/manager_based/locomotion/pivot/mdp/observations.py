@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-
+import isaaclab.utils.math as math_utils
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 
@@ -67,7 +67,7 @@ def yaw_rate_command(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Four-mode pivot observations: all readers of the per-step cache (I8).
+# Four-mode pivot observations.
 # ---------------------------------------------------------------------------
 
 
@@ -81,42 +81,118 @@ def _pivot_cache(env: ManagerBasedRLEnv):
     return cache
 
 
-def balance_signals(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """(zeta, zeta_dot, xi) straight from the cache (I1/I8)."""
-    cache = _pivot_cache(env)
-    return torch.stack([cache.zeta, cache.zeta_dot, cache.xi], dim=-1)
-
-
-def ema_wheel_torque(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """EMA|tau_w| from the cache, scaled by the continuous-torque limit."""
-    cache = _pivot_cache(env)
-    return cache.ema_wheel_torque / cache.physics.wheel_continuous_torque
-
-
-def wheel_contact_flags(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Binary contact flag per wheel, FL | FR | HL | HR (cache-provided)."""
-    cache = _pivot_cache(env)
-    return cache.wheel_contact
-
-
-def pivot_history_stack(
+def balance_signals(
     env: ManagerBasedRLEnv,
-    command_name: str,
-    history_length: int = 5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Concatenate the last H frames of the scalar balance core.
+    """Return [zeta, zeta_dot, xi] relative to selected support wheels."""
 
-    Maintains an env-side ring buffer of the last H-1 (zeta, zeta_dot, xi)
-    frames; the current frame appends at read time.
-    """
-    cache = _pivot_cache(env)
-    history = env.unwrapped.pivot_history
-    current = torch.stack([cache.zeta, cache.zeta_dot, cache.xi], dim=-1)
-    return history.concat(current)
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    # ---------------------------------------------------------
+    # 1. Whole-body CoM
+    # ---------------------------------------------------------
+    mass = asset.root_physx_view.get_masses().to(asset.device)   # (N, B)
+
+    total_mass = mass.sum(
+        dim=1,
+        keepdim=True,
+    ).clamp_min(1.0e-6)
+
+    com_pos_w = (
+        asset.data.body_com_pos_w
+        * mass.unsqueeze(-1)
+    ).sum(dim=1) / total_mass
+
+    com_vel_w = (
+        asset.data.body_com_lin_vel_w
+        * mass.unsqueeze(-1)
+    ).sum(dim=1) / total_mass
+
+    # ---------------------------------------------------------
+    # 2. Support midpoint: selected HL + HR wheel bodies
+    # ---------------------------------------------------------
+    support_pos_w = asset.data.body_pos_w[
+        :, asset_cfg.body_ids
+    ].mean(dim=1)
+
+    # ---------------------------------------------------------
+    # 3. Heading
+    # ---------------------------------------------------------
+    quat = asset.data.root_quat_w
+
+    forward_b = torch.zeros(
+        env.num_envs,
+        3,
+        device=env.device,
+        dtype=com_pos_w.dtype,
+    )
+    forward_b[:, 0] = 1.0
+
+    heading_w = math_utils.quat_apply(
+        quat,
+        forward_b,
+    )
+
+    heading_xy = heading_w[:, :2]
+
+    heading_xy = heading_xy / torch.linalg.vector_norm(
+        heading_xy,
+        dim=-1,
+        keepdim=True,
+    ).clamp_min(1.0e-6)
+
+    # ---------------------------------------------------------
+    # 4. Balance coordinates
+    # ---------------------------------------------------------
+    rel_pos_xy = (
+        com_pos_w[:, :2]
+        - support_pos_w[:, :2]
+    )
+
+    zeta = torch.sum(
+        rel_pos_xy * heading_xy,
+        dim=-1,
+    )
+
+    zeta_dot = torch.sum(
+        com_vel_w[:, :2] * heading_xy,
+        dim=-1,
+    )
+
+    h = (
+        com_pos_w[:, 2]
+        - support_pos_w[:, 2]
+    ).clamp_min(0.05)
+
+    omega0 = torch.sqrt(
+        torch.tensor(
+            9.81,
+            device=env.device,
+            dtype=h.dtype,
+        ) / h
+    )
+
+    xi = zeta + zeta_dot / omega0
+
+    return torch.stack(
+        (zeta, zeta_dot, xi),
+        dim=-1,
+    )
+    
+def wheel_contact_flags(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Return stateless contact flags for explicitly selected wheel bodies."""
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    forces = sensor.data.net_forces_w[:, sensor_cfg.body_ids]
+    return (torch.linalg.vector_norm(forces, dim=-1) > threshold).float()
 
 
 def pivot_command_obs(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    """The 8-dim pivot command: mode one-hot | omega_z* | delta_theta* | tuck*."""
+    """The 7-D pivot command: mode one-hot | omega_z* | delta_theta* | tuck*."""
     return env.command_manager.get_command(command_name)
 
 
@@ -138,24 +214,22 @@ def contact_forces_term(
         magnitude - threshold
     )
 
-def mu_hat_term(env: ManagerBasedRLEnv, default: float = 1.0) -> torch.Tensor:
-    """Privileged: per-env friction estimate used by thexi safety radii."""
-    cache = _pivot_cache(env)
-    return cache.mu_hat.unsqueeze(-1)
+def com_offset_term(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    asset: Articulation = env.scene[asset_cfg.name]
+    
+    robot: Articulation = env.scene["robot"]
 
+    mass = asset.root_physx_view.get_masses().to(asset.device)   # (N, B)
+    
+    total_mass = mass.sum(dim=1, keepdim=True)
 
-def com_offset_term(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Privileged: upstream CoM offset body frame proxy (privileged)."""
-    robot = env.scene["robot"]
-    com = robot.data.body_com_pos_w[:, robot.root_idx]  # (N, 3)
-    root = robot.data.root_pos_w
-    return com - root
+    com_w = (
+        robot.data.body_com_pos_w * mass.unsqueeze(-1)
+    ).sum(dim=1) / total_mass
 
+    offset_w = com_w - robot.data.root_pos_w
 
-def payload_mass_term(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Privileged: body payload mass sum normalized by the SSOT mass."""
-    robot = env.scene["robot"]
-    return (robot.data.body_mass.sum(dim=-1) / _pivot_cache(env).physics.mass).unsqueeze(-1)
+    return offset_w
 
 
 def action_delay_term(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -165,4 +239,3 @@ def action_delay_term(env: ManagerBasedRLEnv) -> torch.Tensor:
     if delay_steps is None:
         return torch.zeros(env.num_envs, 1, device=env.device)
     return delay_steps.float().mean(dim=-1, keepdim=True)
-

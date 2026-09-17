@@ -27,9 +27,15 @@ def standing_pose(joint_names: list[str]) -> torch.Tensor:
 
 def balance_pose(joint_names: list[str], reference_path: str | None = None) -> torch.Tensor:
     """Two-wheel balance pose from the validated FL-HR TO solution."""
+    # TODO: Replace this only after an HL-HR trajectory-optimization reference
+    # has been validated.  The four-mode task currently uses HL-HR support, so
+    # this existing FL-HR reference is a known bootstrap approximation.
     key = reference_path or "default"
     if key not in _REFERENCE_CACHE:
-        _REFERENCE_CACHE[key] = load_leg_reference(joint_names, reference_path)
+        if reference_path is None:
+            _REFERENCE_CACHE[key] = load_leg_reference(joint_names)
+        else:
+            _REFERENCE_CACHE[key] = load_leg_reference(joint_names, reference_path)
     values = [_REFERENCE_CACHE[key][name] for name in joint_names]
     return torch.tensor(values, dtype=torch.float32).unsqueeze(0)
 
@@ -55,28 +61,26 @@ def q_prior(
     Per-mode logic:
       GROUND  : standing pose, tuck does not apply.
       REAR_UP : blend standing -> balance pose driven by tuck (the lift).
-      BALANCE : balance pose modulated by tuck* around the reference.
+      BALANCE : balance pose.
       LAND    : blend balance -> standing driven by tuck (the set-down).
     """
-    standing = standing_pose(joint_names)  # (1, 12)
-    balance = balance_pose(joint_names, reference_path)  # (1, 12)
+    standing = standing_pose(joint_names).to(
+        device=mode.device, dtype=tuck_command.dtype
+    )  # (1, 12)
+    balance = balance_pose(joint_names, reference_path).to(
+        device=mode.device, dtype=tuck_command.dtype
+    )  # (1, 12)
 
     n = mode.shape[0]
     tuck = smoothstep(tuck_command.clamp(0.0, 1.0)).unsqueeze(-1)  # (N, 1)
 
-    # Base pose per mode before the tuck modulation.
-    base = torch.where(
-        ((mode == GROUND) | (mode == BALANCE)).unsqueeze(-1),
-        balance.expand(n, -1),
-        standing.expand(n, -1),
-    )
-    # Tuck target per mode: where the blend heads as tuck* -> 1.
-    target = torch.where(
-        ((mode == REAR_UP) | (mode == LAND)).unsqueeze(-1),
-        balance.expand(n, -1),
-        standing.expand(n, -1),
-    )
-    # Only REAR_UP and LAND actually blend; GROUND/BALANCE stay at the base.
-    blending = ((mode == REAR_UP) | (mode == LAND)).unsqueeze(-1)
-    blend = base + tuck * (target - base)
-    return torch.where(blending, blend, base)
+    standing = standing.expand(n, -1)
+    balance = balance.expand(n, -1)
+    rear_up = standing + tuck * (balance - standing)
+    land = balance + tuck * (standing - balance)
+
+    prior = standing
+    prior = torch.where((mode == REAR_UP).unsqueeze(-1), rear_up, prior)
+    prior = torch.where((mode == BALANCE).unsqueeze(-1), balance, prior)
+    prior = torch.where((mode == LAND).unsqueeze(-1), land, prior)
+    return prior
