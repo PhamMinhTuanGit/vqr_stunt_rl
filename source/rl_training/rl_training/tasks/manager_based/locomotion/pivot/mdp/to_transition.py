@@ -7,7 +7,7 @@ from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi
 
-from .to_reference import REFERENCE_PATH, contact_targets, load_leg_reference, pose_reference, smoothstep
+from .to_reference import REFERENCE_PATH, contact_targets, load_leg_reference, pose_reference, smoothstep, unload_fraction
 from .events import reset_four_wheel_standing
 
 
@@ -193,7 +193,7 @@ def transition_levels(env, env_ids, command_name="pivot", min_episodes=256, succ
     return {"level": float(term.level), "window_success_rate": term.last_success_rate}
 
 
-def to_pose_reward(env, k_pose=2.0):
+def to_pose_reward(env, k_pose=0.8):
     term = env.command_manager.get_term("pivot")
     error = (term.robot.data.joint_pos[:, term.joint_ids] - term.reference).square().sum(-1)
     return term.weights[term.episode_level] * torch.exp(-k_pose * error)
@@ -201,8 +201,23 @@ def to_pose_reward(env, k_pose=2.0):
 
 def scheduled_contact_reward(env):
     term = env.command_manager.get_term("pivot")
-    return 1.0 - (term.contacts() - contact_targets(term.command[:, 1])).square().mean(-1)
 
+    contact = term.contacts()
+    phase = term.command[:, 1]
+    unload = unload_fraction(phase)
+
+    # FL, FR, HL, HR
+    four_wheel = contact.mean(dim=-1)
+
+    # Desired final support: FL + HR
+    diagonal = 0.5 * (
+        contact[:, 0]
+        + contact[:, 3]
+        - contact[:, 1]
+        - contact[:, 2]
+    )
+
+    return (1.0 - unload) * four_wheel + unload * diagonal
 
 def transition_yaw_reward(env, k_yaw=11.11):
     term = env.command_manager.get_term("pivot")

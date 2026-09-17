@@ -121,6 +121,28 @@ def pivot_track_yaw_rate(
     return torch.exp(-error.square() / std**2)
 
 
+def lateral_wheel_slip(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg,
+    threshold: float = 2.0,
+) -> torch.Tensor:
+    """Penalize contacted wheels' velocity along their local axle direction.
+
+    The VQR wheel joints all rotate about local Y (the URDF axes are
+    ``(0, -1, 0)``), so wheel-frame Y is the lateral/axle direction.  Forward
+    rolling in wheel-frame X is intentionally not penalized.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_velocity_w = asset.data.body_lin_vel_w[:, asset_cfg.body_ids]
+    wheel_quat_w = asset.data.body_quat_w[:, asset_cfg.body_ids]
+    wheel_velocity_local = math_utils.quat_apply_inverse(wheel_quat_w, wheel_velocity_w)
+
+    in_contact = _wheel_contact_state(env, sensor_cfg, threshold)
+    lateral_velocity = wheel_velocity_local[..., 1]
+    return torch.sum(in_contact * lateral_velocity.square(), dim=1)
+
+
 def _scalar_command(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     """Return a scalar command as a one-dimensional environment batch."""
     command = env.command_manager.get_command(command_name)

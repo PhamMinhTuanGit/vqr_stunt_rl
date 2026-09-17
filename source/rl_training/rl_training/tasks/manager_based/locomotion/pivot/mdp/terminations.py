@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Deep Robotics
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Termination terms for the two-wheel pivot tasks."""
+"""Termination terms for the VQR pivot tasks."""
 
 from __future__ import annotations
 
@@ -74,6 +74,47 @@ def pivot_drifted_away(
     asset: Articulation = env.scene[asset_cfg.name]
     displacement = asset.data.root_pos_w[:, :2] - env.scene.env_origins[:, :2]
     return torch.linalg.vector_norm(displacement, dim=1) > maximum_distance
+
+
+def lost_wheel_contact(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 2.0,
+    grace_period_s: float = 0.1,
+    persistence_s: float = 0.1,
+) -> torch.Tensor:
+    """Terminate after any selected wheel continuously loses contact."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    current_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids]
+    in_contact = torch.linalg.vector_norm(current_forces, dim=-1) > threshold
+    lost_now = ~torch.all(in_contact, dim=1)
+
+    timer_name = "_lost_wheel_contact_time"
+    age_name = "_lost_wheel_contact_age"
+    step_name = "_lost_wheel_contact_last_episode_step"
+    episode_step = env.episode_length_buf
+    if not hasattr(env, timer_name):
+        setattr(env, timer_name, torch.zeros_like(lost_now, dtype=torch.float))
+        setattr(env, age_name, torch.zeros_like(lost_now, dtype=torch.float))
+        setattr(env, step_name, episode_step.clone() - 1)
+
+    lost_time: torch.Tensor = getattr(env, timer_name)
+    physical_age: torch.Tensor = getattr(env, age_name)
+    last_episode_step: torch.Tensor = getattr(env, step_name)
+    reset_env = episode_step < last_episode_step
+    new_step = episode_step != last_episode_step
+
+    physical_age[reset_env] = 0.0
+    lost_time[reset_env] = 0.0
+    in_grace = physical_age < grace_period_s
+
+    lost_time[in_grace | ~lost_now] = 0.0
+    accumulate = new_step & ~in_grace & lost_now
+    lost_time[accumulate] += env.step_dt
+    physical_age[new_step] += env.step_dt
+    last_episode_step.copy_(episode_step)
+
+    return (lost_time + 1.0e-6 >= persistence_s) & ~in_grace
 
 
 def m3_drifted_from_reset(
