@@ -121,6 +121,28 @@ def pivot_track_yaw_rate(
     return torch.exp(-error.square() / std**2)
 
 
+def lateral_wheel_slip(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg,
+    threshold: float = 2.0,
+) -> torch.Tensor:
+    """Penalize contacted wheels' velocity along their local axle direction.
+
+    The VQR wheel joints all rotate about local Y (the URDF axes are
+    ``(0, -1, 0)``), so wheel-frame Y is the lateral/axle direction.  Forward
+    rolling in wheel-frame X is intentionally not penalized.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_velocity_w = asset.data.body_lin_vel_w[:, asset_cfg.body_ids]
+    wheel_quat_w = asset.data.body_quat_w[:, asset_cfg.body_ids]
+    wheel_velocity_local = math_utils.quat_apply_inverse(wheel_quat_w, wheel_velocity_w)
+
+    in_contact = _wheel_contact_state(env, sensor_cfg, threshold)
+    lateral_velocity = wheel_velocity_local[..., 1]
+    return torch.sum(in_contact * lateral_velocity.square(), dim=1)
+
+
 def _scalar_command(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     """Return a scalar command as a one-dimensional environment batch."""
     command = env.command_manager.get_command(command_name)
@@ -1377,3 +1399,166 @@ def pitch_collapsed(env, min_pitch: float, grace_s: float):
 def drifted_away(env, max_dist: float):
     p = env.scene["robot"].data.root_pos_w[:, :2] - env.scene.env_origins[:, :2]
     return p.norm(dim=1) > max_dist
+
+
+# ---------------------------------------------------------------------------
+# Four-mode pivot rewards (spec section 7): mode-gated, cache-fed (I8).
+# ---------------------------------------------------------------------------
+
+GROUND = 0
+REAR_UP = 1
+BALANCE = 2
+LAND = 3
+
+
+def _pivot_balance_core(env: ManagerBasedRLEnv) -> tuple:
+    """(zeta, zeta_dot, xi) straight from the cache (invariants I1/I8)."""
+    from .observations import _pivot_cache
+
+    cache = _pivot_cache(env)
+    return cache.zeta, cache.zeta_dot, cache.xi
+
+
+def _mode_gate(env, command_name: str) -> torch.Tensor:
+    """Current mode id per env from the 8-dim pivot command (section 7)."""
+    cmd = env.command_manager.get_command(command_name)
+    return cmd[:, :4].argmax(dim=-1)  # one-hot slot holding the mode
+
+
+def mode_gated(term_func, weights: dict):
+    """Wrap ``term_func`` with per-mode weights; unlisted modes contribute 0.
+
+    The wrapped signature matches Isaac Lab reward terms: the first two
+    positional args (env, cfg params...) pass through untouched, and the
+    factory closes over ``command_name`` so cfg params stay keyword-safe.
+    """
+    weight_values = torch.tensor(list(weights.values()))
+
+    def wrapped(env, *args, **kwargs):
+        mode = _mode_gate(env, kwargs["command_name"])
+        out = term_func(env, *args, **kwargs)
+        gate = torch.zeros_like(mode, dtype=out.dtype)
+        for mode_id, weight in weights.items():
+            gate = torch.where(
+                mode == mode_id, torch.full_like(gate, weight, dtype=out.dtype), gate
+            )
+        return out * gate if out.dim() == 1 else out * gate.unsqueeze(-1)
+    return wrapped
+
+
+def capture_point_reward(env: ManagerBasedRLEnv, std: float = 0.12) -> torch.Tensor:
+    """exp(-xi^2 / sigma^2): the balance variable IS xi (I1)."""
+    _, _, xi = _pivot_balance_core(env)
+    return torch.exp(-xi.square() / std.square())
+
+
+def omega_z_tracking(
+    env: ManagerBasedRLEnv, command_name: str, std: float = 0.5
+) -> torch.Tensor:
+    """Yaw-rate tracking; gated OFF past xi_safe together with anchor (I4)."""
+    from .observations import _pivot_cache
+
+    cache = _pivot_cache(env)
+    cmd = env.command_manager.get_command(command_name)
+    target = cmd[:, 4]
+    gate = (cache.xi.abs() <= cache.xi_safe).to(target.dtype)
+    return gate * torch.exp(-(target - cache.omega_z).square() / std.square())
+
+
+def anchor_midpoint_reward(
+    env: ManagerBasedRLEnv, command_name: str
+) -> torch.Tensor:
+    """Anchor drift of the rear-axle midpoint; OFF past xi_safe or LAND (I4)."""
+    from .observations import _pivot_cache
+
+    cache = _pivot_cache(env)
+    robot = env.scene["robot"]
+    cmd = env.command_manager.get_command(command_name)
+    mode = cmd[:, :4].argmax(dim=-1)
+    # Rear-axle midpoint wheel link indices resolved at env init.
+    rear_ids = getattr(env.unwrapped, "pivot_rear_wheel_ids", None)
+    if rear_ids is None:
+        rear_ids = torch.tensor([2, 3], device=robot.device)
+    mid = robot.data.body_pos_w[:, rear_ids, :2].mean(dim=1)
+    drift = (mid - env.scene.env_origins[:, :2]).norm(dim=-1)
+    gate = (cache.xi.abs() <= cache.xi_safe) & (~_is_land(env, command_name))
+    gate = gate.to(drift.dtype)
+    return gate * drift
+
+
+def _is_land(env, command_name: str) -> torch.Tensor:
+    cmd = env.command_manager.get_command(command_name)
+    return cmd[:, 3] > 0.5
+
+
+def front_wheels_off_ground(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Fraction of the front wheel pair clear of the ground."""
+    from .observations import _pivot_cache
+
+    cache = _pivot_cache(env)
+    front = cache.wheel_contact[:, :2]
+    return (front < 0.5).float().mean(dim=-1)
+
+
+def roll_flat_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """|roll| from the cache; roll is always driven toward zero."""
+    from .observations import _pivot_cache
+
+    cache = _pivot_cache(env)
+    return cache.roll.abs()
+
+
+def tuck_tracking(
+    env: ManagerBasedRLEnv, command_name: str
+) -> torch.Tensor:
+    """Bám tuck*: exp(-||realized tuck - tuck*||^2 / std^2) in BALANCE."""
+    from .observations import _pivot_cache
+
+    cache = _pivot_cache(env)
+    cmd = env.command_manager.get_command(command_name)
+    tuck_cmd = cmd[:, 7]
+    realized = getattr(env.unwrapped, "pivot_realized_tuck", None)
+    if realized is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    return torch.exp(-torch.square(realized - tuck_cmd) / 0.25)
+
+
+def thermal_excess_penalty(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """max(0, EMA|tau_w| - 3 Nm)^2 averaged over wheels; cache-fed."""
+    from .observations import _pivot_cache
+
+    cache = _pivot_cache(env)
+    excess = torch.relu(cache.ema_wheel_torque - cache.physics.wheel_continuous_torque)
+    return excess.square().mean(dim=-1)
+
+
+def self_collision_analytic(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Analytic capsule self-collision violation (I6): reward-only."""
+    from .observations import _pivot_cache
+
+    cache = _pivot_cache(env)
+    clearance = getattr(env.unwrapped, "pivot_clearance", None)
+    if clearance is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    target = getattr(cache, "min_clearance_target", 0.02)
+    return torch.relu(target - clearance).square()
+
+
+def landing_peak_force(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """max F_n over wheels normalised by the 645 N landing budget."""
+    from .observations import _pivot_cache
+
+    cache = _pivot_cache(env)
+    sensor = env.scene.sensors["contact_forces"]
+    fn_peak = sensor.data.net_forces_w[:, :, 2].abs().amax(dim=-1)
+    return fn_peak / cache.physics.fn_peak_budget
+
+
+def backflip_excess_penalty(
+    env: ManagerBasedRLEnv, bias_rad: float = 0.0
+) -> torch.Tensor:
+    """I5: pitch strictly beyond theta*(omega_z) (+ optional forward bias)."""
+    from .observations import _pivot_cache
+
+    cache = _pivot_cache(env)
+    return torch.relu(cache.pitch - (cache.theta_star + bias_rad))

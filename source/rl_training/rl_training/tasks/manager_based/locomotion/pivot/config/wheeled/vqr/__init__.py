@@ -56,6 +56,20 @@ gym.register(
 )
 
 gym.register(
+    id="Pivot-VQR-FourWheel-Rotate-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.four_wheel_rotate_env_cfg:VQRFourWheelRotateEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:VQRTwoWheelRotatePPORunnerCfg"
+        ),
+    },
+)
+
+gym.register(
     id="Pivot-FourToTwoWheelRotate-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
@@ -65,6 +79,56 @@ gym.register(
         ),
         "rsl_rl_cfg_entry_point": (
             f"{agents.__name__}.rsl_rl_ppo_cfg:VQRFourToTwoWheelRotatePPORunnerCfg"
+        ),
+    },
+)
+
+gym.register(
+    id="Pivot-FourWheelRotate-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.four_wheel_rotate_env_cfg:VQRFourWheelRotateEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:VQRFourWheelRotatePPORunnerCfg"
+        ),
+    },
+)
+
+gym.register(
+    id="Pivot-VQR-Train-v0",
+    entry_point="rl_training.tasks.manager_based.locomotion.pivot.pivot_env:PivotEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.pivot_env_cfg:PivotEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:PivotVQRPPORunnerCfg"
+        ),
+    },
+)
+
+gym.register(
+    id="Pivot-VQR-Play-v0",
+    entry_point="rl_training.tasks.manager_based.locomotion.pivot.pivot_env:PivotEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.pivot_env_cfg:PivotEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:PivotVQRPPORunnerCfg"
+        ),
+    },
+)
+
+gym.register(
+    id="Recover-VQR-v0",
+    entry_point="rl_training.tasks.manager_based.locomotion.pivot.pivot_env:PivotEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.recover_env_cfg:RecoverEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:PivotVQRRecoverPPORunnerCfg"
         ),
     },
 )

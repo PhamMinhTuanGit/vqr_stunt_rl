@@ -319,3 +319,145 @@ def bad_orientation_2(
     # extract the used quantities (to enable type-hinting)
     asset: RigidObject = env.scene[asset_cfg.name]
     return (asset.data.projected_gravity_b[:, 2] > 0) | (asset.data.projected_gravity_b[:, :2].abs() > 0.7).any(-1)
+
+
+# ---------------------------------------------------------------------------
+# Four-mode pivot reset distribution (spec section 9): 30/25/30/15.
+# ---------------------------------------------------------------------------
+
+GROUND = 0
+REAR_UP = 1
+BALANCE = 2
+LAND = 3
+
+
+def pivot_reset_distribution(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    standing_positions: list | None = None,
+):
+    """Sample reset states per the 30/25/30/15 spec buckets.
+
+    Buckets: 30% four-wheel standing, 25% mid-REAR_UP, 30% near-tipover
+    (zeta, zeta_dot ~ U[+/-xi_max]), 15% hard-state buffer replay.  The
+    fractions are fixed by spec; the standing bucket reuses the audited
+    four-wheel reset event.
+    """
+    asset = env.scene[asset_cfg.name]
+    device = asset.device
+    env_ids = env.reset_buf.nonzero(as_tuple=True)[0]
+    n = len(env_ids)
+    if n == 0:
+        return
+
+    fractions = torch.tensor([0.30, 0.25, 0.30, 0.15], device=device)
+    bucket = torch.multinomial(fractions, n, replacement=True)
+    standing = bucket == 0
+    mid = bucket == 1
+    near_tip = bucket == 2
+    hard = bucket == 3
+
+    # -- standing bucket: audited four-wheel standing reset ------------------
+    if standing.any():
+        reset_four_wheel_standing(
+            env,
+            asset_cfg,
+            standing_positions=standing_positions,
+            env_ids=env_ids[standing],
+        )
+
+    # -- mid rear-up bucket: pitch part-way toward theta* --------------------
+    if mid.any():
+        theta_star_0 = 0.5685  # 32.58 deg in rad; SSOT physical_params.theta_star_0
+        _write_root_with_pitch(
+            env,
+            asset,
+            env_ids[mid],
+            pitch_range=(0.25 * theta_star_0, 0.75 * theta_star_0),
+        )
+
+    # -- near-tip bucket: zeta/zeta_dot ~ U[+/-xi_max] ------------------------
+    if near_tip.any():
+        ids = env_ids[near_tip]
+        cache = getattr(env.unwrapped, "pivot_cache", None)
+        if cache is not None:
+            xi_max = cache.xi_max[ids]
+        else:
+            xi_max = 0.376 * torch.ones(len(ids), device=device)
+        zeta = (torch.rand(len(ids), device=device) * 2 - 1) * xi_max
+        zeta_dot = (torch.rand(len(ids), device=device) * 2 - 1) * xi_max
+        _write_root_with_pitch(
+            env, asset, ids, pitch_range=None, zeta=zeta, zeta_dot=zeta_dot
+        )
+
+    # -- hard-state replay bucket ---------------------------------------------
+    if hard.any():
+        ids = env_ids[hard]
+        buffer = getattr(env.unwrapped, "pivot_hard_states", None)
+        if buffer is not None and buffer.filled > 0:
+            frame = buffer.sample()
+            for name, tensor in frame.items():
+                writer = getattr(asset, f"write_{name}_to_sim", None)
+                if writer is not None:
+                    writer(tensor[ids], env_ids=ids)
+
+
+def _write_root_with_pitch(
+    env,
+    asset,
+    ids,
+    pitch_range,
+    zeta=None,
+    zeta_dot=None,
+):
+    """Place the base at the nominal height with sampled pitch/velocity (helper)."""
+    n = len(ids)
+    device = asset.device
+    pitch = None
+    if pitch_range is not None:
+        pitch = torch.empty(n, device=device).uniform_(*pitch_range)
+
+    root_state = asset.data.default_root_state.clone()
+    root_state[ids, :3] = env.scene.env_origins[ids]
+    root_state[ids, 2] = 0.45
+    if pitch is not None:
+        # Pure pitch about body-y with the xyzw quaternion layout.
+        root_state[ids, 3] = torch.sin(pitch / 2)
+        root_state[ids, 4] = 0.0
+        root_state[ids, 5] = 0.0
+        root_state[ids, 6] = torch.cos(pitch / 2)
+    if zeta is not None:
+        # Longitudinal rate along the heading direction (world x for reset).
+        root_state[ids, 7] = zeta_dot if zeta_dot is not None else 0.0
+    asset.write_root_link_to_sim(root_state[ids], env_ids=ids)
+
+
+def pivot_recover_reset(
+    env,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Reset into the fallen distribution: side-lying or inverted pitch/roll."""
+    asset = env.scene[asset_cfg.name]
+    device = asset.device
+    env_ids = env.reset_buf.nonzero(as_tuple=True)[0]
+    n = len(env_ids)
+    if n == 0:
+        return
+
+    # Pitch ~ U(120, 175) deg or roll ~ U(90, 160) deg: lying over side/back.
+    u = torch.rand(n, device=device)
+    flat_pitch = torch.empty(n, device=device).uniform_(2.1, 3.05)
+    side_roll = torch.empty(n, device=device).uniform_(1.57, 2.8)
+    flat = u < 0.5
+
+    root_state = asset.data.default_root_state.clone()
+    root_state[env_ids, :3] = env.scene.env_origins[env_ids]
+    root_state[env_ids, 2] = 0.20
+    # Pure pitch quaternion (xyzw) for the flat bucket, pure roll otherwise.
+    root_state[env_ids, 3] = torch.where(
+        flat, torch.cos(flat_pitch / 2), torch.cos(side_roll / 2)
+    )
+    root_state[env_ids, 4] = torch.where(flat, torch.sin(flat_pitch / 2), torch.zeros_like(flat_pitch))
+    root_state[env_ids, 5] = torch.where(flat, torch.zeros_like(side_roll), torch.sin(side_roll / 2))
+    root_state[env_ids, 6] = 0.0
+    asset.write_root_link_to_sim(root_state[env_ids], env_ids=env_ids)
