@@ -412,3 +412,124 @@ class PivotCommandCfg(CommandTermCfg):
     pitch_target: tuple[float, float] = (0.9, 1.2)
     gesture_freq: tuple[float, float] = (0.5, 1.5)
     rel_standing_envs: float = 0.2
+
+
+# ---------------------------------------------------------------------------
+# Four-mode command (spec section 7): mode one-hot(4) | omega_z* | delta_theta* | tuck*
+# ---------------------------------------------------------------------------
+
+GROUND = 0
+REAR_UP = 1
+BALANCE = 2
+LAND = 3
+NUM_MODES = 4
+COMMAND_DIM = NUM_MODES + 4  # 8
+
+
+class PivotModeCommand(CommandTerm):
+    """Four-mode pivot command: mode one-hot(4) | omega_z* | delta_theta* | tuck*.
+
+    The supervisor (environment) owns the mode schedule; this term samples
+    the continuous setpoints around it and exposes the 8-dim command vector.
+    """
+
+    def __init__(self, cfg: "PivotModeCommandCfg", env):
+        super().__init__(cfg, env)
+        self.robot = env.scene[cfg.asset_name]
+        self._cmd = torch.zeros(self.num_envs, COMMAND_DIM, device=self.device)
+        self._mode = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._omega_z_ramp = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_omega_z"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["error_delta_theta"] = torch.zeros(self.num_envs, device=self.device)
+
+    def __str__(self):
+        return f"PivotModeCommand(mode={self.cfg.mode_schedule})"
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self._cmd
+
+    @property
+    def mode(self) -> torch.Tensor:
+        return self._mode
+
+    @property
+    def omega_z_command(self) -> torch.Tensor:
+        return self._cmd[:, NUM_MODES]
+
+    @property
+    def delta_theta_command(self) -> torch.Tensor:
+        return self._cmd[:, NUM_MODES + 1]
+
+    @property
+    def tuck_command(self) -> torch.Tensor:
+        return self._cmd[:, NUM_MODES + 2]
+
+    # -- supervisor hooks -------------------------------------------------
+    def set_mode(self, env_ids: torch.Tensor, modes: torch.Tensor) -> None:
+        """Supervisor (L0-L3 arbitration) may override the scheduled mode."""
+        self._mode[env_ids] = modes
+        one_hot = torch.nn.functional.one_hot(self._mode, NUM_MODES).to(self._cmd.dtype)
+        self._cmd[env_ids, :NUM_MODES] = one_hot[env_ids]
+
+    def _resample_command(self, env_ids):
+        n = len(env_ids)
+        device = self.device
+        r = lambda rng: torch.empty(n, device=device).uniform_(*rng)
+        # Continuous setpoints; the mode stays whatever the schedule/supervisor set.
+        # omega_z* <= |6| BALANCE / |3| GROUND (invariant I10) via clamp at write.
+        self._cmd[env_ids, NUM_MODES] = r(self.cfg.omega_z_range).clamp_(
+            -self.cfg.omega_z_limit, self.cfg.omega_z_limit
+        )
+        # delta_theta* in +/-8 deg around theta*(omega_z) (section 7).
+        self._cmd[env_ids, NUM_MODES + 1] = r(self.cfg.delta_theta_range).clamp_(
+            -self.cfg.delta_theta_limit, self.cfg.delta_theta_limit
+        )
+        # tuck* in [0, 1]: 0 = open stance, 1 = fully tucked.
+        self._cmd[env_ids, NUM_MODES + 2] = r((0.0, 1.0))
+        # Keep the one-hot consistent with resampled modes.
+        one_hot = torch.nn.functional.one_hot(self._mode[env_ids], NUM_MODES).to(self._cmd.dtype)
+        self._cmd[env_ids, :NUM_MODES] = one_hot
+        # A share of envs gets a pure hold (omega_z* = 0) to preserve the static
+        # balance skill (S2 gate: r_xi > 0.7 for 20 s).
+        hold = torch.rand(n, device=device) < self.cfg.rel_standing_envs
+        self._cmd[env_ids[hold], NUM_MODES] = 0.
+
+    def _update_command(self):
+        # omega_z* = omega_z at start; step built after probing is rate-limited
+        # by the supervisor and needs no further update here.
+        pass
+
+    def _update_metrics(self):
+        self.metrics["error_omega_z"] += torch.abs(
+            self._cmd[:, NUM_MODES] - self.robot.data.root_ang_vel_b[:, 2]
+        ) / self._env.max_episode_length
+        # delta_theta error versus realized pitch offset around theta*: reads
+        # the cache when available (I8) and falls back to raw attitude otherwise.
+        cache = getattr(self._env.unwrapped, "pivot_cache", None)
+        if cache is not None and getattr(cache, "_updated", False):
+            realized = cache.pitch - cache.theta_star
+        else:
+            g = self.robot.data.projected_gravity_b
+            pitch = torch.atan2(g[:, 0], -g[:, 2])
+            realized = pitch  # theta* term unavailable pre-cache; coarse error only
+        self.metrics["error_delta_theta"] += torch.abs(
+            self._cmd[:, NUM_MODES + 1] - realized
+        ) / self._env.max_episode_length
+
+    def _set_debug_vis_impl(self, debug_vis):
+        pass
+
+
+@configclass
+class PivotModeCommandCfg(CommandTermCfg):
+    class_type: type = PivotModeCommand
+    asset_name: str = MISSING
+    # |omega_z*| capped per mode at runtime (I10): 3 GROUND, 6 BALANCE.
+    omega_z_range: tuple[float, float] = (-6.0, 6.0)
+    omega_z_limit: float = 6.0
+    delta_theta_range: tuple[float, float] = (-0.1396, 0.906)
+    delta_theta_limit: float = 0.906
+    rel_standing_envs: float = 0.2
+    mode_schedule: tuple[str, ...] = ("GROUND", "REAR_UP", "BALANCE", "LAND")
+

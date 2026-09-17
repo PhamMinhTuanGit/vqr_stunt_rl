@@ -179,3 +179,66 @@ def pivot_yaw_rate_levels(
             env._pivot_yaw_curriculum_last_success_rate, device=env.device
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Four-mode pivot curriculum: stages S0-S6 (spec section 9).
+# ---------------------------------------------------------------------------
+
+GROUND = 0
+REAR_UP = 1
+BALANCE = 2
+LAND = 3
+
+# Gate criteria per stage; the env reads these from reward-manager averages.
+PIVOT_STAGE_GATES = {
+    0: {"reward": "yaw_ground_tracking", "threshold": 0.8},
+    1: {"reward": "transition_success", "threshold": 0.90},
+    2: {"reward": "capture_point_balance", "threshold": 0.7},
+    3: {"metric": "abs_delta_theta", "threshold": 4.0},  # deg
+    4: None,  # S4 opens tuck* and EstimatedBalanceState; no reward gate
+    5: None,  # S5 forces low friction (mu -> 0.3) on 30% envs; no gate
+    6: None,  # S6 is full DR + hard-state buffer; terminal stage
+}
+PIVOT_MAX_STAGE = 6
+
+
+def pivot_stages(env, env_ids, command_name: str):
+    """Advance the global four-mode stage once its gate is satisfied."""
+    stage = int(getattr(env.unwrapped, "_pivot_stage", 0))
+    gate = PIVOT_STAGE_GATES.get(stage)
+    if gate is None or stage >= PIVOT_MAX_STAGE:
+        return {"stage": torch.tensor(stage, device=env.device)}
+
+    if "reward" in gate:
+        mean_reward = float(
+            env.reward_manager.get_term(gate["reward"]).mean().item()
+        )
+        passing = mean_reward > gate["threshold"]
+    else:
+        value = float(
+            env.command_manager.get_term(command_name)
+            .metrics[gate["metric"]]
+            .mean()
+            .item()
+        )
+        passing = value < gate["threshold"]
+    if passing:
+        stage += 1
+        env.unwrapped._pivot_stage = stage
+
+    return {
+        "stage": torch.tensor(stage, device=env.device),
+        "passing": torch.tensor(passing, device=env.device),
+    }
+
+
+def pivot_stage_adjustments(env) -> dict:
+    """Per-stage MDP adjustments applied by PivotEnv._pre_physics_step (S4-S6)."""
+    stage = int(getattr(env.unwrapped, "_pivot_stage", 0))
+    return {
+        "tuck_enabled": stage >= 4,
+        "estimated_balance": stage >= 4,
+        "full_dr": stage >= 6,
+        "hard_state_resets": stage >= 6,
+    }

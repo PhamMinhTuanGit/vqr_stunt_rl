@@ -52,3 +52,65 @@ class SoftLimitJointPositionActionCfg(JointPositionActionCfg):
     soft_limit_joint_names: list[str] = MISSING
     # Optional absolute safety margin; asset/actuator limits stay unchanged.
     joint_limit_margin: float | None = None
+
+
+class PriorResidualJointPositionAction(JointPositionAction):
+    """Leg targets = q_prior(mode, tuck*) + 0.3 * residual (invariant I3).
+
+    The residual scale is fixed at 0.3 by the specification: the policy only
+    nudges around the mode-interpolated prior, never steers the whole pose.
+    """
+
+    cfg: "PriorResidualJointPositionActionCfg"
+
+    def __init__(self, cfg: "PriorResidualJointPositionActionCfg", env):
+        super().__init__(cfg, env)
+        self._scale = cfg.residual_scale
+        self._command_name = cfg.command_name
+        self._joint_names_ordered = [
+            self._joint_names[i] for i in range(len(self._joint_names))
+        ]
+
+    @property
+    def prior_command(self):
+        return self._env.command_manager.get_term(self._command_name)
+
+    def compute(self) -> torch.Tensor:
+        return self._raw_actions
+
+    def process_actions(self, actions: torch.Tensor):
+        # Pull the mode and tuck from the pivot command term.
+        term = self.prior_command
+        from .leg_prior import q_prior  # local import avoids a cycle
+
+        mode = term.mode
+        tuck = term.tuck_command
+        prior = q_prior(
+            mode,
+            tuck,
+            self._joint_names_ordered,
+            getattr(self.cfg, "reference_path", None),
+        ).to(self._device)
+        # JointPositionAction applies (raw * scale + offset); fold the prior in
+        # as a dynamic offset and shrink the residual by the residual scale.
+        self._raw_actions = actions
+        self._processed_actions = prior + self._scale * actions * self.cfg.scale
+        # Optionally clamp to runtime soft limits like the soft-limit term.
+        if self.cfg.enforce_soft_limits:
+            limits = self._asset.data.soft_joint_pos_limits[:, self._joint_ids]
+            self._processed_actions = torch.clamp(
+                self._processed_actions, min=limits[..., 0], max=limits[..., 1]
+            )
+
+
+@configclass
+class PriorResidualJointPositionActionCfg(JointPositionActionCfg):
+    """Configuration for the q_prior + scaled-residual leg action."""
+
+    class_type: type = PriorResidualJointPositionAction
+    command_name: str = MISSING
+    # Spec-fixed residual scale (I3); do not tune without re-auditing.
+    residual_scale: float = 0.3
+    # Base scale of JointPositionActionCfg applies on top of the residual scale.
+    enforce_soft_limits: bool = True
+    reference_path: str | None = None
