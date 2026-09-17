@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 import torch
-from typing import TYPE_CHECKING, Sequence
+import math 
+from typing import TYPE_CHECKING, Sequence, Any
 from dataclasses import MISSING 
 from isaaclab.assets import Articulation
 from isaaclab.managers import CommandTerm, CommandTermCfg
@@ -19,6 +20,7 @@ import rl_training.tasks.manager_based.locomotion.velocity.mdp as mdp
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
+MISSING: Any = MISSING
 
 class EpisodeLiftCommand(CommandTerm):
     """Expose a scheduled lift request without writing actions or robot state."""
@@ -423,8 +425,10 @@ REAR_UP = 1
 BALANCE = 2
 LAND = 3
 NUM_MODES = 4
-COMMAND_DIM = NUM_MODES + 4  # 8
-
+COMMAND_DIM = NUM_MODES + 3  # 8
+OMEGA_Z_IDX = 4
+DELTA_THETA_IDX = 5
+TUCK_IDX = 6
 
 class PivotModeCommand(CommandTerm):
     """Four-mode pivot command: mode one-hot(4) | omega_z* | delta_theta* | tuck*.
@@ -496,9 +500,30 @@ class PivotModeCommand(CommandTerm):
         self._cmd[env_ids[hold], NUM_MODES] = 0.
 
     def _update_command(self):
-        # omega_z* = omega_z at start; step built after probing is rate-limited
-        # by the supervisor and needs no further update here.
-        pass
+        self._update_mode()
+
+        one_hot = torch.nn.functional.one_hot(
+            self._mode,
+            NUM_MODES,
+        ).to(self._cmd.dtype)
+
+        self._cmd[:, :NUM_MODES] = one_hot
+
+        # I10
+        omega = self._cmd[:, OMEGA_Z_IDX]
+
+        ground = self._mode == GROUND
+        balance = self._mode == BALANCE
+
+        omega[ground] = torch.clamp(
+            omega[ground], -3.0, 3.0
+        )
+
+        omega[balance] = torch.clamp(
+            omega[balance], -6.0, 6.0
+        )
+
+        self._cmd[:, OMEGA_Z_IDX] = omega
 
     def _update_metrics(self):
         self.metrics["error_omega_z"] += torch.abs(
@@ -519,6 +544,43 @@ class PivotModeCommand(CommandTerm):
 
     def _set_debug_vis_impl(self, debug_vis):
         pass
+    
+    def _update_mode(self):
+        t = self._env.episode_length_buf * self._env.step_dt
+
+        ground_end = self.cfg.ground_duration_s
+
+        rear_up_end = (
+            ground_end
+            + self.cfg.rear_up_duration_s
+        )
+
+        balance_end = (
+            rear_up_end
+            + self.cfg.balance_duration_s
+        )
+
+        mode = torch.full_like(self._mode, LAND)
+
+        mode = torch.where(
+            t < balance_end,
+            BALANCE,
+            mode,
+        )
+
+        mode = torch.where(
+            t < rear_up_end,
+            REAR_UP,
+            mode,
+        )
+
+        mode = torch.where(
+            t < ground_end,
+            GROUND,
+            mode,
+        )
+
+        self._mode[:] = mode
 
 
 @configclass
@@ -531,5 +593,6 @@ class PivotModeCommandCfg(CommandTermCfg):
     delta_theta_range: tuple[float, float] = (-0.1396, 0.906)
     delta_theta_limit: float = 0.906
     rel_standing_envs: float = 0.2
+    rear_up_duration_s = 
     mode_schedule: tuple[str, ...] = ("GROUND", "REAR_UP", "BALANCE", "LAND")
 

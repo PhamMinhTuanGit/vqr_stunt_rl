@@ -99,7 +99,7 @@ class PivotActionsCfg:
         asset_name="robot",
         joint_names=WHEEL_JOINT_NAMES,
         scale=PHYS.wheel_peak_torque,
-        use_default_offset=True,
+        #use_default_offset=True,
         preserve_order=True,
     )
 
@@ -154,14 +154,24 @@ class PivotPolicyObsCfg(ObsGroup):
     )
     previous_action = ObsTerm(func=mdp.last_action)
     balance_signals = ObsTerm(func=mdp.balance_signals)
-    ema_wheel_torque = ObsTerm(func=mdp.ema_wheel_torque)
+
     wheel_contact = ObsTerm(func=mdp.wheel_contact_flags)
     pivot_command = ObsTerm(
         func=mdp.pivot_command_obs, params={"command_name": "pivot_mode"}
     )
-    history_stack = ObsTerm(
-        func=mdp.pivot_history_stack,
-        params={"command_name": "pivot_mode", "history_length": 5},
+    balance_history = ObsTerm(
+        func=mdp.balance_signals,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=[
+                    "HL_WHEEL",
+                    "HR_WHEEL",
+                ],
+            ),
+        },
+        history_length=5,
+        flatten_history_dim=True,
     )
 
     def __post_init__(self):

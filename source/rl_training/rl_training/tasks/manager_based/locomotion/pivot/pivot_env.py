@@ -62,8 +62,8 @@ class _HistoryStack:
 class PivotEnv(ManagerBasedRLEnv):
     """Four-mode pivot environment with a per-step state cache."""
 
-    def __init__(self, cfg, render_interval: int | None = None, **kwargs):
-        super().__init__(cfg, render_interval, **kwargs)
+    def __init__(self, cfg, render_mode: int | None = None, **kwargs):
+        super().__init__(cfg, render_mode, **kwargs)
 
         robot = self.scene["robot"]
         self.pivot_cache = PivotStateCache(

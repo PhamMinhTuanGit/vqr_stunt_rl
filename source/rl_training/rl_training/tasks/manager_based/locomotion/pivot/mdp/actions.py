@@ -9,10 +9,10 @@ from dataclasses import MISSING
 
 import torch
 
-from isaaclab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
+from isaaclab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg, JointActionCfg 
 from isaaclab.utils import configclass
 
-
+MISSING: Any = MISSING  # type: ignore
 class SoftLimitJointPositionAction(JointPositionAction):
     """Clamp selected processed position targets to runtime soft joint limits."""
 

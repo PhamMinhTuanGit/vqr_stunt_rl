@@ -121,13 +121,22 @@ def pivot_command_obs(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor
 
 
 def contact_forces_term(
-    env: ManagerBasedRLEnv, threshold: float = 1.0
-) -> torch.Tensor:
-    """Privileged: per-wheel normal force magnitude above threshold."""
-    sensor = env.scene.sensors["contact_forces"]
-    magnitude = sensor.data.net_forces_w.norm(dim=-1)
-    return torch.relu(magnitude - threshold)
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 1.0,
+):
+    sensor = env.scene.sensors[sensor_cfg.name]
 
+    forces = sensor.data.net_forces_w[:, sensor_cfg.body_ids]
+
+    magnitude = torch.linalg.vector_norm(
+        forces,
+        dim=-1,
+    )
+
+    return torch.relu(
+        magnitude - threshold
+    )
 
 def mu_hat_term(env: ManagerBasedRLEnv, default: float = 1.0) -> torch.Tensor:
     """Privileged: per-env friction estimate used by thexi safety radii."""
