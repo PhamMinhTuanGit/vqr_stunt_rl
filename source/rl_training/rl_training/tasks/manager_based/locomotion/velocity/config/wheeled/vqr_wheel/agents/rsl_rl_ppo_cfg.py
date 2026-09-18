@@ -76,3 +76,12 @@ class VQRWheelFlatPPORunnerCfg(VQRWheelRoughPPORunnerCfg):
 
         self.max_iterations = 5000
         self.experiment_name = "vqr_wheel_flat"
+
+
+@configclass
+class VQRWheelYawFlatPPORunnerCfg(VQRWheelFlatPPORunnerCfg):
+    """Runner settings for the flat yaw-rate task."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "vqr_wheel_yaw_flat"

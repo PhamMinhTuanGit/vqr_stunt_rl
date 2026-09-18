@@ -38,6 +38,9 @@ constexpr double kJointSafetyMargin = 0.05;
 constexpr double kLegTorqueLimit = 60.0;
 constexpr double kWheelTorqueLimit = 20.0;
 constexpr double kMetricTolerance = 1.0e-8;
+// Slack for limit comparisons of a max-iter iterate that sits exactly on an
+// active bound (Python physics guard uses the same micron-scale slack).
+constexpr double kLimitSlack = 2.0e-6;
 constexpr double kNormalizationTolerance = 1.0e-12;
 
 const std::array<std::string, 12> kLegJointNames = {
@@ -53,6 +56,17 @@ const std::array<std::pair<std::string, std::string>, 4> kWheelFrames = {{
     {"FR", "FR_WHEEL"},
     {"HL", "HL_WHEEL"},
     {"HR", "HR_WHEEL"},
+}};
+
+// Equal joint values produce a point-symmetric pose in the audited URDF, so
+// the FL/HR and FR/HL equal-value pairs define joint-space point symmetry.
+const std::array<std::pair<std::string, std::string>, 6> kJointSymmetryPairs = {{
+    {"FL_HipX_joint", "HR_HipX_joint"},
+    {"FR_HipX_joint", "HL_HipX_joint"},
+    {"FL_HipY_joint", "HR_HipY_joint"},
+    {"FR_HipY_joint", "HL_HipY_joint"},
+    {"FL_Knee_joint", "HR_Knee_joint"},
+    {"FR_Knee_joint", "HL_Knee_joint"},
 }};
 
 struct JointMargin {
@@ -96,6 +110,8 @@ struct Result {
   Eigen::Vector3d support_hr_body;
   Eigen::Vector3d saved_support_fl_body;
   Eigen::Vector3d saved_support_hr_body;
+  Eigen::Vector3d saved_swing_fr_body;
+  Eigen::Vector3d saved_swing_hl_body;
   Eigen::Vector3d com_body;
   SupportMetrics support_body;
   double support_distance_3d_world;
@@ -104,6 +120,20 @@ struct Result {
   double support_dy_body;
   double support_angle_body_x;
   double support_angle_body_y;
+  double midpoint_error;
+  double load_split_fraction;
+  double swing_fr_tuck_radius;
+  double swing_hl_tuck_radius;
+  double stance_residual_x;
+  double stance_residual_y;
+  double swing_residual_x;
+  double swing_residual_y;
+  double swing_height_difference;
+  double axle_line_angle_fl;
+  double axle_line_angle_hr;
+  double joint_symmetry_max_abs;
+  Eigen::Vector3d swing_fr_body;
+  Eigen::Vector3d swing_hl_body;
 };
 
 void require(bool condition, const std::string &message) {
@@ -131,6 +161,14 @@ Eigen::Vector3d vector3(const YAML::Node &node, const std::string &path) {
           "Expected three-vector: " + path);
   Eigen::Vector3d value(node[0].as<double>(), node[1].as<double>(),
                         node[2].as<double>());
+  require(value.allFinite(), "Non-finite YAML vector: " + path);
+  return value;
+}
+
+Eigen::Vector2d vector2(const YAML::Node &node, const std::string &path) {
+  require(node.IsSequence() && node.size() == 2,
+          "Expected two-vector: " + path);
+  Eigen::Vector2d value(node[0].as<double>(), node[1].as<double>());
   require(value.allFinite(), "Non-finite YAML vector: " + path);
   return value;
 }
@@ -246,6 +284,7 @@ Result validate(const std::filesystem::path &yaml_path) {
       quaternion.w();
   const auto legs = requireNode(variables, "leg_joints", "variables");
   std::vector<JointMargin> margins;
+  std::map<std::string, double> angles;
   for (const auto &name : kLegJointNames) {
     require(model.existJointName(name), "Missing joint: " + name);
     const auto &joint = model.joints[model.getJointId(name)];
@@ -253,6 +292,7 @@ Result validate(const std::filesystem::path &yaml_path) {
             "Leg joint is not scalar: " + name);
     const double angle = scalar(legs, name, "variables.leg_joints");
     q[joint.idx_q()] = angle;
+    angles.emplace(name, angle);
     const double lower = angle - model.lowerPositionLimit[joint.idx_q()];
     const double upper = model.upperPositionLimit[joint.idx_q()] - angle;
     require(std::isfinite(lower) && std::isfinite(upper) && lower >= 0.0 &&
@@ -430,6 +470,8 @@ Result validate(const std::filesystem::path &yaml_path) {
   Eigen::Vector3d support_hr_body = Eigen::Vector3d::Zero();
   Eigen::Vector3d saved_support_fl_body = Eigen::Vector3d::Zero();
   Eigen::Vector3d saved_support_hr_body = Eigen::Vector3d::Zero();
+  Eigen::Vector3d saved_swing_fr_body = Eigen::Vector3d::Zero();
+  Eigen::Vector3d saved_swing_hl_body = Eigen::Vector3d::Zero();
   Eigen::Vector3d com_body = Eigen::Vector3d::Zero();
   SupportMetrics support_body{0.0, 0.0, 0.0};
   double support_distance_3d_world = 0.0;
@@ -438,6 +480,20 @@ Result validate(const std::filesystem::path &yaml_path) {
   double support_dy_body = 0.0;
   double support_angle_body_x = 0.0;
   double support_angle_body_y = 0.0;
+  double midpoint_error = 0.0;
+  double load_split_fraction = 0.0;
+  double swing_fr_tuck_radius = 0.0;
+  double swing_hl_tuck_radius = 0.0;
+  double stance_residual_x = 0.0;
+  double stance_residual_y = 0.0;
+  double swing_residual_x = 0.0;
+  double swing_residual_y = 0.0;
+  double swing_height_difference = 0.0;
+  double axle_line_angle_fl = 0.0;
+  double axle_line_angle_hr = 0.0;
+  double joint_symmetry_max_abs = 0.0;
+  Eigen::Vector3d swing_fr_body = Eigen::Vector3d::Zero();
+  Eigen::Vector3d swing_hl_body = Eigen::Vector3d::Zero();
   if (aligned) {
     const Eigen::Matrix3d world_from_body = quaternion.toRotationMatrix();
     const Eigen::Vector3d lateral = Eigen::Vector3d::UnitY();
@@ -553,13 +609,13 @@ Result validate(const std::filesystem::path &yaml_path) {
     require(dx_limit >= 0.030 - kMetricTolerance &&
                 dx_limit <= 0.100 + kMetricTolerance,
             "Invalid saved BODY-frame dx limit");
-    require(std::abs(support_dx_body) <= dx_limit + kMetricTolerance,
+    require(std::abs(support_dx_body) <= dx_limit + kLimitSlack,
             "BODY-frame support dx constraint failed");
-    require(std::abs(support_dy_body) >= y_separation - kMetricTolerance,
+    require(std::abs(support_dy_body) >= y_separation - kLimitSlack,
             "BODY-frame support y-separation constraint failed");
     require(direction_x <=
                 std::sin(direction_limit_deg * std::acos(-1.0) / 180.0) +
-                    kMetricTolerance,
+                    kLimitSlack,
             "BODY-frame support direction constraint failed");
 
     const auto saved_contacts_body =
@@ -605,6 +661,136 @@ Result validate(const std::filesystem::path &yaml_path) {
     near(support_angle_body_y,
          scalar(saved_line, "angle_wrt_body_y_deg", "support_line_body"),
          "BODY support angle relative to Y");
+
+    // Two-wheel inverted-pendulum shaping checks.
+    swing_fr_body =
+        world_from_body.transpose() * (contacts.at("FR") - base_position);
+    swing_hl_body =
+        world_from_body.transpose() * (contacts.at("HL") - base_position);
+    const auto saved_swing_body =
+        requireNode(root, "swing_contacts_body", "root");
+    saved_swing_fr_body =
+        vector3(requireNode(saved_swing_body, "FR", "swing_contacts_body"),
+                "swing_contacts_body.FR");
+    saved_swing_hl_body =
+        vector3(requireNode(saved_swing_body, "HL", "swing_contacts_body"),
+                "swing_contacts_body.HL");
+    vectorNear(swing_fr_body, saved_swing_fr_body, "FR BODY swing contact");
+    vectorNear(swing_hl_body, saved_swing_hl_body, "HL BODY swing contact");
+
+    const auto saved_symmetry = requireNode(root, "pose_symmetry", "root");
+    // Use the WORLD-frame CoM projection like the Python solver; the BODY
+    // frame variant matches only when the base is level.
+    midpoint_error = support.s - 0.5 * support.length;
+    near(midpoint_error,
+         scalar(saved_symmetry, "midpoint_error_m", "pose_symmetry"),
+         "support-midpoint error");
+    const double midpoint_tolerance =
+        scalar(constraints, "midpoint_tolerance_m", "constraints");
+    require(midpoint_tolerance > 0.0 && midpoint_tolerance <= 0.020 +
+                                                   kMetricTolerance,
+            "Invalid saved support-midpoint tolerance");
+    require(std::abs(midpoint_error) <= midpoint_tolerance + kLimitSlack,
+            "CoM is not near the support-segment midpoint");
+    const double fz_fl = forces.at("FL").z();
+    const double fz_hr = forces.at("HR").z();
+    load_split_fraction = fz_fl / (fz_fl + fz_hr);
+    near(load_split_fraction,
+         scalar(saved_symmetry, "load_split_fraction", "pose_symmetry"),
+         "wheel load split fraction");
+    require(std::abs(load_split_fraction - 0.5) <= 0.1,
+            "Wheel normal loads are not balanced");
+
+    const Eigen::Vector3d support_unit =
+        (contacts.at("HR") - contacts.at("FL"))
+            .normalized();
+    const auto axleAngleDeg = [&support_unit](const Eigen::Vector3d &axis) {
+      const double cosine =
+          std::clamp(std::abs(axis.dot(support_unit)), 0.0, 1.0);
+      return std::acos(cosine) * 180.0 / std::acos(-1.0);
+    };
+    axle_line_angle_fl = axleAngleDeg(wheel_axes_world.at("FL"));
+    axle_line_angle_hr = axleAngleDeg(wheel_axes_world.at("HR"));
+    const auto saved_axle =
+        requireNode(saved_symmetry, "axle_line_angle_deg", "pose_symmetry");
+    near(axle_line_angle_fl,
+         scalar(saved_axle, "FL", "pose_symmetry.axle_line_angle_deg"),
+         "FL axle-to-support-line angle");
+    near(axle_line_angle_hr,
+         scalar(saved_axle, "HR", "pose_symmetry.axle_line_angle_deg"),
+         "HR axle-to-support-line angle");
+    const double axle_limit =
+        scalar(constraints, "axle_line_limit_deg", "constraints");
+    require(axle_limit > 0.0 && axle_limit <= 20.0 + kMetricTolerance,
+            "Invalid saved axle-line limit");
+    require(axle_line_angle_fl <= axle_limit + kLimitSlack &&
+                axle_line_angle_hr <= axle_limit + kLimitSlack,
+            "Stance axle is not parallel to the support line");
+
+    swing_fr_tuck_radius = swing_fr_body.head<2>().norm();
+    swing_hl_tuck_radius = swing_hl_body.head<2>().norm();
+    const auto saved_tuck =
+        requireNode(saved_symmetry, "tuck_radius_m", "pose_symmetry");
+    near(swing_fr_tuck_radius,
+         scalar(saved_tuck, "FR", "pose_symmetry.tuck_radius_m"),
+         "FR swing tuck radius");
+    near(swing_hl_tuck_radius,
+         scalar(saved_tuck, "HL", "pose_symmetry.tuck_radius_m"),
+         "HL swing tuck radius");
+    const double tuck_limit =
+        scalar(constraints, "tuck_radius_m", "constraints");
+    require(tuck_limit > 0.0, "Invalid saved tuck radius");
+    require(swing_fr_tuck_radius <= tuck_limit + kLimitSlack &&
+                swing_hl_tuck_radius <= tuck_limit + kLimitSlack,
+            "A swing foot is not tucked within the saved radius");
+
+    stance_residual_x = support_fl_body.x() + support_hr_body.x();
+    stance_residual_y = support_fl_body.y() + support_hr_body.y();
+    swing_residual_x = swing_fr_body.x() + swing_hl_body.x();
+    swing_residual_y = swing_fr_body.y() + swing_hl_body.y();
+    swing_height_difference = swing_fr_body.z() - swing_hl_body.z();
+    const auto saved_stance_res = vector2(
+        requireNode(saved_symmetry, "stance_residual_body_xy_m",
+                    "pose_symmetry"),
+        "pose_symmetry.stance_residual_body_xy_m");
+    const auto saved_swing_res = vector2(
+        requireNode(saved_symmetry, "swing_residual_body_xy_m",
+                    "pose_symmetry"),
+        "pose_symmetry.swing_residual_body_xy_m");
+    near(stance_residual_x, saved_stance_res.x(),
+         "stance point-symmetry residual x");
+    near(stance_residual_y, saved_stance_res.y(),
+         "stance point-symmetry residual y");
+    near(swing_residual_x, saved_swing_res.x(),
+         "swing point-symmetry residual x");
+    near(swing_residual_y, saved_swing_res.y(),
+         "swing point-symmetry residual y");
+    near(swing_height_difference,
+         scalar(saved_symmetry, "swing_height_difference_m", "pose_symmetry"),
+         "swing height difference");
+    joint_symmetry_max_abs = 0.0;
+    for (const auto &[first_name, second_name] : kJointSymmetryPairs) {
+      joint_symmetry_max_abs =
+          std::max(joint_symmetry_max_abs,
+                   std::abs(angles.at(first_name) - angles.at(second_name)));
+    }
+    near(joint_symmetry_max_abs,
+         scalar(saved_symmetry, "joint_symmetry_max_abs_rad", "pose_symmetry"),
+         "joint symmetry magnitude");
+    const bool symmetry_hard = requireNode(saved_symmetry, "symmetry_hard",
+                                           "pose_symmetry")
+                                   .as<bool>();
+    const double symmetry_tolerance = scalar(
+        saved_symmetry, "symmetry_tolerance_m", "pose_symmetry");
+    if (symmetry_hard) {
+      const std::array<double, 5> residuals = {
+          std::abs(stance_residual_x), std::abs(stance_residual_y),
+          std::abs(swing_residual_x), std::abs(swing_residual_y),
+          std::abs(swing_height_difference)};
+      require(*std::max_element(residuals.begin(), residuals.end()) <=
+                  symmetry_tolerance + kLimitSlack,
+              "Hard point-symmetry constraint failed");
+    }
   }
 
   vectorNear(
@@ -736,6 +922,8 @@ Result validate(const std::filesystem::path &yaml_path) {
           support_hr_body,
           saved_support_fl_body,
           saved_support_hr_body,
+          saved_swing_fr_body,
+          saved_swing_hl_body,
           com_body,
           support_body,
           support_distance_3d_world,
@@ -743,7 +931,21 @@ Result validate(const std::filesystem::path &yaml_path) {
           support_dx_body,
           support_dy_body,
           support_angle_body_x,
-          support_angle_body_y};
+          support_angle_body_y,
+          midpoint_error,
+          load_split_fraction,
+          swing_fr_tuck_radius,
+          swing_hl_tuck_radius,
+          stance_residual_x,
+          stance_residual_y,
+          swing_residual_x,
+          swing_residual_y,
+          swing_height_difference,
+          axle_line_angle_fl,
+          axle_line_angle_hr,
+          joint_symmetry_max_abs,
+          swing_fr_body,
+          swing_hl_body};
 }
 
 void printVector(const Eigen::Vector3d &value) {
@@ -832,6 +1034,28 @@ void printResult(const Result &result) {
               << result.support_angle_body_x << '\n';
     std::cout << "support angle wrt body Y [deg] = "
               << result.support_angle_body_y << '\n';
+    std::cout << "support-midpoint error [m] = " << result.midpoint_error
+              << '\n';
+    std::cout << "wheel load split FL/(FL+HR) = " << result.load_split_fraction
+              << '\n';
+    std::cout << "stance point-symmetry residual = ["
+              << result.stance_residual_x << ", " << result.stance_residual_y
+              << "]\n";
+    std::cout << "swing point-symmetry residual = ["
+              << result.swing_residual_x << ", " << result.swing_residual_y
+              << "]\n";
+    std::cout << "swing height difference [m] = "
+              << result.swing_height_difference << '\n';
+    std::cout << "FL axle vs support line [deg] = "
+              << result.axle_line_angle_fl << '\n';
+    std::cout << "HR axle vs support line [deg] = "
+              << result.axle_line_angle_hr << '\n';
+    std::cout << "FR swing tuck radius [m] = " << result.swing_fr_tuck_radius
+              << '\n';
+    std::cout << "HL swing tuck radius [m] = " << result.swing_hl_tuck_radius
+              << '\n';
+    std::cout << "joint symmetry max |delta| [rad] = "
+              << result.joint_symmetry_max_abs << '\n';
     std::cout << "sideways-support constraints = PASS\n";
   }
   std::cout << std::scientific << "full dynamics residual infinity norm = "

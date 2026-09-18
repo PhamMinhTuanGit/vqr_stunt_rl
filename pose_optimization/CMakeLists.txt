@@ -256,4 +256,10 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/sideways_frame_inconsistency_test.py"
       --validator "$<TARGET_FILE:validate_static_equilibrium>"
       --yaml "${VQR_SIDEWAYS_STATIC_OUTPUT_PATH}")
+
+  add_test(NAME joint_symmetry_convention
+    COMMAND "${VQR_PYTHON_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/joint_symmetry_convention_test.py")
+  set_tests_properties(joint_symmetry_convention PROPERTIES
+    ENVIRONMENT_MODIFICATION "PYTHONPATH=path_list_prepend:${VQR_CASADI_PYTHON_PATH};PYTHONPATH=path_list_prepend:${VQR_PINOCCHIO_PYTHON_PATH};VQR_TREAD_CONTACT_LIBRARY=set:${CMAKE_CURRENT_BINARY_DIR}/libtread_contact_c_api.so;VQR_URDF_PATH=set:${VQR_URDF_PATH}")
 endif()

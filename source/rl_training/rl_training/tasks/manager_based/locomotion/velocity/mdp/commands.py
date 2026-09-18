@@ -6,8 +6,9 @@
 
 from __future__ import annotations
 
-import torch
 from typing import TYPE_CHECKING, Sequence
+
+import torch
 
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.utils import configclass
@@ -185,3 +186,47 @@ class DiscreteCommandControllerCfg(CommandTermCfg):
     List of available discrete commands, where each element is an integer.
     Example: [10, 20, 30, 40, 50]
     """
+
+
+class YawRateCommand(CommandTerm):
+    """Sample target yaw rate [rad/s].
+
+    command shape: (num_envs, 1)
+    command[:, 0] = yaw_rate_cmd
+    """
+
+    cfg: "YawRateCommandCfg"
+
+    def __init__(self, cfg: "YawRateCommandCfg", env):
+        super().__init__(cfg, env)
+
+        self.robot = env.scene[cfg.asset_name]
+
+        self._command = torch.zeros(self.num_envs, 1, device=self.device)
+        self.metrics["error_yaw_rate"] = torch.zeros(self.num_envs, device=self.device)
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self._command
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        """Sample new yaw-rate target."""
+        self._command[env_ids, 0].uniform_(*self.cfg.yaw_rate_range)
+
+    def _update_command(self):
+        # Command is constant until next resampling.
+        pass
+
+    def _update_metrics(self):
+        wz = self.robot.data.root_ang_vel_b[:, 2]
+
+        self.metrics["error_yaw_rate"] = torch.abs(wz - self._command[:, 0])
+
+
+@configclass
+class YawRateCommandCfg(CommandTermCfg):
+    """Configuration for a scalar body-frame yaw-rate command."""
+
+    class_type: type = YawRateCommand
+    asset_name: str = "robot"
+    yaw_rate_range: tuple[float, float] = (-1.0, 1.0)

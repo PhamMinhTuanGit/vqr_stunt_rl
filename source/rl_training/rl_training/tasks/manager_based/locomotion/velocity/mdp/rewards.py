@@ -126,6 +126,214 @@ def track_ang_vel_z_exp(
     return reward
 
 
+def track_yaw_rate_exp(
+    env: ManagerBasedRLEnv,
+    std: float,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward tracking of a scalar body-frame yaw-rate command."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    yaw_rate_command = env.command_manager.get_command(command_name)[:, 0]
+    yaw_rate_error = torch.square(yaw_rate_command - asset.data.root_ang_vel_b[:, 2])
+    return torch.exp(-yaw_rate_error / std**2)
+
+
+def _yaw_wheel_contacts(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float,
+) -> torch.Tensor:
+    """Return contact flags for the explicitly selected wheel bodies."""
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    forces = sensor.data.net_forces_w[:, sensor_cfg.body_ids]
+    return torch.linalg.vector_norm(forces, dim=-1) > threshold
+
+
+def _yaw_whole_body_com_xy(asset: Articulation) -> torch.Tensor:
+    """Return the mass-weighted whole-body CoM projected onto the ground plane."""
+    masses = asset.root_physx_view.get_masses().to(asset.device)
+    total_mass = masses.sum(dim=1, keepdim=True).clamp_min(1.0e-6)
+    return (asset.data.body_com_pos_w[..., :2] * masses.unsqueeze(-1)).sum(dim=1) / total_mass
+
+
+def _yaw_support_geometry(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return CoM distance to the support line, projection coordinate, and segment length."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    support_xy = asset.data.body_pos_w[:, asset_cfg.body_ids, :2]
+    if support_xy.shape[1] != 2:
+        raise ValueError("Yaw support rewards require exactly two ordered support wheel bodies.")
+
+    start = support_xy[:, 0]
+    segment = support_xy[:, 1] - start
+    length_sq = torch.sum(segment.square(), dim=-1).clamp_min(1.0e-8)
+    length = torch.sqrt(length_sq)
+    com_offset = _yaw_whole_body_com_xy(asset) - start
+    projection = torch.sum(com_offset * segment, dim=-1) / length_sq
+    perpendicular_distance = torch.abs(
+        com_offset[:, 0] * segment[:, 1] - com_offset[:, 1] * segment[:, 0]
+    ) / length
+    return perpendicular_distance, projection, length
+
+
+def yaw_com_support(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    std: float,
+) -> torch.Tensor:
+    """Reward the projected whole-body CoM for staying near the FL-HR support line."""
+    distance, _, _ = _yaw_support_geometry(env, asset_cfg)
+    return torch.exp(-distance.square() / std**2)
+
+
+def yaw_support_contact(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Reward only when both selected support wheels contact the ground."""
+    return _yaw_wheel_contacts(env, sensor_cfg, threshold).float().prod(dim=1)
+
+
+def yaw_lift_clearance(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    wheel_radius: float,
+    target_clearance: float,
+) -> torch.Tensor:
+    """Reward the weaker lifted wheel's normalized ground clearance."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    ground_height = env.scene.env_origins[:, 2].unsqueeze(-1)
+    clearance = wheel_height - ground_height - wheel_radius
+    clearance_score = torch.clamp(clearance / target_clearance, min=0.0, max=1.0)
+    return clearance_score.amin(dim=1)
+
+
+def yaw_com_inside_support_segment(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    std: float,
+) -> torch.Tensor:
+    """Reward CoM projection inside the finite FL-HR support segment.
+
+    The score is one anywhere inside the segment and decays smoothly with the
+    physical distance past either endpoint.
+    """
+    _, projection, segment_length = _yaw_support_geometry(env, asset_cfg)
+    outside_distance = (
+        torch.relu(-projection) + torch.relu(projection - 1.0)
+    ) * segment_length
+    return torch.exp(-outside_distance.square() / std**2)
+
+
+def yaw_balance(
+    env: ManagerBasedRLEnv,
+    std: float,
+    nominal_roll: float = 0.0,
+    nominal_pitch: float = 0.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward roll and pitch near the configured diagonal-support equilibrium."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    roll, pitch, _ = math_utils.euler_xyz_from_quat(asset.data.root_quat_w)
+    roll_error = math_utils.wrap_to_pi(roll - nominal_roll)
+    pitch_error = math_utils.wrap_to_pi(pitch - nominal_pitch)
+    return torch.exp(-(roll_error.square() + pitch_error.square()) / std**2)
+
+
+def yaw_gated_tracking(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    support_sensor_cfg: SceneEntityCfg,
+    lifted_asset_cfg: SceneEntityCfg,
+    wheel_radius: float,
+    target_clearance: float,
+    std: float,
+    contact_threshold: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Track yaw only after both support wheels contact and both lifted wheels clear the plane."""
+    support_gate = yaw_support_contact(env, support_sensor_cfg, contact_threshold)
+    clearance_gate = yaw_lift_clearance(
+        env, lifted_asset_cfg, wheel_radius, target_clearance
+    )
+    return support_gate * clearance_gate * track_yaw_rate_exp(
+        env, std, command_name, asset_cfg
+    )
+
+
+def yaw_lateral_wheel_slip(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Penalize contacted wheels' velocity along their local axle direction."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    velocity_w = asset.data.body_lin_vel_w[:, asset_cfg.body_ids]
+    orientation_w = asset.data.body_quat_w[:, asset_cfg.body_ids]
+    velocity_local = math_utils.quat_apply_inverse(orientation_w, velocity_w)
+    in_contact = _yaw_wheel_contacts(env, sensor_cfg, threshold)
+    return torch.sum(in_contact * velocity_local[..., 1].square(), dim=1)
+
+
+def yaw_rolling_wheel_slip(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    body_asset_cfg: SceneEntityCfg,
+    joint_asset_cfg: SceneEntityCfg,
+    wheel_radius: float,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Penalize violation of the no-slip rolling constraint on contacted wheels."""
+    asset: Articulation = env.scene[body_asset_cfg.name]
+    velocity_w = asset.data.body_lin_vel_w[:, body_asset_cfg.body_ids]
+    orientation_w = asset.data.body_quat_w[:, body_asset_cfg.body_ids]
+    forward_velocity = math_utils.quat_apply_inverse(orientation_w, velocity_w)[..., 0]
+    wheel_velocity = asset.data.joint_vel[:, joint_asset_cfg.joint_ids]
+    rolling_error = forward_velocity + wheel_radius * wheel_velocity
+    in_contact = _yaw_wheel_contacts(env, sensor_cfg, threshold)
+    return torch.sum(in_contact * rolling_error.square(), dim=1)
+
+
+def yaw_action_rate_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Penalize first-order changes in the complete action vector."""
+    return torch.sum(
+        torch.square(env.action_manager.action - env.action_manager.prev_action), dim=1
+    )
+
+
+def yaw_joint_velocity_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize velocity of explicitly selected joints without terrain gating."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.sum(asset.data.joint_vel[:, asset_cfg.joint_ids].square(), dim=1)
+
+
+def yaw_joint_torque_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize applied torque of explicitly selected joints without terrain gating."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.sum(asset.data.applied_torque[:, asset_cfg.joint_ids].square(), dim=1)
+
+
+def yaw_lifted_wheel_spin_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize free spin of the FR-HL lifted wheel joints."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.sum(asset.data.joint_vel[:, asset_cfg.joint_ids].square(), dim=1)
+
+
 def track_lin_vel_xy_yaw_frame_exp(
     env, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -1112,3 +1320,37 @@ def lin_vel_xy_l2_with_ang_z_command(
     # reward *= torch.sum(torch.square(env.command_manager.get_command(command_name)[:, 2:]), dim=1) > command_threshold
     # reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
+
+def contact_forces_FL_HR(
+    env: ManagerBasedRLEnv,
+    threshold: float,
+    sensor_cfg: SceneEntityCfg,
+    scale: float = 20.0,
+) -> torch.Tensor:
+    """Reward simultaneous contact of FL and HR wheels at current timestep."""
+
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    # net_forces_w shape:
+    # (num_envs, num_sensor_bodies, 3)
+    #
+    # Select only FL and HR using body_ids
+    # -> (num_envs, 2, 3)
+    forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+
+    # Force magnitude of FL and HR
+    # -> (num_envs, 2)
+    force_mag = torch.norm(forces, dim=-1)
+
+    # Only reward contact force above threshold
+    excess_force = torch.clamp(force_mag - threshold, min=0.0)
+
+    # Smooth score [0, 1)
+    # -> (num_envs, 2)
+    contact_score = torch.tanh(excess_force / scale)
+
+    # Require BOTH FL and HR to have contact
+    # -> (num_envs,)
+    reward = contact_score[:, 0] * contact_score[:, 1]
+
+    return reward * get_gait_level_tensor(env)

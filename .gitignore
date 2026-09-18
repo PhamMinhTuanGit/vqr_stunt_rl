@@ -46,3 +46,6 @@ deep_robotics_model*
 *.zip
 */build/*
 third_party/*
+.claude/
+.codegraph/
+.vscode/

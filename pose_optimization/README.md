@@ -338,6 +338,43 @@ wheel alignment, forces, friction, torques, and margins directly from the URDF,
 and compares every saved metric. CTest target
 `independent_sideways_static_validation` is the saved-pose regression test.
 
+### Two-wheel inverted-pendulum shaping
+
+Beyond the sideways support constraints, M-TO2S shapes the pose into a
+segway-style two-wheel equilibrium:
+
+- **Support midpoint**: `|s - L/2| <= midpoint_tolerance` keeps the CoM at the
+  support-segment midpoint, so both wheels carry `mg/2` (equal load split is
+  verified independently from the saved contact forces).
+- **Axle alignment**: each stance wheel axle must stay within
+  `axle_line_limit_deg` of the support line, so pitching about the line
+  contact rolls both wheels without scrub.
+- **Swing shaping**: swing feet are lifted towards `swing_height_target_m`
+  (a soft quadratic around the hard clearance floor) and tucked within a
+  `tuck_radius_m` cylinder about the body origin in the XY plane.
+- **Point symmetry**: the FL/HR and FR/HL contact pairs are driven
+  point-symmetrically about the body origin (`p_FL + p_HR = 0`,
+  `p_FR + p_HL = 0`, equal swing heights). The audited URDF places the rear
+  legs so equal joint values produce this symmetry; because the mass
+  distribution is not perfectly point-symmetric (the CoM sits ~11 mm forward),
+  task-space symmetry is a soft weight that ramps through the shaping ladder
+  and only the final stage enforces `|residual| <= symmetry_tolerance_m` as a
+  hard constraint.
+
+These are staged through a `shaping_continuation` ladder (config
+`sideways_static_optimization`): each stage raises the shaping objective
+`weight_scale`, tightens `tuck_radius_m`, `midpoint_tolerance_m`, and
+`axle_line_limit_deg`, and only the last stage turns point symmetry hard. Each
+stage solves the eps/clearance continuation up to three passes: warm-started
+(primals and duals), primal-only (duals dropped), and cold (the M-TO2R guess);
+the stale duals of a previous stage otherwise stall IPOPT at the new active
+set. If a stage still fails to validate, the solver keeps the last validated
+stage result and records the outcome, so infeasibility of perfect symmetry
+degrades to the best soft-symmetric pose instead of failing the milestone.
+The probe that established the equal-value joint-symmetry convention also
+lives behind `JOINT_SYMMETRY_PAIRS` in `apps/static_equilibrium_sideways.py`
+and is guarded by the `joint_symmetry_convention` CTest.
+
 ## Remaining model limitation
 
 There is no ambiguity in the audited URDF source, joint ordering, actuator

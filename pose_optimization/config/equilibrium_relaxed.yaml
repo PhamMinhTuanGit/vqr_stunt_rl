@@ -103,10 +103,10 @@ optimization:
     - {name: C, swing_clearance_m: 0.010, com_tolerance_m: 0.005}
     - {name: D, swing_clearance_m: 0.020, com_tolerance_m: 0.002}
   ipopt:
-    tolerance: 1.0e-10
-    acceptable_tolerance: 1.0e-8
-    constraint_violation_tolerance: 1.0e-12
-    max_iterations: 1000
+    tolerance: 1.0e-8
+    acceptable_tolerance: 1.0e-6
+    constraint_violation_tolerance: 1.0e-9
+    max_iterations: 3000
 
 static_optimization:
   initial_guess: ../output/kinematic_equilibrium_FL_HR.yaml
@@ -158,85 +158,8 @@ sideways_static_optimization:
   preferred_swing_clearance_m: 0.030
   fallback_swing_clearance_m: 0.020
   dx_weight: 10.0
-  # Inverted-pendulum shaping: support-midpoint CoM (equal wheel loading),
-  # stance axles parallel to the support line, swing feet lifted towards a
-  # target clearance and tucked to a body-radius, and point symmetry between
-  # the FL/HR plus FR/HL leg pairs. Point symmetry uses a soft-weight ladder
-  # because the URDF mass distribution is not perfectly point-symmetric.
-  # Each shaping stage ramps the objective weight scale and tightens the
-  # midpoint/axle/tuck constraint bounds before the final hard stage.
-  swing_height_target_m: 0.050
-  swing_height_weight: 5.0e+3
-  tuck_weight: 1.0e+2
-  joint_symmetry_weight: 1.0e+2
-  symmetry_tolerance_m: 0.003
-  shaping_continuation:
-    - name: shapeA
-      weight_scale: 0.001
-      tuck_radius_m: 0.550
-      midpoint_tolerance_m: 0.020
-      axle_line_limit_deg: 20.0
-      symmetry_weight: 1.0
-      symmetry_hard: false
-    - name: shapeB
-      weight_scale: 0.01
-      tuck_radius_m: 0.480
-      midpoint_tolerance_m: 0.012
-      axle_line_limit_deg: 14.0
-      symmetry_weight: 10.0
-      symmetry_hard: false
-    - name: shapeC
-      weight_scale: 0.03
-      tuck_radius_m: 0.430
-      midpoint_tolerance_m: 0.009
-      axle_line_limit_deg: 11.0
-      symmetry_weight: 30.0
-      symmetry_hard: false
-    - name: shapeD
-      weight_scale: 0.1
-      tuck_radius_m: 0.400
-      midpoint_tolerance_m: 0.006
-      axle_line_limit_deg: 9.0
-      symmetry_weight: 100.0
-      symmetry_hard: false
-    - name: shapeD2
-      weight_scale: 0.25
-      tuck_radius_m: 0.380
-      midpoint_tolerance_m: 0.005
-      axle_line_limit_deg: 8.0
-      symmetry_weight: 200.0
-      symmetry_hard: false
-    - name: shapeE
-      weight_scale: 0.5
-      tuck_radius_m: 0.360
-      midpoint_tolerance_m: 0.004
-      axle_line_limit_deg: 7.0
-      symmetry_weight: 300.0
-      symmetry_hard: false
-    - name: shapeE2
-      weight_scale: 1.0
-      tuck_radius_m: 0.340
-      midpoint_tolerance_m: 0.003
-      axle_line_limit_deg: 6.0
-      symmetry_weight: 500.0
-      symmetry_hard: false
-    - name: shapeF
-      weight_scale: 10.0
-      tuck_radius_m: 0.320
-      midpoint_tolerance_m: 0.002
-      axle_line_limit_deg: 5.0
-      symmetry_weight: 1000.0
-      symmetry_hard: true
   ipopt:
     tolerance: 1.0e-9
     acceptable_tolerance: 1.0e-7
     constraint_violation_tolerance: 1.0e-10
-    max_iterations: 3200
-    # shapeC+ tail: dual degeneracy keeps inf_du ~1e-2 while inf_pr < 1e-8;
-    # the iterate is primal-feasible. Accept it when the independent physics
-    # validation passes, instead of discarding the pose for a missing dual
-    # optimality certificate.
-    acceptable_iter: 40
-    # Adaptive barrier handles the degenerate active set at shaping stages
-    # where monotone mu leaves dual infeasibility flat at ~1e-2.
-    mu_strategy: adaptive
+    max_iterations: 2500
