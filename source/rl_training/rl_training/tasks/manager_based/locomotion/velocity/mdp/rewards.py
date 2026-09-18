@@ -198,19 +198,37 @@ def yaw_support_contact(
     return _yaw_wheel_contacts(env, sensor_cfg, threshold).float().prod(dim=1)
 
 
+def _yaw_lift_progress(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    wheel_radius: float,
+    target_clearance: float,
+) -> torch.Tensor:
+    """Return independent normalized clearance progress for the selected wheels."""
+    if target_clearance <= 0.0:
+        raise ValueError("target_clearance must be positive.")
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    ground_height = env.scene.env_origins[:, 2].unsqueeze(-1)
+    clearance = wheel_height - ground_height - wheel_radius
+    return torch.clamp(clearance / target_clearance, min=0.0, max=1.0)
+
+
 def yaw_lift_clearance(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
     wheel_radius: float,
     target_clearance: float,
 ) -> torch.Tensor:
-    """Reward the weaker lifted wheel's normalized ground clearance."""
-    asset: Articulation = env.scene[asset_cfg.name]
-    wheel_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
-    ground_height = env.scene.env_origins[:, 2].unsqueeze(-1)
-    clearance = wheel_height - ground_height - wheel_radius
-    clearance_score = torch.clamp(clearance / target_clearance, min=0.0, max=1.0)
-    return clearance_score.amin(dim=1)
+    """Shape lifted-wheel clearance with partial credit and a four-wheel penalty.
+
+    Each selected wheel contributes independently. The returned score is in
+    ``[-1, 1]``: both wheels on the ground score ``-1``, lifting either wheel
+    improves the score, and both wheels must reach the target to score ``1``.
+    """
+    progress = _yaw_lift_progress(env, asset_cfg, wheel_radius, target_clearance)
+    return 2.0 * progress.mean(dim=1) - 1.0
 
 
 def yaw_com_inside_support_segment(
@@ -294,13 +312,15 @@ def yaw_gated_tracking(
         contact_threshold,
     )
 
-    # Smooth [0, 1] progress toward lifting FR and HL.
-    clearance_gate = yaw_lift_clearance(
+    # Smooth [0, 1] partial-credit progress toward lifting FR and HL. Keep this
+    # separate from yaw_lift_clearance, whose signed score penalizes four-wheel
+    # stance and therefore is not suitable as a multiplicative gate.
+    clearance_gate = _yaw_lift_progress(
         env,
         lifted_asset_cfg,
         wheel_radius,
         target_clearance,
-    )
+    ).mean(dim=1)
 
     # Yaw tracking score in [0, 1].
     yaw_tracking = track_yaw_rate_exp(

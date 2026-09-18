@@ -279,7 +279,9 @@ class ObservationsCfg:
             func=mdp.wheel_clearance,
             params={
                 "asset_cfg": SceneEntityCfg(
-                    "robot", body_names=["FL_WHEEL", "HR_WHEEL"], preserve_order=True
+                    "robot",
+                    body_names=["FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL"],
+                    preserve_order=True,
                 ),
                 "wheel_radius": 0.091,
             },

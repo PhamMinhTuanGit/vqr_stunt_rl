@@ -4,6 +4,7 @@
 # Copyright (c) 2024-2025 Ziqi Fan
 # SPDX-License-Identifier: Apache-2.0
 
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
@@ -33,6 +34,9 @@ LEG_JOINT_NAMES = [
 ]
 WHEEL_RADIUS = 0.091
 TARGET_LIFT_CLEARANCE = 0.05
+YAW_RATE_LEVELS = (0.25, 0.50, 0.75, 1.00)
+LIFT_CLEARANCE_LEVELS = (0.015, 0.025, 0.040, TARGET_LIFT_CLEARANCE)
+DR_SCALE_LEVELS = (0.0, 0.33, 0.66, 1.0)
 
 
 @configclass
@@ -82,7 +86,7 @@ class VQRWheelRewardsCfg:
                 "robot", body_names=LIFTED_WHEEL_NAMES, preserve_order=True
             ),
             "wheel_radius": WHEEL_RADIUS,
-            "target_clearance": TARGET_LIFT_CLEARANCE,
+            "target_clearance": LIFT_CLEARANCE_LEVELS[0],
         },
     )
     com_inside_segment = RewTerm(
@@ -116,11 +120,9 @@ class VQRWheelRewardsCfg:
                 preserve_order=True,
             ),
             "wheel_radius": WHEEL_RADIUS,
-            "target_clearance": TARGET_LIFT_CLEARANCE,
+            "target_clearance": LIFT_CLEARANCE_LEVELS[0],
             "std": 0.30,
             "contact_threshold": 1.0,
-
-            # NEW
             "clearance_gate_floor": 0.25,
         },
     )
@@ -204,9 +206,35 @@ class VQRWheelRewardsCfg:
 
 
 @configclass
+class VQRWheelYawCurriculumCfg:
+    """Performance-gated command, clearance and domain-randomization curriculum."""
+
+    task_levels = CurrTerm(
+        func=mdp.yaw_task_levels,
+        params={
+            "command_name": "yaw_rate_cmd",
+            "yaw_rate_levels": YAW_RATE_LEVELS,
+            "clearance_levels": LIFT_CLEARANCE_LEVELS,
+            "dr_levels": DR_SCALE_LEVELS,
+            "support_reward_name": "support_contact",
+            "lift_reward_name": "lift_clearance",
+            "balance_reward_name": "balance",
+            "yaw_reward_name": "gated_yaw_tracking",
+            "support_threshold": 0.85,
+            "lift_threshold": 0.60,
+            "balance_threshold": 0.75,
+            "yaw_threshold": 0.65,
+            "min_evaluated_episodes": 256,
+            "required_success_rate": 0.70,
+        },
+    )
+
+
+@configclass
 class VQRWheelRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
     actions: VQRWheelActionsCfg = VQRWheelActionsCfg()
     rewards: VQRWheelRewardsCfg = VQRWheelRewardsCfg()
+    curriculum: VQRWheelYawCurriculumCfg = VQRWheelYawCurriculumCfg()
 
     base_link_name = "TORSO"
     foot_link_name = ".*_WHEEL"
@@ -275,8 +303,12 @@ class VQRWheelRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         )
 
         # ------------------------------Actions------------------------------
-        # reduce action scale
-        self.actions.joint_pos.scale = {".*_HipX_joint": 0.125, "^(?!.*_HipX_joint).*": 0.25}
+        # Wider per-joint residual ranges improve pose discovery.
+        self.actions.joint_pos.scale = {
+            ".*_HipX_joint": 0.30,
+            ".*_HipY_joint": 0.60,
+            ".*_Knee_joint": 0.50,
+        }
         self.actions.joint_vel.scale = 5.0
         self.actions.joint_pos.clip = {".*": (-100.0, 100.0)}
         self.actions.joint_vel.clip = {".*": (-100.0, 100.0)}
@@ -289,17 +321,17 @@ class VQRWheelRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
                 "x": (-1.0, 1.0),
                 "y": (-1.0, 1.0),
                 "z": (0.0, 0.0),
-                "roll": (-0.3, 0.3),
-                "pitch": (-0.3, 0.3),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
                 "yaw": (-3.14, 3.14),
             },
             "velocity_range": {
-                "x": (-0.2, 0.2),
-                "y": (-0.2, 0.2),
-                "z": (-0.2, 0.2),
-                "roll": (-0.05, 0.05),
-                "pitch": (-0.05, 0.05),
-                "yaw": (-0.0, 0.0),
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
             },
         }
         self.events.randomize_rigid_body_mass_base.params["asset_cfg"].body_names = [self.base_link_name]
@@ -342,17 +374,25 @@ class VQRWheelRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.events.randomize_rigid_body_material.params["dynamic_friction_range"] = [0.35, 1.5]
         self.events.randomize_rigid_body_material.params["restitution_range"] = [0.0, 0.7]
 
+        # Stage zero starts without online disturbances. yaw_task_levels opens
+        # these ranges together with command and clearance difficulty.
+        self.events.randomize_apply_external_force_torque.params["force_range"] = (0.0, 0.0)
+        self.events.randomize_apply_external_force_torque.params["torque_range"] = (0.0, 0.0)
+        self.events.randomize_actuator_gains.params["stiffness_distribution_params"] = (1.0, 1.0)
+        self.events.randomize_actuator_gains.params["damping_distribution_params"] = (1.0, 1.0)
+        self.events.randomize_push_robot.params["velocity_range"] = {
+            "x": (0.0, 0.0),
+            "y": (0.0, 0.0),
+        }
+
         # ------------------------------Terminations------------------------------
         # self.terminations.illegal_contact.params["sensor_cfg"].body_names = [self.base_link_name]
         self.terminations.illegal_contact = None
         self.terminations.bad_orientation_2 = None
 
-        # ------------------------------Curriculums------------------------------
-        # self.curriculum.command_levels.params["range_multiplier"] = (0.2, 1.0)
-        self.curriculum.command_levels = None
-
         # ------------------------------Commands------------------------------
-        self.commands.yaw_rate_cmd.yaw_rate_range = (-1.0, 1.0)
+        initial_yaw_limit = YAW_RATE_LEVELS[0]
+        self.commands.yaw_rate_cmd.yaw_rate_range = (-initial_yaw_limit, initial_yaw_limit)
 
 
 @configclass
@@ -365,4 +405,3 @@ class VQRWheelFlatEnvCfg(VQRWheelRoughEnvCfg):
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
         self.scene.height_scanner = None
-        self.curriculum.terrain_levels = None
