@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import quat_apply, quat_apply_inverse
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
@@ -77,6 +77,96 @@ def wheel_normal_force(
     fz = sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2]
 
     return torch.clamp(fz, min=0.0) / force_scale
+
+
+def base_height(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return root height relative to the local environment ground origin."""
+    robot: Articulation = env.scene[asset_cfg.name]
+    return (robot.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]).unsqueeze(-1)
+
+
+def com_support_coordinate(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Return whole-body CoM coordinates in the two-wheel support frame.
+
+    The selected bodies must be ordered ``[FL_WHEEL, HR_WHEEL]``.  The output
+    is ``[along_support, lateral_to_support]`` in meters, measured from the
+    support-segment midpoint.  Positive ``along_support`` points from FL to HR;
+    positive lateral is the left normal of that direction in the world XY plane.
+    """
+    robot: Articulation = env.scene[asset_cfg.name]
+    support_xy = robot.data.body_pos_w[:, asset_cfg.body_ids, :2]
+    if support_xy.shape[1] != 2:
+        raise ValueError("com_support_coordinate requires exactly two ordered support bodies.")
+
+    support_vector = support_xy[:, 1] - support_xy[:, 0]
+    support_length = torch.linalg.vector_norm(
+        support_vector, dim=-1, keepdim=True
+    ).clamp_min(1.0e-6)
+    tangent = support_vector / support_length
+    normal = torch.stack((-tangent[:, 1], tangent[:, 0]), dim=-1)
+    support_midpoint = support_xy.mean(dim=1)
+
+    masses = robot.root_physx_view.get_masses().to(robot.device)
+    total_mass = masses.sum(dim=1, keepdim=True).clamp_min(1.0e-6)
+    com_xy = (
+        robot.data.body_com_pos_w[..., :2] * masses.unsqueeze(-1)
+    ).sum(dim=1) / total_mass
+    relative_com = com_xy - support_midpoint
+
+    along_support = torch.sum(relative_com * tangent, dim=-1)
+    lateral_to_support = torch.sum(relative_com * normal, dim=-1)
+    return torch.stack((along_support, lateral_to_support), dim=-1)
+
+
+def rolling_lateral_contact_velocity(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    body_asset_cfg: SceneEntityCfg,
+    joint_asset_cfg: SceneEntityCfg,
+    wheel_radius: float,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Return contacted wheels' local rolling/lateral velocities.
+
+    For each selected wheel, the two values are contact-point
+    ``[rolling, lateral]`` velocity.  Rolling uses ``v_local_x + radius * qdot``
+    for the VQR wheel joint's local negative-Y axis; lateral uses ``v_local_y``.
+    Values are zeroed while that wheel is not in contact.  The flattened output
+    preserves the configured wheel/body order.
+    """
+    robot: Articulation = env.scene[body_asset_cfg.name]
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    selection_lengths = {
+        len(body_asset_cfg.body_ids),
+        len(joint_asset_cfg.joint_ids),
+        len(sensor_cfg.body_ids),
+    }
+    if len(selection_lengths) != 1:
+        raise ValueError("Wheel body, joint, and contact-sensor selections must have equal length.")
+
+    velocity_w = robot.data.body_lin_vel_w[:, body_asset_cfg.body_ids]
+    orientation_w = robot.data.body_quat_w[:, body_asset_cfg.body_ids]
+    contact_force = torch.linalg.vector_norm(
+        sensor.data.net_forces_w[:, sensor_cfg.body_ids], dim=-1
+    )
+    in_contact = contact_force > threshold
+    velocity_local = quat_apply_inverse(
+        orientation_w.reshape(-1, 4), velocity_w.reshape(-1, 3)
+    ).reshape(velocity_w.shape)
+    rolling_contact_velocity = (
+        velocity_local[..., 0]
+        + wheel_radius * robot.data.joint_vel[:, joint_asset_cfg.joint_ids]
+    )
+    rolling_lateral_velocity = torch.stack(
+        (rolling_contact_velocity, velocity_local[..., 1]), dim=-1
+    )
+    return (rolling_lateral_velocity * in_contact.unsqueeze(-1)).reshape(env.num_envs, -1)
 
 
 def support_wheel_alignment(

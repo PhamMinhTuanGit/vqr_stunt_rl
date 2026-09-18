@@ -245,6 +245,23 @@ def yaw_balance(
     return torch.exp(-(roll_error.square() + pitch_error.square()) / std**2)
 
 
+# def yaw_gated_tracking(
+#     env: ManagerBasedRLEnv,
+#     command_name: str,
+#     support_sensor_cfg: SceneEntityCfg,
+#     lifted_asset_cfg: SceneEntityCfg,
+#     wheel_radius: float,
+#     target_clearance: float,
+#     std: float,
+#     contact_threshold: float = 1.0,
+#     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+# ) -> torch.Tensor:
+#     """Track yaw only after both support wheels contact and both lifted wheels clear the plane."""
+#     support_gate = yaw_support_contact(env, support_sensor_cfg, contact_threshold)
+#     clearance_gate = yaw_lift_clearance(
+#         env, lifted_asset_cfg, wheel_radius, target_clearance
+#     )
+#     return support_gate * clearance_gate * track_yaw_rate_exp(env, std, command_name, asset_cfg)
 def yaw_gated_tracking(
     env: ManagerBasedRLEnv,
     command_name: str,
@@ -254,17 +271,56 @@ def yaw_gated_tracking(
     target_clearance: float,
     std: float,
     contact_threshold: float = 1.0,
+    clearance_gate_floor: float = 0.25,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Track yaw only after both support wheels contact and both lifted wheels clear the plane."""
-    support_gate = yaw_support_contact(env, support_sensor_cfg, contact_threshold)
-    clearance_gate = yaw_lift_clearance(
-        env, lifted_asset_cfg, wheel_radius, target_clearance
-    )
-    return support_gate * clearance_gate * track_yaw_rate_exp(
-        env, std, command_name, asset_cfg
+    """Track yaw while transitioning toward the two-wheel pose.
+
+    - Both support wheels must remain in contact.
+    - Yaw tracking is already rewarded before the lifted wheels reach
+      their target clearance.
+    - The yaw reward smoothly increases as the lifted wheels rise.
+
+    clearance_gate_floor:
+        Fraction of yaw reward available when lifted-wheel clearance is zero.
+        0.25 means 25% yaw reward is available from the beginning.
+    """
+
+    # Hard safety/task-topology gate:
+    # 1 only when both FL and HR support wheels are in contact.
+    support_gate = yaw_support_contact(
+        env,
+        support_sensor_cfg,
+        contact_threshold,
     )
 
+    # Smooth [0, 1] progress toward lifting FR and HL.
+    clearance_gate = yaw_lift_clearance(
+        env,
+        lifted_asset_cfg,
+        wheel_radius,
+        target_clearance,
+    )
+
+    # Yaw tracking score in [0, 1].
+    yaw_tracking = track_yaw_rate_exp(
+        env,
+        std,
+        command_name,
+        asset_cfg,
+    )
+
+    # Do not require lift completion before yaw becomes useful.
+    #
+    # clearance = 0  -> 0.25
+    # clearance = 0.5 -> 0.625
+    # clearance = 1  -> 1.0
+    clearance_weight = (
+        clearance_gate_floor
+        + (1.0 - clearance_gate_floor) * clearance_gate
+    )
+
+    return support_gate * clearance_weight * yaw_tracking
 
 def yaw_lateral_wheel_slip(
     env: ManagerBasedRLEnv,

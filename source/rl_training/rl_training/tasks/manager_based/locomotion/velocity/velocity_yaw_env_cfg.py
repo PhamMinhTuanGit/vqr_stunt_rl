@@ -202,6 +202,10 @@ class ObservationsCfg:
             clip=(-100.0, 100.0),
             scale=1.0,
         )
+        base_height = ObsTerm(
+            func=mdp.base_height,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
         base_ang_vel = ObsTerm(
             func=mdp.base_ang_vel,
             clip=(-100.0, 100.0),
@@ -255,7 +259,9 @@ class ObservationsCfg:
             func=mdp.wheel_normal_force,
             params={
                 "sensor_cfg": SceneEntityCfg(
-                    "contact_forces", body_names=["FL_WHEEL", "HR_WHEEL"], preserve_order=True
+                    "contact_forces",
+                    body_names=["FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL"],
+                    preserve_order=True,
                 )
             },
         )
@@ -263,7 +269,9 @@ class ObservationsCfg:
             func=mdp.wheel_contact,
             params={
                 "sensor_cfg": SceneEntityCfg(
-                    "contact_forces", body_names=["FL_WHEEL", "HR_WHEEL"], preserve_order=True
+                    "contact_forces",
+                    body_names=["FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL"],
+                    preserve_order=True,
                 )
             },
         )
@@ -282,6 +290,36 @@ class ObservationsCfg:
                 "asset_cfg": SceneEntityCfg(
                     "robot", body_names=["FL_WHEEL", "HR_WHEEL"], preserve_order=True
                 )
+            },
+        )
+        com_support_coordinate = ObsTerm(
+            func=mdp.com_support_coordinate,
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot", body_names=["FL_WHEEL", "HR_WHEEL"], preserve_order=True
+                )
+            },
+        )
+        rolling_lateral_contact_velocity = ObsTerm(
+            func=mdp.rolling_lateral_contact_velocity,
+            params={
+                "sensor_cfg": SceneEntityCfg(
+                    "contact_forces",
+                    body_names=["FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL"],
+                    preserve_order=True,
+                ),
+                "body_asset_cfg": SceneEntityCfg(
+                    "robot",
+                    body_names=["FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL"],
+                    preserve_order=True,
+                ),
+                "joint_asset_cfg": SceneEntityCfg(
+                    "robot",
+                    joint_names=["FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL"],
+                    preserve_order=True,
+                ),
+                "wheel_radius": 0.091,
+                "threshold": 1.0,
             },
         )
 

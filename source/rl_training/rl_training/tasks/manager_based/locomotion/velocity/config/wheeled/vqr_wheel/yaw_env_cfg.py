@@ -106,15 +106,22 @@ class VQRWheelRewardsCfg:
         params={
             "command_name": "yaw_rate_cmd",
             "support_sensor_cfg": SceneEntityCfg(
-                "contact_forces", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+                "contact_forces",
+                body_names=SUPPORT_WHEEL_NAMES,
+                preserve_order=True,
             ),
             "lifted_asset_cfg": SceneEntityCfg(
-                "robot", body_names=LIFTED_WHEEL_NAMES, preserve_order=True
+                "robot",
+                body_names=LIFTED_WHEEL_NAMES,
+                preserve_order=True,
             ),
             "wheel_radius": WHEEL_RADIUS,
             "target_clearance": TARGET_LIFT_CLEARANCE,
             "std": 0.30,
             "contact_threshold": 1.0,
+
+            # NEW
+            "clearance_gate_floor": 0.25,
         },
     )
     lateral_slip = RewTerm(
