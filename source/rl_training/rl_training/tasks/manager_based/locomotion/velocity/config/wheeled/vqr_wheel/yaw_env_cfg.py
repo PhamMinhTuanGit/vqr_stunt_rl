@@ -221,7 +221,7 @@ class VQRWheelYawCurriculumCfg:
             "balance_reward_name": "balance",
             "yaw_reward_name": "gated_yaw_tracking",
             "support_threshold": 0.85,
-            "lift_threshold": 0.60,
+            "lift_progress_threshold": 0.80,
             "balance_threshold": 0.75,
             "yaw_threshold": 0.65,
             "min_evaluated_episodes": 256,

@@ -228,6 +228,17 @@ def yaw_lift_clearance(
     improves the score, and both wheels must reach the target to score ``1``.
     """
     progress = _yaw_lift_progress(env, asset_cfg, wheel_radius, target_clearance)
+
+    # Keep a separate curriculum metric: the weaker wheel's progress, averaged
+    # over the episode. This must not be reconstructed from the signed mean
+    # reward because one fully lifted wheel can hide the other grounded wheel.
+    min_progress = progress.amin(dim=1)
+    if not hasattr(env, "_yaw_lift_min_progress_sum"):
+        env._yaw_lift_min_progress_sum = torch.zeros_like(min_progress)
+        env._yaw_lift_min_progress_samples = torch.zeros_like(min_progress, dtype=torch.long)
+    env._yaw_lift_min_progress_sum += min_progress
+    env._yaw_lift_min_progress_samples += 1
+
     return 2.0 * progress.mean(dim=1) - 1.0
 
 

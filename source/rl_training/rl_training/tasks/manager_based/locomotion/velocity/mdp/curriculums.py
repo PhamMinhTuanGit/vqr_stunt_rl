@@ -109,7 +109,7 @@ def yaw_task_levels(
     balance_reward_name: str,
     yaw_reward_name: str,
     support_threshold: float,
-    lift_threshold: float,
+    lift_progress_threshold: float,
     balance_threshold: float,
     yaw_threshold: float,
     min_evaluated_episodes: int,
@@ -130,6 +130,14 @@ def yaw_task_levels(
         env._yaw_task_curriculum_evaluated = 0
         env._yaw_task_curriculum_successes = 0
         env._yaw_task_curriculum_last_success_rate = 0.0
+        env._yaw_task_curriculum_last_support_score = 0.0
+        env._yaw_task_curriculum_last_lift_progress = 0.0
+        env._yaw_task_curriculum_last_balance_score = 0.0
+        env._yaw_task_curriculum_last_yaw_score = 0.0
+        env._yaw_task_curriculum_last_batch_success_rate = 0.0
+        env._yaw_task_curriculum_last_window_evaluated = 0
+        env._yaw_task_curriculum_last_window_successes = 0
+        env._yaw_task_curriculum_stage_advanced = 0.0
 
     if isinstance(env_ids, slice):
         selected_env_ids = torch.arange(env.num_envs, device=env.device)
@@ -150,24 +158,47 @@ def yaw_task_levels(
             return weighted_sum / (episode_duration * reward_weight)
 
         support_score = normalized_score(support_reward_name)
-        lift_score = normalized_score(lift_reward_name)
+        if hasattr(env, "_yaw_lift_min_progress_sum"):
+            lift_sample_count = env._yaw_lift_min_progress_samples[completed_env_ids].clamp_min(1)
+            lift_progress_score = (
+                env._yaw_lift_min_progress_sum[completed_env_ids] / lift_sample_count
+            )
+        else:
+            # The initial reset happens before the reward has ever been evaluated.
+            lift_progress_score = torch.zeros_like(support_score)
         balance_score = normalized_score(balance_reward_name)
         yaw_score = normalized_score(yaw_reward_name)
         successful = (
             (support_score >= support_threshold)
-            & (lift_score >= lift_threshold)
+            & (lift_progress_score >= lift_progress_threshold)
             & (balance_score >= balance_threshold)
             & (yaw_score >= yaw_threshold)
         )
 
+        env._yaw_task_curriculum_last_support_score = float(support_score.mean().item())
+        env._yaw_task_curriculum_last_lift_progress = float(lift_progress_score.mean().item())
+        env._yaw_task_curriculum_last_balance_score = float(balance_score.mean().item())
+        env._yaw_task_curriculum_last_yaw_score = float(yaw_score.mean().item())
+        env._yaw_task_curriculum_last_batch_success_rate = float(successful.float().mean().item())
+
         env._yaw_task_curriculum_evaluated += len(completed_env_ids)
         env._yaw_task_curriculum_successes += int(successful.sum().item())
 
+    # Curriculum is evaluated before manager buffers are reset. Clear the
+    # custom per-episode metric here so the next episode starts from zero.
+    if hasattr(env, "_yaw_lift_min_progress_sum"):
+        env._yaw_lift_min_progress_sum[selected_env_ids] = 0.0
+        env._yaw_lift_min_progress_samples[selected_env_ids] = 0
+
+    env._yaw_task_curriculum_stage_advanced = 0.0
     if env._yaw_task_curriculum_evaluated >= min_evaluated_episodes:
+        env._yaw_task_curriculum_last_window_evaluated = env._yaw_task_curriculum_evaluated
+        env._yaw_task_curriculum_last_window_successes = env._yaw_task_curriculum_successes
         success_rate = env._yaw_task_curriculum_successes / env._yaw_task_curriculum_evaluated
         env._yaw_task_curriculum_last_success_rate = success_rate
         if success_rate >= required_success_rate and env._yaw_task_curriculum_stage < num_levels - 1:
             env._yaw_task_curriculum_stage += 1
+            env._yaw_task_curriculum_stage_advanced = 1.0
         env._yaw_task_curriculum_evaluated = 0
         env._yaw_task_curriculum_successes = 0
 
@@ -229,10 +260,30 @@ def yaw_task_levels(
     )
     env.event_manager.set_term_cfg("randomize_reset_base", reset_cfg)
 
+    def log_scalar(value: float | int) -> torch.Tensor:
+        return torch.tensor(float(value), device=env.device)
+
+    # CurriculumManager prefixes these keys with ``Curriculum/task_levels/``.
+    # RSL-RL forwards them unchanged to TensorBoard and its iteration terminal log.
     return {
-        "stage": torch.tensor(stage, device=env.device),
-        "yaw_limit": torch.tensor(yaw_limit, device=env.device),
-        "target_clearance": torch.tensor(target_clearance, device=env.device),
-        "dr_scale": torch.tensor(dr_scale, device=env.device),
-        "window_success_rate": torch.tensor(env._yaw_task_curriculum_last_success_rate, device=env.device),
+        "stage": log_scalar(stage),
+        "yaw_limit": log_scalar(yaw_limit),
+        "target_clearance": log_scalar(target_clearance),
+        "dr_scale": log_scalar(dr_scale),
+        "support_score": log_scalar(env._yaw_task_curriculum_last_support_score),
+        "lift_min_progress": log_scalar(env._yaw_task_curriculum_last_lift_progress),
+        "balance_score": log_scalar(env._yaw_task_curriculum_last_balance_score),
+        "yaw_score": log_scalar(env._yaw_task_curriculum_last_yaw_score),
+        "batch_success_rate": log_scalar(env._yaw_task_curriculum_last_batch_success_rate),
+        "window_success_rate": log_scalar(env._yaw_task_curriculum_last_success_rate),
+        "window_evaluated_episodes": log_scalar(env._yaw_task_curriculum_last_window_evaluated),
+        "window_successful_episodes": log_scalar(env._yaw_task_curriculum_last_window_successes),
+        "pending_evaluated_episodes": log_scalar(env._yaw_task_curriculum_evaluated),
+        "pending_successful_episodes": log_scalar(env._yaw_task_curriculum_successes),
+        "stage_advanced": log_scalar(env._yaw_task_curriculum_stage_advanced),
+        "support_threshold": log_scalar(support_threshold),
+        "lift_progress_threshold": log_scalar(lift_progress_threshold),
+        "balance_threshold": log_scalar(balance_threshold),
+        "yaw_threshold": log_scalar(yaw_threshold),
+        "required_success_rate": log_scalar(required_success_rate),
     }

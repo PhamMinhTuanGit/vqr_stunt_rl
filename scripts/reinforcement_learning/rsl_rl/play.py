@@ -134,13 +134,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.scene.terrain.terrain_generator.num_cols = 5
         env_cfg.scene.terrain.terrain_generator.curriculum = False
 
-    # disable randomization for play
+    # disable randomization and training-only curricula for play
     env_cfg.observations.policy.enable_corruption = False
-    # remove random pushing
-    env_cfg.events.randomize_apply_external_force_torque = None
-    env_cfg.events.push_robot = None
-    if env_cfg.curriculum is not None and hasattr(env_cfg.curriculum, "command_levels"):
-        env_cfg.curriculum.command_levels = None
+    if env_cfg.events is not None:
+        for event_name in (
+            "randomize_apply_external_force_torque",
+            "randomize_push_robot",
+            "push_robot",
+        ):
+            if hasattr(env_cfg.events, event_name):
+                setattr(env_cfg.events, event_name, None)
+
+    if env_cfg.curriculum is not None:
+        for curriculum_name in ("command_levels", "task_levels"):
+            if hasattr(env_cfg.curriculum, curriculum_name):
+                setattr(env_cfg.curriculum, curriculum_name, None)
 
     if args_cli.keyboard:
         env_cfg.scene.num_envs = 1
