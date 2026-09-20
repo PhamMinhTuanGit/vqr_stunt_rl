@@ -108,6 +108,8 @@ def yaw_task_levels(
     lift_reward_name: str,
     balance_reward_name: str,
     yaw_reward_name: str,
+    torso_contact_termination_name: str,
+    minimum_base_height: float,
     support_threshold: float,
     lift_progress_threshold: float,
     balance_threshold: float,
@@ -134,6 +136,8 @@ def yaw_task_levels(
         env._yaw_task_curriculum_last_lift_progress = 0.0
         env._yaw_task_curriculum_last_balance_score = 0.0
         env._yaw_task_curriculum_last_yaw_score = 0.0
+        env._yaw_task_curriculum_last_min_base_height = 0.0
+        env._yaw_task_curriculum_last_torso_contact_rate = 0.0
         env._yaw_task_curriculum_last_batch_success_rate = 0.0
         env._yaw_task_curriculum_last_window_evaluated = 0
         env._yaw_task_curriculum_last_window_successes = 0
@@ -168,17 +172,26 @@ def yaw_task_levels(
             lift_progress_score = torch.zeros_like(support_score)
         balance_score = normalized_score(balance_reward_name)
         yaw_score = normalized_score(yaw_reward_name)
+        if hasattr(env, "_yaw_base_height_min"):
+            minimum_episode_height = env._yaw_base_height_min[completed_env_ids]
+        else:
+            minimum_episode_height = torch.zeros_like(support_score)
+        torso_contact = env.termination_manager.get_term(torso_contact_termination_name)[completed_env_ids]
         successful = (
             (support_score >= support_threshold)
             & (lift_progress_score >= lift_progress_threshold)
             & (balance_score >= balance_threshold)
             & (yaw_score >= yaw_threshold)
+            & (minimum_episode_height >= minimum_base_height)
+            & ~torso_contact
         )
 
         env._yaw_task_curriculum_last_support_score = float(support_score.mean().item())
         env._yaw_task_curriculum_last_lift_progress = float(lift_progress_score.mean().item())
         env._yaw_task_curriculum_last_balance_score = float(balance_score.mean().item())
         env._yaw_task_curriculum_last_yaw_score = float(yaw_score.mean().item())
+        env._yaw_task_curriculum_last_min_base_height = float(minimum_episode_height.mean().item())
+        env._yaw_task_curriculum_last_torso_contact_rate = float(torso_contact.float().mean().item())
         env._yaw_task_curriculum_last_batch_success_rate = float(successful.float().mean().item())
 
         env._yaw_task_curriculum_evaluated += len(completed_env_ids)
@@ -189,6 +202,8 @@ def yaw_task_levels(
     if hasattr(env, "_yaw_lift_min_progress_sum"):
         env._yaw_lift_min_progress_sum[selected_env_ids] = 0.0
         env._yaw_lift_min_progress_samples[selected_env_ids] = 0
+    if hasattr(env, "_yaw_base_height_min"):
+        env._yaw_base_height_min[selected_env_ids] = torch.inf
 
     env._yaw_task_curriculum_stage_advanced = 0.0
     if env._yaw_task_curriculum_evaluated >= min_evaluated_episodes:
@@ -274,6 +289,8 @@ def yaw_task_levels(
         "lift_min_progress": log_scalar(env._yaw_task_curriculum_last_lift_progress),
         "balance_score": log_scalar(env._yaw_task_curriculum_last_balance_score),
         "yaw_score": log_scalar(env._yaw_task_curriculum_last_yaw_score),
+        "minimum_episode_base_height": log_scalar(env._yaw_task_curriculum_last_min_base_height),
+        "torso_contact_rate": log_scalar(env._yaw_task_curriculum_last_torso_contact_rate),
         "batch_success_rate": log_scalar(env._yaw_task_curriculum_last_batch_success_rate),
         "window_success_rate": log_scalar(env._yaw_task_curriculum_last_success_rate),
         "window_evaluated_episodes": log_scalar(env._yaw_task_curriculum_last_window_evaluated),
@@ -285,5 +302,6 @@ def yaw_task_levels(
         "lift_progress_threshold": log_scalar(lift_progress_threshold),
         "balance_threshold": log_scalar(balance_threshold),
         "yaw_threshold": log_scalar(yaw_threshold),
+        "minimum_base_height": log_scalar(minimum_base_height),
         "required_success_rate": log_scalar(required_success_rate),
     }

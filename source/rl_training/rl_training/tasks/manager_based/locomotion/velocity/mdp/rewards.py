@@ -189,6 +189,96 @@ def yaw_com_support(
     return torch.exp(-distance.square() / std**2)
 
 
+def yaw_base_height_tracking(
+    env: ManagerBasedRLEnv,
+    target_height: float,
+    error_scale: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Track TORSO height with non-saturating, normalized Huber shaping.
+
+    The raw score is ``1 - huber(abs(height - target) / error_scale)``.
+    It is maximal at the finite target, quadratic nearby, and linear rather
+    than exponentially flat when the torso is far from the target.
+    """
+    if error_scale <= 0.0:
+        raise ValueError("error_scale must be positive.")
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    base_height = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    if not hasattr(env, "_yaw_base_height_min"):
+        env._yaw_base_height_min = torch.full_like(base_height, torch.inf)
+    env._yaw_base_height_min = torch.minimum(env._yaw_base_height_min, base_height)
+
+    normalized_error = torch.abs(base_height - target_height) / error_scale
+    huber = torch.where(
+        normalized_error <= 1.0,
+        0.5 * normalized_error.square(),
+        normalized_error - 0.5,
+    )
+    return 1.0 - huber
+
+
+def yaw_low_base_height_l1(
+    env: ManagerBasedRLEnv,
+    minimum_height: float,
+    error_scale: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return normalized L1 violation below the minimum safe base height."""
+    if error_scale <= 0.0:
+        raise ValueError("error_scale must be positive.")
+    asset: Articulation = env.scene[asset_cfg.name]
+    base_height = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    return torch.relu(minimum_height - base_height) / error_scale
+
+
+def yaw_downward_low_base_velocity_l2(
+    env: ManagerBasedRLEnv,
+    minimum_height: float,
+    height_margin: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize downward base velocity only inside the low-height region."""
+    if height_margin <= 0.0:
+        raise ValueError("height_margin must be positive.")
+    asset: Articulation = env.scene[asset_cfg.name]
+    base_height = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    low_gate = torch.clamp(
+        torch.relu(minimum_height - base_height) / height_margin,
+        max=1.0,
+    )
+    downward_speed = torch.relu(-asset.data.root_lin_vel_w[:, 2])
+    return low_gate * downward_speed.square()
+
+
+def yaw_support_span_band_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    minimum_span: float,
+    maximum_span: float,
+    std: float,
+) -> torch.Tensor:
+    """Penalize FL-HR span only outside the configured non-zero-width band."""
+    if minimum_span < 0.0 or maximum_span <= minimum_span:
+        raise ValueError("Support-span bounds must satisfy 0 <= minimum_span < maximum_span.")
+    if std <= 0.0:
+        raise ValueError("std must be positive.")
+
+    _, _, span = _yaw_support_geometry(env, asset_cfg)
+    outside_distance = torch.relu(minimum_span - span) + torch.relu(span - maximum_span)
+    return (outside_distance / std).square()
+
+
+def yaw_planar_velocity_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize base x/y velocity for rotate-in-place behavior."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.sum(asset.data.root_lin_vel_b[:, :2].square(), dim=1)
+
+
 def yaw_support_contact(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,

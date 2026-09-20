@@ -146,6 +146,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 setattr(env_cfg.events, event_name, None)
 
     if env_cfg.curriculum is not None:
+        # A task-level curriculum initializes the yaw range at its easiest
+        # stage.  Playback disables that curriculum, so first promote the
+        # command to the final trained range instead of leaving it at ±0.25.
+        task_levels = getattr(env_cfg.curriculum, "task_levels", None)
+        if task_levels is not None:
+            command_name = task_levels.params.get("command_name")
+            yaw_rate_levels = task_levels.params.get("yaw_rate_levels")
+            if command_name is not None and yaw_rate_levels:
+                command_cfg = getattr(env_cfg.commands, command_name)
+                final_yaw_limit = float(yaw_rate_levels[-1])
+                command_cfg.yaw_rate_range = (-final_yaw_limit, final_yaw_limit)
+
         for curriculum_name in ("command_levels", "task_levels"):
             if hasattr(env_cfg.curriculum, curriculum_name):
                 setattr(env_cfg.curriculum, curriculum_name, None)

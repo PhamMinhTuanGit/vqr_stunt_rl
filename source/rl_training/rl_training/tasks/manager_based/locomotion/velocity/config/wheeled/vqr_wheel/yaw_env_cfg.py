@@ -7,6 +7,7 @@
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.utils.noise import NoiseModelWithAdditiveBiasCfg
@@ -15,6 +16,7 @@ import rl_training.tasks.manager_based.locomotion.velocity.mdp as mdp
 from rl_training.tasks.manager_based.locomotion.velocity.velocity_yaw_env_cfg import (
     ActionsCfg,
     LocomotionVelocityRoughEnvCfg,
+    TerminationsCfg,
 )
 
 ##
@@ -33,9 +35,13 @@ LEG_JOINT_NAMES = [
     "HR_HipX_joint", "HR_HipY_joint", "HR_Knee_joint",
 ]
 WHEEL_RADIUS = 0.091
-TARGET_LIFT_CLEARANCE = 0.05
+TARGET_BASE_HEIGHT = 0.49
+MIN_BASE_HEIGHT = 0.38
+SUPPORT_SPAN_MIN = 0.50
+SUPPORT_SPAN_MAX = 0.70
+TARGET_LIFT_CLEARANCE = 0.20
 YAW_RATE_LEVELS = (0.25, 0.50, 0.75, 1.00)
-LIFT_CLEARANCE_LEVELS = (0.015, 0.025, 0.040, TARGET_LIFT_CLEARANCE)
+LIFT_CLEARANCE_LEVELS = (0.05, 0.10, 0.15, TARGET_LIFT_CLEARANCE)
 DR_SCALE_LEVELS = (0.0, 0.33, 0.66, 1.0)
 
 
@@ -56,7 +62,7 @@ class VQRWheelActionsCfg(ActionsCfg):
 
 @configclass
 class VQRWheelRewardsCfg:
-    """The explicit fourteen-term reward set for diagonal-support yaw training."""
+    """The explicit reward set for diagonal-support rotate-in-place training."""
 
     com_support = RewTerm(
         func=mdp.yaw_com_support,
@@ -66,6 +72,45 @@ class VQRWheelRewardsCfg:
                 "robot", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
             ),
             "std": 0.08,
+        },
+    )
+    base_height = RewTerm(
+        func=mdp.yaw_base_height_tracking,
+        weight=2.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "target_height": TARGET_BASE_HEIGHT,
+            "error_scale": 0.10,
+        },
+    )
+    low_base_height = RewTerm(
+        func=mdp.yaw_low_base_height_l1,
+        weight=-4.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "minimum_height": MIN_BASE_HEIGHT,
+            "error_scale": 0.10,
+        },
+    )
+    downward_low_base_velocity = RewTerm(
+        func=mdp.yaw_downward_low_base_velocity_l2,
+        weight=-8.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "minimum_height": MIN_BASE_HEIGHT,
+            "height_margin": 0.10,
+        },
+    )
+    support_span_band = RewTerm(
+        func=mdp.yaw_support_span_band_l2,
+        weight=-1.0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+            "minimum_span": SUPPORT_SPAN_MIN,
+            "maximum_span": SUPPORT_SPAN_MAX,
+            "std": 0.05,
         },
     )
     support_contact = RewTerm(
@@ -161,7 +206,9 @@ class VQRWheelRewardsCfg:
         weight=-2.0,
         params={
             "sensor_cfg": SceneEntityCfg(
-                "contact_forces", body_names=["^(?!.*_WHEEL).*"], preserve_order=True
+                "contact_forces",
+                body_names=["^(?!(TORSO|.*_WHEEL)$).*"],
+                preserve_order=True,
             ),
             "threshold": 1.0,
         },
@@ -203,6 +250,7 @@ class VQRWheelRewardsCfg:
             )
         },
     )
+    planar_velocity = RewTerm(func=mdp.yaw_planar_velocity_l2, weight=-1.0)
 
 
 @configclass
@@ -220,6 +268,8 @@ class VQRWheelYawCurriculumCfg:
             "lift_reward_name": "lift_clearance",
             "balance_reward_name": "balance",
             "yaw_reward_name": "gated_yaw_tracking",
+            "torso_contact_termination_name": "torso_contact",
+            "minimum_base_height": MIN_BASE_HEIGHT,
             "support_threshold": 0.85,
             "lift_progress_threshold": 0.80,
             "balance_threshold": 0.75,
@@ -231,9 +281,24 @@ class VQRWheelYawCurriculumCfg:
 
 
 @configclass
+class VQRWheelYawTerminationsCfg(TerminationsCfg):
+    """Yaw-task failures; wheel contact is intentionally not terminal."""
+
+    torso_contact = DoneTerm(
+        func=mdp.TorsoContactWithGrace,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["TORSO"]),
+            "threshold": 1.0,
+            "grace_period_s": 0.15,
+        },
+    )
+
+
+@configclass
 class VQRWheelRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
     actions: VQRWheelActionsCfg = VQRWheelActionsCfg()
     rewards: VQRWheelRewardsCfg = VQRWheelRewardsCfg()
+    terminations: VQRWheelYawTerminationsCfg = VQRWheelYawTerminationsCfg()
     curriculum: VQRWheelYawCurriculumCfg = VQRWheelYawCurriculumCfg()
 
     base_link_name = "TORSO"
@@ -386,7 +451,8 @@ class VQRWheelRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         }
 
         # ------------------------------Terminations------------------------------
-        # self.terminations.illegal_contact.params["sensor_cfg"].body_names = [self.base_link_name]
+        # The inherited catch-all term is disabled. The dedicated stateful term
+        # terminates TORSO contact after its own reset-relative grace timer.
         self.terminations.illegal_contact = None
         self.terminations.bad_orientation_2 = None
 
