@@ -38,6 +38,19 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument("--keyboard", action="store_true", default=False, help="Whether to use keyboard.")
+parser.add_argument("--max_steps", type=int, default=None, help="Stop playback after this many environment steps.")
+parser.add_argument(
+    "--reward_diagnostics",
+    action="store_true",
+    default=False,
+    help="Print the measured weighted reward decomposition during playback.",
+)
+parser.add_argument(
+    "--reward_diagnostics_interval",
+    type=int,
+    default=250,
+    help="Playback steps per reward decomposition report.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -117,6 +130,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else 50
+    if args_cli.reward_diagnostics_interval <= 0:
+        raise ValueError("--reward_diagnostics_interval must be positive.")
+    if args_cli.max_steps is not None and args_cli.max_steps <= 0:
+        raise ValueError("--max_steps must be positive.")
 
     # handle deprecated configurations (convert old policy format to new actor/critic format)
     # agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
@@ -152,10 +169,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         task_levels = getattr(env_cfg.curriculum, "task_levels", None)
         if task_levels is not None:
             command_name = task_levels.params.get("command_name")
-            yaw_rate_levels = task_levels.params.get("yaw_rate_levels")
-            if command_name is not None and yaw_rate_levels:
+            final_yaw_limit = task_levels.params.get("maximum_yaw_limit")
+            if final_yaw_limit is None:
+                yaw_rate_levels = task_levels.params.get("yaw_rate_levels")
+                if yaw_rate_levels:
+                    final_yaw_limit = yaw_rate_levels[-1]
+            if command_name is not None and final_yaw_limit is not None:
                 command_cfg = getattr(env_cfg.commands, command_name)
-                final_yaw_limit = float(yaw_rate_levels[-1])
+                final_yaw_limit = float(final_yaw_limit)
                 command_cfg.yaw_rate_range = (-final_yaw_limit, final_yaw_limit)
 
         for curriculum_name in ("command_levels", "task_levels"):
@@ -254,6 +275,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dt = env.unwrapped.step_dt
     # reset environment
     obs, _ = env.reset()
+
+    reward_diagnostic_sum = None
+    reward_diagnostic_samples = 0
+    gate_open_sum = 0.0
+    mean_abs_yaw_command_sum = 0.0
+    yaw_rate_error_sum = 0.0
+    if args_cli.reward_diagnostics:
+        reward_manager = env.unwrapped.reward_manager
+        reward_diagnostic_sum = torch.zeros(len(reward_manager.active_terms), device=env.unwrapped.device)
+        print("[INFO] Reward diagnostics enabled; values are weighted reward rates averaged across environments.")
+        if "yaw_rate_cmd" in env.unwrapped.command_manager.active_terms:
+            yaw_command_term = env.unwrapped.command_manager.get_term("yaw_rate_cmd")
+            initial_abs_command = env.unwrapped.command_manager.get_command("yaw_rate_cmd")[:, 0].abs().mean()
+            print(f"[INFO] yaw_rate_cmd range: {yaw_command_term.cfg.yaw_rate_range}")
+            print(f"[INFO] initial mean |yaw_rate_cmd|: {initial_abs_command.item():.6f}")
     
     timestep = 0
     # simulate environment
@@ -266,11 +302,55 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
             # env stepping
             obs, _, _, _ = env.step(actions)
+        if args_cli.reward_diagnostics:
+            reward_manager = env.unwrapped.reward_manager
+            reward_diagnostic_sum += reward_manager._step_reward.mean(dim=0)
+            reward_diagnostic_samples += 1
+            unwrapped_env = env.unwrapped
+            if hasattr(unwrapped_env, "_yaw_gate_open_current"):
+                gate_open_sum += float(unwrapped_env._yaw_gate_open_current.mean().item())
+            if hasattr(unwrapped_env, "_yaw_command_abs_current"):
+                mean_abs_yaw_command_sum += float(unwrapped_env._yaw_command_abs_current.mean().item())
+                yaw_rate_error_sum += float(unwrapped_env._yaw_rate_abs_error_current.mean().item())
+            if reward_diagnostic_samples == args_cli.reward_diagnostics_interval:
+                mean_terms = reward_diagnostic_sum / reward_diagnostic_samples
+                positive_total = mean_terms.clamp_min(0.0).sum()
+                yaw_index = (
+                    reward_manager.active_terms.index("gated_yaw_tracking")
+                    if "gated_yaw_tracking" in reward_manager.active_terms
+                    else None
+                )
+                print("\n[REWARD DIAGNOSTICS] weighted rate by term")
+                for name, value in zip(reward_manager.active_terms, mean_terms.tolist()):
+                    print(f"  {name:32s} {value: .6f}")
+                print(f"  {'positive_total':32s} {positive_total.item(): .6f}")
+                if yaw_index is not None and positive_total.item() > 0.0:
+                    yaw_share = mean_terms[yaw_index].clamp_min(0.0) / positive_total
+                    print(f"  {'gated_yaw_positive_share':32s} {yaw_share.item(): .3%}")
+                gate_open_rate = gate_open_sum / reward_diagnostic_samples
+                mean_abs_yaw_command = mean_abs_yaw_command_sum / reward_diagnostic_samples
+                mean_yaw_rate_error = yaw_rate_error_sum / reward_diagnostic_samples
+                tracking_ratio = (
+                    1.0 - mean_yaw_rate_error / mean_abs_yaw_command
+                    if mean_abs_yaw_command > 1.0e-6
+                    else 0.0
+                )
+                print(f"  {'gate_open_rate':32s} {gate_open_rate: .6f}")
+                print(f"  {'mean_abs_yaw_cmd':32s} {mean_abs_yaw_command: .6f}")
+                print(f"  {'mean_error_yaw_rate':32s} {mean_yaw_rate_error: .6f}")
+                print(f"  {'tracking_ratio':32s} {tracking_ratio: .6f}")
+                reward_diagnostic_sum.zero_()
+                reward_diagnostic_samples = 0
+                gate_open_sum = 0.0
+                mean_abs_yaw_command_sum = 0.0
+                yaw_rate_error_sum = 0.0
+        timestep += 1
         if args_cli.video:
-            timestep += 1
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
+        if args_cli.max_steps is not None and timestep >= args_cli.max_steps:
+            break
 
         if args_cli.keyboard:
             camera_follow(env)

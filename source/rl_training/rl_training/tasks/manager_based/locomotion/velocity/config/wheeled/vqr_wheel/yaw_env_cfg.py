@@ -36,13 +36,23 @@ LEG_JOINT_NAMES = [
 ]
 WHEEL_RADIUS = 0.091
 TARGET_BASE_HEIGHT = 0.49
-MIN_BASE_HEIGHT = 0.38
+MIN_BASE_HEIGHT = 0.35
 SUPPORT_SPAN_MIN = 0.50
 SUPPORT_SPAN_MAX = 0.70
 TARGET_LIFT_CLEARANCE = 0.20
-YAW_RATE_LEVELS = (0.25, 0.50, 0.75, 1.00)
 LIFT_CLEARANCE_LEVELS = (0.05, 0.10, 0.15, TARGET_LIFT_CLEARANCE)
-DR_SCALE_LEVELS = (0.0, 0.33, 0.66, 1.0)
+YAW_RATE_LEVELS = (0.25, 0.40, 0.55, 0.70, 0.85, 1.00)
+ONLINE_DR_SCALE_LEVELS = (0.30, 0.40, 0.55, 0.70, 0.85, 1.00)
+YAW_TRACKING_RATIO_THRESHOLDS = (0.30, 0.35, 0.40, 0.45, 0.50, 0.55)
+YAW_EDGE_TRACKING_RATIO_THRESHOLDS = (0.20, 0.25, 0.30, 0.35, 0.40, 0.45)
+YAW_REF = 1.00
+
+# Reward-rebalance baseline is stage-dependent. On resume at yaw_limit=0.25,
+# a null-yaw policy can start near mean reward 300 because yaw tracking is easy;
+# the mean is expected to fall as yaw_limit expands. Compare rewards only at the
+# same yaw_limit, never directly with the legacy approximately 345 baseline.
+# Startup-only physical-parameter DR remains at its configured range. The
+# curriculum scales reset/interval (online) disturbances together with yaw.
 
 
 @configclass
@@ -66,7 +76,7 @@ class VQRWheelRewardsCfg:
 
     com_support = RewTerm(
         func=mdp.yaw_com_support,
-        weight=5.0,
+        weight=3.0,
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
@@ -113,16 +123,6 @@ class VQRWheelRewardsCfg:
             "std": 0.05,
         },
     )
-    support_contact = RewTerm(
-        func=mdp.yaw_support_contact,
-        weight=4.0,
-        params={
-            "sensor_cfg": SceneEntityCfg(
-                "contact_forces", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
-            ),
-            "threshold": 1.0,
-        },
-    )
     lift_clearance = RewTerm(
         func=mdp.yaw_lift_clearance,
         weight=3.0,
@@ -151,7 +151,7 @@ class VQRWheelRewardsCfg:
     )
     gated_yaw_tracking = RewTerm(
         func=mdp.yaw_gated_tracking,
-        weight=3.0,
+        weight=8.0,
         params={
             "command_name": "yaw_rate_cmd",
             "support_sensor_cfg": SceneEntityCfg(
@@ -169,6 +169,7 @@ class VQRWheelRewardsCfg:
             "std": 0.30,
             "contact_threshold": 1.0,
             "clearance_gate_floor": 0.25,
+            "edge_command_fraction": 0.80,
         },
     )
     lateral_slip = RewTerm(
@@ -198,6 +199,8 @@ class VQRWheelRewardsCfg:
                 "robot", joint_names=WHEEL_NAMES, preserve_order=True
             ),
             "wheel_radius": WHEEL_RADIUS,
+            "command_name": "yaw_rate_cmd",
+            "yaw_reference": YAW_REF,
             "threshold": 1.0,
         },
     )
@@ -236,6 +239,9 @@ class VQRWheelRewardsCfg:
         func=mdp.yaw_joint_torque_l2,
         weight=-1.0e-4,
         params={
+            "command_name": "yaw_rate_cmd",
+            "yaw_reference": YAW_REF,
+            "minimum_scale": 0.30,
             "asset_cfg": SceneEntityCfg(
                 "robot", joint_names=LEG_JOINT_NAMES + WHEEL_NAMES, preserve_order=True
             )
@@ -245,6 +251,8 @@ class VQRWheelRewardsCfg:
         func=mdp.yaw_lifted_wheel_spin_l2,
         weight=-0.02,
         params={
+            "command_name": "yaw_rate_cmd",
+            "yaw_reference": YAW_REF,
             "asset_cfg": SceneEntityCfg(
                 "robot", joint_names=LIFTED_WHEEL_NAMES, preserve_order=True
             )
@@ -255,16 +263,17 @@ class VQRWheelRewardsCfg:
 
 @configclass
 class VQRWheelYawCurriculumCfg:
-    """Performance-gated command, clearance and domain-randomization curriculum."""
+    """Lift first, then jointly progress yaw command and online DR."""
 
     task_levels = CurrTerm(
         func=mdp.yaw_task_levels,
         params={
             "command_name": "yaw_rate_cmd",
-            "yaw_rate_levels": YAW_RATE_LEVELS,
             "clearance_levels": LIFT_CLEARANCE_LEVELS,
-            "dr_levels": DR_SCALE_LEVELS,
-            "support_reward_name": "support_contact",
+            "yaw_rate_levels": YAW_RATE_LEVELS,
+            "dr_scale_levels": ONLINE_DR_SCALE_LEVELS,
+            "tracking_ratio_thresholds": YAW_TRACKING_RATIO_THRESHOLDS,
+            "edge_tracking_ratio_thresholds": YAW_EDGE_TRACKING_RATIO_THRESHOLDS,
             "lift_reward_name": "lift_clearance",
             "balance_reward_name": "balance",
             "yaw_reward_name": "gated_yaw_tracking",
@@ -274,8 +283,11 @@ class VQRWheelYawCurriculumCfg:
             "lift_progress_threshold": 0.80,
             "balance_threshold": 0.75,
             "yaw_threshold": 0.65,
-            "min_evaluated_episodes": 256,
-            "required_success_rate": 0.70,
+            "min_evaluated_episodes": 2048,
+            "required_success_rate": 0.85,
+            "required_consecutive_windows": 3,
+            "min_clearance_stage_steps": 1000,
+            "min_yaw_stage_steps": 6000,
         },
     )
 
@@ -439,8 +451,8 @@ class VQRWheelRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.events.randomize_rigid_body_material.params["dynamic_friction_range"] = [0.35, 1.5]
         self.events.randomize_rigid_body_material.params["restitution_range"] = [0.0, 0.7]
 
-        # Stage zero starts without online disturbances. yaw_task_levels opens
-        # these ranges together with command and clearance difficulty.
+        # yaw_task_levels owns reset/interval DR and starts it at yaw stage zero.
+        # Startup material/mass/inertia/CoM DR is intentionally unchanged.
         self.events.randomize_apply_external_force_torque.params["force_range"] = (0.0, 0.0)
         self.events.randomize_apply_external_force_torque.params["torque_range"] = (0.0, 0.0)
         self.events.randomize_actuator_gains.params["stiffness_distribution_params"] = (1.0, 1.0)
@@ -457,8 +469,7 @@ class VQRWheelRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.terminations.bad_orientation_2 = None
 
         # ------------------------------Commands------------------------------
-        initial_yaw_limit = YAW_RATE_LEVELS[0]
-        self.commands.yaw_rate_cmd.yaw_rate_range = (-initial_yaw_limit, initial_yaw_limit)
+        self.commands.yaw_rate_cmd.yaw_rate_range = (-YAW_RATE_LEVELS[0], YAW_RATE_LEVELS[0])
 
 
 @configclass

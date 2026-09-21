@@ -184,9 +184,11 @@ def yaw_com_support(
     asset_cfg: SceneEntityCfg,
     std: float,
 ) -> torch.Tensor:
-    """Reward the projected whole-body CoM for staying near the FL-HR support line."""
+    """Reward CoM proximity with a non-flat reciprocal-L1 kernel."""
+    if std <= 0.0:
+        raise ValueError("std must be positive.")
     distance, _, _ = _yaw_support_geometry(env, asset_cfg)
-    return torch.exp(-distance.square() / std**2)
+    return 1.0 / (1.0 + distance / std)
 
 
 def yaw_base_height_tracking(
@@ -391,6 +393,7 @@ def yaw_gated_tracking(
     std: float,
     contact_threshold: float = 1.0,
     clearance_gate_floor: float = 0.25,
+    edge_command_fraction: float = 0.80,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Track yaw while transitioning toward the two-wheel pose.
@@ -403,7 +406,12 @@ def yaw_gated_tracking(
     clearance_gate_floor:
         Fraction of yaw reward available when lifted-wheel clearance is zero.
         0.25 means 25% yaw reward is available from the beginning.
+    edge_command_fraction:
+        Commands above this fraction of the active yaw limit contribute to the
+        edge-tracking curriculum metric.
     """
+    if not 0.0 < edge_command_fraction <= 1.0:
+        raise ValueError("edge_command_fraction must be in (0, 1].")
 
     # Hard safety/task-topology gate:
     # 1 only when both FL and HR support wheels are in contact.
@@ -412,6 +420,19 @@ def yaw_gated_tracking(
         support_sensor_cfg,
         contact_threshold,
     )
+    # Contact is a task condition, not a standalone positive reward. Accumulate
+    # it here for curriculum evaluation without inflating the value target.
+    if not hasattr(env, "_yaw_support_score_sum"):
+        env._yaw_support_score_sum = torch.zeros_like(support_gate)
+        env._yaw_support_score_samples = torch.zeros_like(support_gate, dtype=torch.long)
+    env._yaw_support_score_sum += support_gate
+    env._yaw_support_score_samples += 1
+    if not hasattr(env, "_yaw_gate_open_sum"):
+        env._yaw_gate_open_sum = torch.zeros_like(support_gate)
+        env._yaw_gate_open_samples = torch.zeros_like(support_gate, dtype=torch.long)
+    env._yaw_gate_open_sum += support_gate
+    env._yaw_gate_open_samples += 1
+    env._yaw_gate_open_current = support_gate
 
     # Smooth [0, 1] partial-credit progress toward lifting FR and HL. Keep this
     # separate from yaw_lift_clearance, whose signed score penalizes four-wheel
@@ -422,6 +443,34 @@ def yaw_gated_tracking(
         wheel_radius,
         target_clearance,
     ).mean(dim=1)
+
+    # Accumulate scale-invariant tracking inputs independently of the shaped
+    # exponential score. These are also exposed to play diagnostics.
+    asset: RigidObject = env.scene[asset_cfg.name]
+    yaw_command = env.command_manager.get_command(command_name)[:, 0]
+    yaw_abs_error = torch.abs(yaw_command - asset.data.root_ang_vel_b[:, 2])
+    if not hasattr(env, "_yaw_command_abs_sum"):
+        env._yaw_command_abs_sum = torch.zeros_like(yaw_command)
+        env._yaw_rate_abs_error_sum = torch.zeros_like(yaw_command)
+        env._yaw_tracking_metric_samples = torch.zeros_like(yaw_command, dtype=torch.long)
+    env._yaw_command_abs_sum += torch.abs(yaw_command)
+    env._yaw_rate_abs_error_sum += yaw_abs_error
+    env._yaw_tracking_metric_samples += 1
+    env._yaw_command_abs_current = torch.abs(yaw_command)
+    env._yaw_rate_abs_error_current = yaw_abs_error
+
+    # Aggregate a separate metric near the active command boundary. A global
+    # mean can otherwise hide poor behavior close to the target +/-yaw limit.
+    command_term = env.command_manager.get_term(command_name)
+    yaw_limit = max(abs(float(value)) for value in command_term.cfg.yaw_rate_range)
+    edge_mask = torch.abs(yaw_command) >= edge_command_fraction * yaw_limit
+    if not hasattr(env, "_yaw_edge_command_abs_sum"):
+        env._yaw_edge_command_abs_sum = torch.zeros_like(yaw_command)
+        env._yaw_edge_rate_abs_error_sum = torch.zeros_like(yaw_command)
+        env._yaw_edge_tracking_samples = torch.zeros_like(yaw_command, dtype=torch.long)
+    env._yaw_edge_command_abs_sum += torch.where(edge_mask, torch.abs(yaw_command), 0.0)
+    env._yaw_edge_rate_abs_error_sum += torch.where(edge_mask, yaw_abs_error, 0.0)
+    env._yaw_edge_tracking_samples += edge_mask.long()
 
     # Yaw tracking score in [0, 1].
     yaw_tracking = track_yaw_rate_exp(
@@ -442,6 +491,23 @@ def yaw_gated_tracking(
     )
 
     return support_gate * clearance_weight * yaw_tracking
+
+
+def _yaw_command_penalty_scale(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    yaw_reference: float,
+    minimum_scale: float = 0.0,
+) -> torch.Tensor:
+    """Return command relief against a fixed reference, optionally with a floor."""
+    if yaw_reference <= 0.0:
+        raise ValueError("yaw_reference must be positive.")
+    if not 0.0 <= minimum_scale <= 1.0:
+        raise ValueError("minimum_scale must be in [0, 1].")
+    yaw_command = torch.abs(env.command_manager.get_command(command_name)[:, 0])
+    scale = 1.0 - torch.clamp(yaw_command / yaw_reference, min=0.0, max=1.0)
+    return torch.clamp(scale, min=minimum_scale)
+
 
 def yaw_lateral_wheel_slip(
     env: ManagerBasedRLEnv,
@@ -464,9 +530,11 @@ def yaw_rolling_wheel_slip(
     body_asset_cfg: SceneEntityCfg,
     joint_asset_cfg: SceneEntityCfg,
     wheel_radius: float,
+    command_name: str,
+    yaw_reference: float,
     threshold: float = 1.0,
 ) -> torch.Tensor:
-    """Penalize violation of the no-slip rolling constraint on contacted wheels."""
+    """Penalize rolling error less aggressively as requested yaw rises."""
     asset: Articulation = env.scene[body_asset_cfg.name]
     velocity_w = asset.data.body_lin_vel_w[:, body_asset_cfg.body_ids]
     orientation_w = asset.data.body_quat_w[:, body_asset_cfg.body_ids]
@@ -474,7 +542,8 @@ def yaw_rolling_wheel_slip(
     wheel_velocity = asset.data.joint_vel[:, joint_asset_cfg.joint_ids]
     rolling_error = forward_velocity + wheel_radius * wheel_velocity
     in_contact = _yaw_wheel_contacts(env, sensor_cfg, threshold)
-    return torch.sum(in_contact * rolling_error.square(), dim=1)
+    penalty = torch.sum(in_contact * rolling_error.square(), dim=1)
+    return _yaw_command_penalty_scale(env, command_name, yaw_reference) * penalty
 
 
 def yaw_action_rate_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -496,19 +565,27 @@ def yaw_joint_velocity_l2(
 def yaw_joint_torque_l2(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
+    command_name: str,
+    yaw_reference: float,
+    minimum_scale: float,
 ) -> torch.Tensor:
-    """Penalize applied torque of explicitly selected joints without terrain gating."""
+    """Penalize torque with command-relative relief during intentional rotation."""
     asset: Articulation = env.scene[asset_cfg.name]
-    return torch.sum(asset.data.applied_torque[:, asset_cfg.joint_ids].square(), dim=1)
+    penalty = torch.sum(asset.data.applied_torque[:, asset_cfg.joint_ids].square(), dim=1)
+    scale = _yaw_command_penalty_scale(env, command_name, yaw_reference, minimum_scale)
+    return scale * penalty
 
 
 def yaw_lifted_wheel_spin_l2(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
+    command_name: str,
+    yaw_reference: float,
 ) -> torch.Tensor:
-    """Penalize free spin of the FR-HL lifted wheel joints."""
+    """Penalize lifted-wheel spin with relief during intentional rotation."""
     asset: Articulation = env.scene[asset_cfg.name]
-    return torch.sum(asset.data.joint_vel[:, asset_cfg.joint_ids].square(), dim=1)
+    penalty = torch.sum(asset.data.joint_vel[:, asset_cfg.joint_ids].square(), dim=1)
+    return _yaw_command_penalty_scale(env, command_name, yaw_reference) * penalty
 
 
 def track_lin_vel_xy_yaw_frame_exp(

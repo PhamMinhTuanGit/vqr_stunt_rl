@@ -211,7 +211,10 @@ class YawRateCommand(CommandTerm):
 
     def _resample_command(self, env_ids: Sequence[int]):
         """Sample new yaw-rate target."""
-        self._command[env_ids, 0].uniform_(*self.cfg.yaw_rate_range)
+        # Advanced indexing returns a copy, so calling ``uniform_`` directly on
+        # ``self._command[env_ids, 0]`` leaves the command buffer unchanged.
+        sampled = torch.empty_like(self._command[env_ids, 0]).uniform_(*self.cfg.yaw_rate_range)
+        self._command[env_ids, 0] = sampled
 
     def _update_command(self):
         # Command is constant until next resampling.

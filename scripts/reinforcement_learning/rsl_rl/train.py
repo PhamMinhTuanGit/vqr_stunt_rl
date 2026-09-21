@@ -36,6 +36,12 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--critic_warmup_iterations",
+    type=int,
+    default=None,
+    help="Critic-only PPO updates after resume. Flat-VQR-Wheel-Yaw defaults to 150; use 0 to disable.",
+)
+parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 # append RSL-RL cli arguments
@@ -64,6 +70,7 @@ carb.logging.acquire_logging().set_level_threshold_for_source(
 """Check for minimum supported RSL-RL version."""
 
 import importlib.metadata as metadata
+import inspect
 import platform
 from packaging import version
 
@@ -110,10 +117,145 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
+_YAW_CURRICULUM_PREFIX = "_yaw_task_curriculum_"
+_YAW_CURRICULUM_CHECKPOINT_KEY = "yaw_curriculum"
+_YAW_CURRICULUM_PERSISTENT_FIELDS = (
+    "_yaw_task_curriculum_stage",
+    "_yaw_task_curriculum_yaw_stage",
+    "_yaw_task_curriculum_consecutive_passes",
+)
+
+
+def _export_yaw_curriculum_state(task_env) -> dict:
+    """Serialize scalar yaw-curriculum state without simulator tensors."""
+    values = {
+        name: getattr(task_env, name)
+        for name in _YAW_CURRICULUM_PERSISTENT_FIELDS
+        if hasattr(task_env, name) and isinstance(getattr(task_env, name), (bool, int, float))
+    }
+    current_step = int(task_env.common_step_counter)
+    stage_start_step = int(getattr(task_env, "_yaw_task_curriculum_stage_start_step", current_step))
+    term_params = task_env.cfg.curriculum.task_levels.params
+    return {
+        "version": 1,
+        "values": values,
+        "stage_elapsed_steps": max(0, current_step - stage_start_step),
+        "yaw_rate_levels": list(term_params["yaw_rate_levels"]),
+        "dr_scale_levels": list(term_params["dr_scale_levels"]),
+    }
+
+
+def _restore_yaw_curriculum_state(task_env, checkpoint_infos) -> bool:
+    """Restore a saved yaw curriculum and immediately reapply its difficulty."""
+    if not isinstance(checkpoint_infos, dict):
+        return False
+    payload = checkpoint_infos.get(_YAW_CURRICULUM_CHECKPOINT_KEY)
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return False
+    term_params = task_env.cfg.curriculum.task_levels.params
+    if payload.get("yaw_rate_levels") != list(term_params["yaw_rate_levels"]) or payload.get(
+        "dr_scale_levels"
+    ) != list(term_params["dr_scale_levels"]):
+        print("[WARN] Saved yaw curriculum stage table differs from the active config; ignoring saved state.")
+        return False
+
+    values = payload.get("values")
+    if not isinstance(values, dict):
+        return False
+    for name, value in values.items():
+        if name.startswith(_YAW_CURRICULUM_PREFIX) and isinstance(value, (bool, int, float)):
+            setattr(task_env, name, value)
+
+    elapsed_steps = max(0, int(payload.get("stage_elapsed_steps", 0)))
+    task_env._yaw_task_curriculum_stage_start_step = int(task_env.common_step_counter) - elapsed_steps
+
+    # Calling the term with no completed environments clamps restored indices
+    # and reapplies command, reward-target and online-DR configuration.
+    term_cfg = task_env.cfg.curriculum.task_levels
+    term_cfg.func(task_env, [], **term_cfg.params)
+    command_name = term_cfg.params["command_name"]
+    command_term = task_env.command_manager.get_term(command_name)
+    all_env_ids = torch.arange(task_env.num_envs, device=task_env.device)
+    command_term.reset(all_env_ids)
+    return True
+
+
+def _install_yaw_curriculum_checkpointing(runner: OnPolicyRunner, task_env) -> None:
+    """Inject yaw curriculum state into every RSL-RL checkpoint."""
+    original_save = runner.save
+
+    def save_with_yaw_curriculum(path: str, infos: dict | None = None) -> None:
+        checkpoint_infos = dict(infos) if isinstance(infos, dict) else {}
+        if infos is not None and not isinstance(infos, dict):
+            checkpoint_infos["runner_infos"] = infos
+        checkpoint_infos[_YAW_CURRICULUM_CHECKPOINT_KEY] = _export_yaw_curriculum_state(task_env)
+        original_save(path, checkpoint_infos)
+
+    runner.save = save_with_yaw_curriculum
+
+
+def _verify_yaw_reward_config(env, env_cfg) -> None:
+    """Print and enforce the source reward contract before any PPO update."""
+    reward_manager = env.unwrapped.reward_manager
+    term_names = list(reward_manager.active_terms)
+    yaw_weight = (
+        float(reward_manager.get_term_cfg("gated_yaw_tracking").weight)
+        if "gated_yaw_tracking" in term_names
+        else float("nan")
+    )
+    print(f"[INFO] Flat-VQR-Wheel-Yaw env config source: {inspect.getfile(type(env_cfg))}")
+    print(f"[INFO] Flat-VQR-Wheel-Yaw reward terms ({len(term_names)}): {term_names}")
+    print(f"[INFO] Flat-VQR-Wheel-Yaw gated_yaw_tracking weight: {yaw_weight}")
+    if "support_contact" in term_names:
+        raise RuntimeError("Stale yaw reward config detected: support_contact must not be an active reward term.")
+    if len(term_names) != 18 or yaw_weight != 8.0:
+        raise RuntimeError(
+            "Unexpected Flat-VQR-Wheel-Yaw reward config: expected 18 terms and gated_yaw_tracking weight 8.0."
+        )
+
+
+def _install_critic_warmup(runner: OnPolicyRunner, num_iterations: int) -> None:
+    """Freeze actor/distribution parameters for the first resumed PPO updates."""
+    if num_iterations <= 0:
+        return
+
+    frozen_parameters = []
+    for name, parameter in runner.alg.policy.named_parameters():
+        if not name.startswith("critic."):
+            frozen_parameters.append((parameter, parameter.requires_grad))
+            parameter.requires_grad_(False)
+    if not frozen_parameters:
+        raise RuntimeError("Critic warm-up found no actor/distribution parameters to freeze.")
+
+    original_update = runner.alg.update
+    original_schedule = runner.alg.schedule
+    # With a frozen actor the measured KL is approximately zero. Leaving the
+    # adaptive schedule enabled would therefore drive the shared optimizer LR
+    # to its maximum during critic-only updates.
+    runner.alg.schedule = "fixed"
+    completed_updates = 0
+
+    def update_with_critic_warmup():
+        nonlocal completed_updates
+        warmup_active = completed_updates < num_iterations
+        loss_dict = original_update()
+        completed_updates += 1
+        loss_dict["critic_warmup_active"] = float(warmup_active)
+        if completed_updates == num_iterations:
+            for parameter, original_requires_grad in frozen_parameters:
+                parameter.requires_grad_(original_requires_grad)
+            runner.alg.schedule = original_schedule
+            print(f"[INFO] Critic warm-up complete after {num_iterations} PPO updates; actor unfrozen.")
+        return loss_dict
+
+    runner.alg.update = update_with_critic_warmup
+    print(f"[INFO] Critic-only warm-up enabled for {num_iterations} PPO updates.")
+
 
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
+    task_name = args_cli.task.split(":")[-1]
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
@@ -153,6 +295,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    yaw_task_env = env.unwrapped if task_name == "Flat-VQR-Wheel-Yaw" else None
+    if task_name == "Flat-VQR-Wheel-Yaw":
+        _verify_yaw_reward_config(env, env_cfg)
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -184,10 +329,41 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
+    checkpoint_infos = None
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
-        runner.load(resume_path)
+        checkpoint_infos = runner.load(resume_path)
+
+    if yaw_task_env is not None:
+        restored = _restore_yaw_curriculum_state(yaw_task_env, checkpoint_infos)
+        if restored:
+            print(
+                "[INFO] Restored Flat-VQR-Wheel-Yaw curriculum: "
+                f"clearance_stage={yaw_task_env._yaw_task_curriculum_stage}, "
+                f"yaw_stage={yaw_task_env._yaw_task_curriculum_yaw_stage}."
+            )
+        elif agent_cfg.resume:
+            print("[WARN] Checkpoint has no yaw curriculum state; starting curriculum from stage zero.")
+        _install_yaw_curriculum_checkpointing(runner, yaw_task_env)
+
+    critic_warmup_iterations = args_cli.critic_warmup_iterations
+    if critic_warmup_iterations is None:
+        critic_warmup_iterations = 150 if agent_cfg.resume and task_name == "Flat-VQR-Wheel-Yaw" else 0
+    if critic_warmup_iterations < 0:
+        raise ValueError("--critic_warmup_iterations must be non-negative.")
+    if critic_warmup_iterations > 0 and not agent_cfg.resume:
+        print("[WARN] Critic warm-up was requested without --resume; disabling it for fresh training.")
+        critic_warmup_iterations = 0
+    if agent_cfg.resume:
+        start_iteration = runner.current_learning_iteration
+        final_update_label = start_iteration + agent_cfg.max_iterations - 1
+        print(
+            "[INFO] --max_iterations is relative on resume: "
+            f"{agent_cfg.max_iterations} updates from checkpoint iteration {start_iteration}; "
+            f"expected final checkpoint label {final_update_label}."
+        )
+    _install_critic_warmup(runner, critic_warmup_iterations)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
