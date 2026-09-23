@@ -14,6 +14,7 @@ from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.utils import configclass
 
 import rl_training.tasks.manager_based.locomotion.velocity.mdp as mdp
+from .fsm import VQRFsmState, VQRYawFSM
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -233,3 +234,97 @@ class YawRateCommandCfg(CommandTermCfg):
     class_type: type = YawRateCommand
     asset_name: str = "robot"
     yaw_rate_range: tuple[float, float] = (-1.0, 1.0)
+
+
+class YawFSMCommand(YawRateCommand):
+    """Yaw-rate command coupled to the per-environment yaw FSM.
+
+    ``VQRYawFSM`` is deliberately kept as the single source of truth for the
+    transition rules.  The readiness predicates are buffers rather than
+    callbacks so they can be computed from batched Isaac Lab sensor data by
+    the task and assigned without creating one Python callback per environment.
+
+    The command itself remains ``(num_envs, 1)`` and is therefore compatible
+    with existing yaw observations and rewards.
+    """
+
+    cfg: "YawFSMCommandCfg"
+
+    def __init__(self, cfg: "YawFSMCommandCfg", env):
+        super().__init__(cfg, env)
+
+        self._fsm = [
+            VQRYawFSM(yaw_enter=cfg.yaw_enter, yaw_exit=cfg.yaw_exit)
+            for _ in range(self.num_envs)
+        ]
+        self._fsm_state = torch.full(
+            (self.num_envs,), int(VQRFsmState.FOUR_STAND), dtype=torch.int64, device=self.device
+        )
+
+        # These are public on purpose: task-specific sensor code can update
+        # all predicates in one batched operation before the command update.
+        self.positive_pose_ready = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.negative_pose_ready = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.four_stand_ready = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.unsafe = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+    @property
+    def fsm_state(self) -> torch.Tensor:
+        """Current FSM state for every environment as ``VQRFsmState`` values."""
+        return self._fsm_state
+
+    def set_fsm_inputs(
+        self,
+        positive_pose_ready: torch.Tensor,
+        negative_pose_ready: torch.Tensor,
+        four_stand_ready: torch.Tensor,
+        unsafe: torch.Tensor,
+    ) -> None:
+        """Set the batched readiness predicates consumed on the next update."""
+        values = (
+            (positive_pose_ready, self.positive_pose_ready),
+            (negative_pose_ready, self.negative_pose_ready),
+            (four_stand_ready, self.four_stand_ready),
+            (unsafe, self.unsafe),
+        )
+        for value, target in values:
+            if value.shape != target.shape:
+                raise ValueError(f"FSM predicate must have shape {tuple(target.shape)}, got {tuple(value.shape)}")
+            target.copy_(value.to(device=self.device, dtype=torch.bool))
+
+    def _reset_fsm(self, env_ids: Sequence[int] | slice) -> None:
+        ids = range(self.num_envs) if isinstance(env_ids, slice) else env_ids
+        for env_id in ids:
+            self._fsm[int(env_id)].state = VQRFsmState.FOUR_STAND
+        self._fsm_state[env_ids] = int(VQRFsmState.FOUR_STAND)
+
+        self.positive_pose_ready[env_ids] = False
+        self.negative_pose_ready[env_ids] = False
+        self.four_stand_ready[env_ids] = False
+        self.unsafe[env_ids] = False
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        super()._resample_command(env_ids)
+        self._reset_fsm(env_ids)
+
+    def _update_command(self):
+        """Apply exactly the transition ordering defined by ``fsm.py``."""
+        yaw_cmd = self._command[:, 0].detach().cpu().tolist()
+        positive = self.positive_pose_ready.detach().cpu().tolist()
+        negative = self.negative_pose_ready.detach().cpu().tolist()
+        four_stand = self.four_stand_ready.detach().cpu().tolist()
+        unsafe = self.unsafe.detach().cpu().tolist()
+
+        for env_id, fsm in enumerate(self._fsm):
+            self._fsm_state[env_id] = int(
+                fsm.update(yaw_cmd[env_id], positive[env_id], negative[env_id], four_stand[env_id], unsafe[env_id])
+            )
+
+
+@configclass
+class YawFSMCommandCfg(YawRateCommandCfg):
+    """Configuration for a yaw-rate command driven by ``VQRYawFSM``."""
+
+    class_type: type = YawFSMCommand
+    yaw_enter: float = 0.10
+    yaw_exit: float = 0.05

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
@@ -16,6 +17,36 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
+
+
+def fsm_state_one_hot(
+    env: ManagerBasedEnv,
+    command_name: str = "yaw_rate_cmd",
+    num_states: int = 7,
+) -> torch.Tensor:
+    """Return the yaw FSM state as a one-hot observation vector.
+
+    The command term owns the state so the observation always reflects the
+    same state machine used by the command/reward logic.  The output shape is
+    ``(num_envs, num_states)``.
+    """
+
+    command_term = env.command_manager.get_term(command_name)
+    if not hasattr(command_term, "fsm_state"):
+        raise TypeError(
+            f"Command '{command_name}' does not expose 'fsm_state'; "
+            "use YawFSMCommand for the FSM task."
+        )
+
+    state = command_term.fsm_state
+    if state.ndim != 1 or state.shape[0] != env.num_envs:
+        raise ValueError(
+            f"FSM state must have shape ({env.num_envs},), got {tuple(state.shape)}"
+        )
+    if torch.any((state < 0) | (state >= num_states)):
+        raise ValueError(f"FSM state values must be in [0, {num_states}), got {state}")
+
+    return F.one_hot(state.to(dtype=torch.long), num_classes=num_states).to(dtype=torch.float32)
 
 
 def joint_pos_rel_without_wheel(
