@@ -28,8 +28,12 @@ from rl_training.tasks.manager_based.locomotion.velocity.velocity_yaw_env_cfg im
 from rl_training.assets.deeprobotics import VQRWHEEL_CFG  # isort: skip
 
 
-SUPPORT_WHEEL_NAMES = ["FL_WHEEL", "HR_WHEEL"]
-LIFTED_WHEEL_NAMES = ["FR_WHEEL", "HL_WHEEL"]
+# Keep the configuration and the reward implementation on the same canonical
+# front-first mirror mapping.  ``fsm_mirror.py`` is the single source of truth.
+SUPPORT_WHEEL_NAMES = list(mdp.SUPPORT_POS)
+LIFTED_WHEEL_NAMES = list(mdp.SWING_POS)
+SUPPORT_WHEEL_NAMES_MIRROR = list(mdp.SUPPORT_NEG)
+LIFTED_WHEEL_NAMES_MIRROR = list(mdp.SWING_NEG)
 WHEEL_NAMES = ["FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL"]
 LEG_JOINT_NAMES = [
     "FL_HipX_joint", "FL_HipY_joint", "FL_Knee_joint",
@@ -48,6 +52,10 @@ YAW_RATE_LEVELS = (0.25, 0.40, 0.55, 0.70, 0.85, 1.00)
 ONLINE_DR_SCALE_LEVELS = (0.30, 0.40, 0.55, 0.70, 0.85, 1.00)
 YAW_TRACKING_RATIO_THRESHOLDS = (0.30, 0.35, 0.40, 0.45, 0.50, 0.55)
 YAW_EDGE_TRACKING_RATIO_THRESHOLDS = (0.20, 0.25, 0.30, 0.35, 0.40, 0.45)
+# Per-direction mean radius while in YAW.  The final 8 cm target matches the
+# short-run acceptance criterion; earlier yaw levels use the same physical
+# bound so the scale ladder cannot hide circular drift.
+FSM_DRIFT_THRESHOLDS = (0.08, 0.08, 0.08, 0.08, 0.08, 0.08)
 YAW_REF = 1.00
 
 # Reward-rebalance baseline is stage-dependent. On resume at yaw_limit=0.25,
@@ -150,7 +158,12 @@ class VQRWheelRewardsCfg:
     balance = RewTerm(
         func=mdp.yaw_balance,
         weight=2.0,
-        params={"nominal_roll": 0.0, "nominal_pitch": 0.0, "std": 0.25},
+        params={
+            "nominal_roll": 0.0,
+            "nominal_pitch": 0.0,
+            "std": 0.25,
+            "fsm_command_name": "yaw_rate_cmd",
+        },
     )
     gated_yaw_tracking = RewTerm(
         func=mdp.yaw_gated_tracking,
@@ -265,6 +278,285 @@ class VQRWheelRewardsCfg:
 
 
 @configclass
+class VQRWheelFSMRewardsCfg:
+    """The 22-term reward contract for ``Flat-VQR-Wheel-Yaw-FSM``.
+
+    The first ten terms are the unchanged baseline safety/regularization
+    terms.  The next eight terms are state-gated geometry terms, and the last
+    four terms provide FSM tracking, potential shaping, drift control, and
+    recovery-entry bookkeeping.  POS/NEG geometry is selected through the
+    command's ``support_diagonal`` buffer rather than by duplicating reward
+    terms.
+    """
+
+    # ------------------------------ Group 1: always-on baseline ------------------------------
+    balance = RewTerm(
+        func=mdp.yaw_balance,
+        weight=2.0,
+        params={"nominal_roll": 0.0, "nominal_pitch": 0.0, "std": 0.25},
+    )
+    torque = RewTerm(
+        func=mdp.yaw_joint_torque_l2,
+        weight=-1.0e-4,
+        params={
+            "command_name": "yaw_rate_cmd",
+            "yaw_reference": YAW_REF,
+            "minimum_scale": 0.30,
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=LEG_JOINT_NAMES + WHEEL_NAMES, preserve_order=True
+            ),
+        },
+    )
+    action_rate = RewTerm(func=mdp.yaw_action_rate_l2, weight=-0.02)
+    joint_velocity = RewTerm(
+        func=mdp.yaw_joint_velocity_l2,
+        weight=-0.001,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=LEG_JOINT_NAMES, preserve_order=True
+            )
+        },
+    )
+    joint_limits = RewTerm(
+        func=mdp.joint_pos_limits,
+        weight=-0.5,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=LEG_JOINT_NAMES, preserve_order=True
+            )
+        },
+    )
+    lateral_slip = RewTerm(
+        func=mdp.yaw_lateral_wheel_slip,
+        weight=-2.0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=WHEEL_NAMES, preserve_order=True
+            ),
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=WHEEL_NAMES, preserve_order=True
+            ),
+            "threshold": 1.0,
+        },
+    )
+    undesired_contact = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-2.0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=["^(?!(TORSO|.*_WHEEL)$).*"],
+                preserve_order=True,
+            ),
+            "threshold": 1.0,
+        },
+    )
+    planar_velocity = RewTerm(func=mdp.yaw_planar_velocity_l2, weight=-1.0)
+    low_base_height = RewTerm(
+        func=mdp.yaw_low_base_height_l1,
+        weight=-4.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "minimum_height": MIN_BASE_HEIGHT,
+            "error_scale": 0.10,
+        },
+    )
+    downward_low_base_velocity = RewTerm(
+        func=mdp.yaw_downward_low_base_velocity_l2,
+        weight=-8.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "minimum_height": MIN_BASE_HEIGHT,
+            "height_margin": 0.10,
+        },
+    )
+
+    # ------------------------------ Group 2: FSM-gated geometry ------------------------------
+    com_support = RewTerm(
+        func=mdp.yaw_com_support,
+        weight=3.0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+            "asset_cfg_mirror": SceneEntityCfg(
+                "robot", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "std": 0.08,
+            "fsm_command_name": "yaw_rate_cmd",
+        },
+    )
+    com_inside_segment = RewTerm(
+        func=mdp.yaw_com_inside_support_segment,
+        weight=2.0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+            "asset_cfg_mirror": SceneEntityCfg(
+                "robot", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "std": 0.05,
+            "fsm_command_name": "yaw_rate_cmd",
+        },
+    )
+    support_span_band = RewTerm(
+        func=mdp.yaw_support_span_band_l2,
+        weight=-1.0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+            "asset_cfg_mirror": SceneEntityCfg(
+                "robot", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "minimum_span": SUPPORT_SPAN_MIN,
+            "maximum_span": SUPPORT_SPAN_MAX,
+            "std": 0.05,
+            "fsm_command_name": "yaw_rate_cmd",
+        },
+    )
+    lift_clearance = RewTerm(
+        func=mdp.yaw_lift_clearance,
+        weight=3.0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=LIFTED_WHEEL_NAMES, preserve_order=True
+            ),
+            "asset_cfg_mirror": SceneEntityCfg(
+                "robot", body_names=LIFTED_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "wheel_radius": WHEEL_RADIUS,
+            "target_clearance": LIFT_CLEARANCE_LEVELS[0],
+            "fsm_command_name": "yaw_rate_cmd",
+        },
+    )
+    base_height = RewTerm(
+        func=mdp.yaw_base_height_tracking,
+        weight=0.49,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "target_height": TARGET_BASE_HEIGHT,
+            "error_scale": 0.10,
+            "fsm_command_name": "yaw_rate_cmd",
+        },
+    )
+    lifted_wheel_spin = RewTerm(
+        func=mdp.yaw_lifted_wheel_spin_l2,
+        weight=-0.02,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=LIFTED_WHEEL_NAMES, preserve_order=True
+            ),
+            "asset_cfg_mirror": SceneEntityCfg(
+                "robot", joint_names=LIFTED_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "command_name": "yaw_rate_cmd",
+            "yaw_reference": YAW_REF,
+            "fsm_command_name": "yaw_rate_cmd",
+        },
+    )
+    rolling_slip = RewTerm(
+        func=mdp.yaw_rolling_wheel_slip,
+        weight=-0.5,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+            "sensor_cfg_mirror": SceneEntityCfg(
+                "contact_forces", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "body_asset_cfg": SceneEntityCfg(
+                "robot", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+            "body_asset_cfg_mirror": SceneEntityCfg(
+                "robot", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "joint_asset_cfg": SceneEntityCfg(
+                "robot", joint_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+            "joint_asset_cfg_mirror": SceneEntityCfg(
+                "robot", joint_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "wheel_radius": WHEEL_RADIUS,
+            "command_name": "yaw_rate_cmd",
+            "yaw_reference": YAW_REF,
+            "threshold": 1.0,
+            "fsm_command_name": "yaw_rate_cmd",
+        },
+    )
+    four_stand_stability = RewTerm(
+        func=mdp.four_stand_stability,
+        weight=3.0,
+        params={
+            "fsm_command_name": "yaw_rate_cmd",
+            "target_height": TARGET_BASE_HEIGHT,
+            "height_std": 0.08,
+            "attitude_std": 0.25,
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
+
+    # ------------------------------ Group 3: phase/curriculum terms ------------------------------
+    fsm_gated_tracking = RewTerm(
+        func=mdp.fsm_gated_tracking,
+        weight=8.0,
+        params={
+            "command_name": "yaw_rate_cmd",
+            "fsm_command_name": "yaw_rate_cmd",
+            "support_sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+            "support_sensor_cfg_mirror": SceneEntityCfg(
+                "contact_forces", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "lifted_asset_cfg": SceneEntityCfg(
+                "robot", body_names=LIFTED_WHEEL_NAMES, preserve_order=True
+            ),
+            "lifted_asset_cfg_mirror": SceneEntityCfg(
+                "robot", body_names=LIFTED_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "wheel_radius": WHEEL_RADIUS,
+            "target_clearance": LIFT_CLEARANCE_LEVELS[0],
+            "std": 0.30,
+            "contact_threshold": 1.0,
+            "clearance_gate_floor": 0.0,
+            "edge_command_fraction": 0.80,
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
+    transition_progress = RewTerm(
+        func=mdp.TransitionProgress,
+        weight=2.0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=LIFTED_WHEEL_NAMES, preserve_order=True
+            ),
+            "asset_cfg_mirror": SceneEntityCfg(
+                "robot", body_names=LIFTED_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "wheel_radius": WHEEL_RADIUS,
+            "target_clearance": LIFT_CLEARANCE_LEVELS[0],
+            "fsm_command_name": "yaw_rate_cmd",
+            "gamma": 0.99,
+        },
+    )
+    spin_center_drift = RewTerm(
+        func=mdp.spin_center_drift,
+        weight=0.0,  # Phase A; curriculum raises this to -0.5/-2.0 in B/C.
+        params={
+            "fsm_command_name": "yaw_rate_cmd",
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
+    safe_recovery_entry = RewTerm(
+        func=mdp.safe_recovery_entry,
+        weight=0.0,  # Termination semantics in phases A/B; -2.0 in phase C.
+        params={"fsm_command_name": "yaw_rate_cmd"},
+    )
+
+
+@configclass
 class VQRWheelYawCurriculumCfg:
     """Lift first, then jointly progress yaw command and online DR."""
 
@@ -296,6 +588,47 @@ class VQRWheelYawCurriculumCfg:
 
 
 @configclass
+class VQRWheelFSMCurriculumCfg(VQRWheelYawCurriculumCfg):
+    """Three-phase FSM curriculum with independent POS/NEG certification."""
+
+    task_levels = CurrTerm(
+        func=mdp.yaw_fsm_task_levels,
+        params={
+            "command_name": "yaw_rate_cmd",
+            "clearance_levels": LIFT_CLEARANCE_LEVELS,
+            "yaw_rate_levels": YAW_RATE_LEVELS,
+            "dr_scale_levels": ONLINE_DR_SCALE_LEVELS,
+            "tracking_ratio_thresholds": YAW_TRACKING_RATIO_THRESHOLDS,
+            "edge_tracking_ratio_thresholds": YAW_EDGE_TRACKING_RATIO_THRESHOLDS,
+            "lift_reward_name": "lift_clearance",
+            "balance_reward_name": "balance",
+            "yaw_reward_name": "fsm_gated_tracking",
+            "transition_reward_name": "transition_progress",
+            "spin_center_drift_reward_name": "spin_center_drift",
+            "safe_recovery_reward_name": "safe_recovery_entry",
+            "torso_contact_termination_name": "torso_contact",
+            "minimum_base_height": MIN_BASE_HEIGHT,
+            "support_threshold": 0.85,
+            "lift_progress_threshold": 0.80,
+            "balance_threshold": 0.75,
+            "yaw_threshold": 0.65,
+            "min_evaluated_episodes": 2048,
+            "required_success_rate": 0.85,
+            "required_consecutive_windows": 3,
+            "min_clearance_stage_steps": 1000,
+            "min_yaw_stage_steps": 6000,
+            # §7: both directions need their own evidence; one good diagonal
+            # must not pull the other across a curriculum boundary.
+            "min_directional_episodes": 1024,
+            "transition_success_threshold": 0.85,
+            "drift_thresholds": FSM_DRIFT_THRESHOLDS,
+            # 150 PPO iterations at the standard 24-step rollout.
+            "reward_ramp_steps": 3600,
+        },
+    )
+
+
+@configclass
 class VQRWheelYawTerminationsCfg(TerminationsCfg):
     """Yaw-task failures; wheel contact is intentionally not terminal."""
 
@@ -305,6 +638,42 @@ class VQRWheelYawTerminationsCfg(TerminationsCfg):
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["TORSO"]),
             "threshold": 1.0,
             "grace_period_s": 0.15,
+        },
+    )
+
+
+@configclass
+class VQRWheelFSMTerminationsCfg(VQRWheelYawTerminationsCfg):
+    """Phase-aware unsafe handling plus FSM watchdogs."""
+
+    torso_contact = DoneTerm(
+        func=mdp.FSMUnsafeWithGrace,
+        params={
+            "robot_name": "robot",
+            "torso_sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=["TORSO"], preserve_order=True
+            ),
+            "threshold": 1.0,
+            "grace_period_s": 0.15,
+            "minimum_base_height": MIN_BASE_HEIGHT,
+            "unsafe_angle_limit": 0.80,
+        },
+    )
+
+    fsm_transition_timeout = DoneTerm(
+        func=mdp.fsm_transition_timeout,
+        params={"command_name": "yaw_rate_cmd", "timeout_s": 3.0},
+    )
+
+    swing_contact_timeout = DoneTerm(
+        func=mdp.SwingContactTimeout,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=WHEEL_NAMES, preserve_order=True
+            ),
+            "command_name": "yaw_rate_cmd",
+            "threshold": 1.0,
+            "timeout_s": 0.20,
         },
     )
 
@@ -497,13 +866,40 @@ class VQRWheelFSMCommandsCfg(CommandsCfg):
         yaw_rate_range=(-1.0, 1.0),
         yaw_enter=0.10,
         yaw_exit=0.05,
+        yaw_min_dwell=0.20,
+        recovery_dwell=0.50,
+        support_sensor_cfg=SceneEntityCfg(
+            "contact_forces", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+        ),
+        support_sensor_cfg_mirror=SceneEntityCfg(
+            "contact_forces", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+        ),
+        lifted_asset_cfg=SceneEntityCfg(
+            "robot", body_names=LIFTED_WHEEL_NAMES, preserve_order=True
+        ),
+        lifted_asset_cfg_mirror=SceneEntityCfg(
+            "robot", body_names=LIFTED_WHEEL_NAMES_MIRROR, preserve_order=True
+        ),
+        all_wheel_sensor_cfg=SceneEntityCfg(
+            "contact_forces", body_names=WHEEL_NAMES, preserve_order=True
+        ),
+        torso_sensor_cfg=SceneEntityCfg(
+            "contact_forces", body_names=["TORSO"], preserve_order=True
+        ),
+        target_clearance=LIFT_CLEARANCE_LEVELS[0],
+        wheel_radius=WHEEL_RADIUS,
+        contact_threshold=1.0,
+        clearance_fraction=0.8,
+        pose_angle_limit=0.35,
+        unsafe_angle_limit=0.80,
+        minimum_base_height=MIN_BASE_HEIGHT,
         debug_vis=False,
     )
 
 
 @configclass
 class VQRWheelFSMObservationsCfg(ObservationsCfg):
-    """Flat yaw observations plus the seven-state FSM one-hot vector."""
+    """Flat yaw observations with 62D policy and 95D critic inputs."""
 
     @configclass
     class PolicyCfg(ObservationsCfg.PolicyCfg):
@@ -518,6 +914,14 @@ class VQRWheelFSMObservationsCfg(ObservationsCfg):
             func=mdp.fsm_state_one_hot,
             params={"command_name": "yaw_rate_cmd", "num_states": 7},
         )
+        fsm_ready_flags = ObsTerm(
+            func=mdp.fsm_ready_flags,
+            params={"command_name": "yaw_rate_cmd"},
+        )
+        fsm_state_time = ObsTerm(
+            func=mdp.fsm_state_time,
+            params={"command_name": "yaw_rate_cmd"},
+        )
 
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
@@ -525,7 +929,10 @@ class VQRWheelFSMObservationsCfg(ObservationsCfg):
 
 @configclass
 class VQRWheelFlatEnvFSMCfg(VQRWheelFlatEnvCfg):
-    """Flat-VQR-Wheel-Yaw with only the FSM one-hot observer extension."""
+    """Flat-VQR-Wheel-Yaw with the FSM, 22-term reward set, and watchdog."""
 
     commands: VQRWheelFSMCommandsCfg = VQRWheelFSMCommandsCfg()
     observations: VQRWheelFSMObservationsCfg = VQRWheelFSMObservationsCfg()
+    rewards: VQRWheelFSMRewardsCfg = VQRWheelFSMRewardsCfg()
+    terminations: VQRWheelFSMTerminationsCfg = VQRWheelFSMTerminationsCfg()
+    curriculum: VQRWheelFSMCurriculumCfg = VQRWheelFSMCurriculumCfg()

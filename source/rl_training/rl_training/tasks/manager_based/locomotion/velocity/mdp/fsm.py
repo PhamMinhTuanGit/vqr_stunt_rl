@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import torch
 
 from enum import IntEnum
 from typing import Sequence
 
 try:
+    from isaaclab.managers import SceneEntityCfg
     from isaaclab.utils import configclass
 
     from .commands import YawRateCommand, YawRateCommandCfg
@@ -17,13 +20,16 @@ except ImportError:  # Keep scalar/vector FSM unit tests independent of Isaac La
     class YawRateCommandCfg:
         pass
 
+    class SceneEntityCfg:
+        pass
+
 __all__ = [
     "VQRFsmState",
     "VQRYawFSM",
     "YawFSMVectorized",
     "YawFSMCommand",
     "YawFSMCommandCfg",
-    "compute_fsm_reward_mask",
+    "select_swing_wheel_contact",
 ]
 
 
@@ -37,19 +43,54 @@ class VQRFsmState(IntEnum):
     SAFE_RECOVERY = 6
 
 
+def select_swing_wheel_contact(
+    positive_support_contact: torch.Tensor,
+    negative_support_contact: torch.Tensor,
+    support_diagonal: torch.Tensor,
+) -> torch.Tensor:
+    """Select whether any active swing wheel is in contact.
+
+    The POS support pair is FL+HR, so its swing pair is the NEG support pair
+    FR+HL; the NEG branch is the exact mirror.  Inputs retain the two
+    per-wheel contact flags so an individual swing-wheel contact is not lost
+    through a prior ``prod`` reduction.
+    """
+    if positive_support_contact.shape != negative_support_contact.shape:
+        raise ValueError("POS/NEG contact tensors must have the same shape.")
+    if positive_support_contact.ndim != 2 or positive_support_contact.shape[1] != 2:
+        raise ValueError("Support contact tensors must have shape (num_envs, 2).")
+    if support_diagonal.shape != positive_support_contact.shape[:1]:
+        raise ValueError("support_diagonal must have shape (num_envs,).")
+
+    pos_swing_contact = negative_support_contact.to(dtype=torch.bool).any(dim=1)
+    neg_swing_contact = positive_support_contact.to(dtype=torch.bool).any(dim=1)
+    return torch.where(
+        support_diagonal == 1,
+        pos_swing_contact,
+        torch.where(
+            support_diagonal == -1,
+            neg_swing_contact,
+            torch.zeros_like(pos_swing_contact),
+        ),
+    )
+
+
 class VQRYawFSM:
     def __init__(
         self,
         yaw_enter=0.10,
         yaw_exit=0.05,
         dt=0.02,
+        yaw_min_dwell=0.20,
         recovery_dwell=0.5,
     ):
         self.yaw_enter = yaw_enter
         self.yaw_exit = yaw_exit
         self.dt = dt
+        self.yaw_min_dwell = yaw_min_dwell
         self.recovery_dwell = recovery_dwell
         self.state = VQRFsmState.FOUR_STAND
+        self.state_time = 0.0
         self._recovery_safe_time = 0.0
 
     def update(
@@ -60,12 +101,11 @@ class VQRYawFSM:
         four_stand_ready: bool,
         unsafe: bool,
     ):
+        previous = self.state
         if unsafe:
             self.state = VQRFsmState.SAFE_RECOVERY
             self._recovery_safe_time = 0.0
-            return self.state
-
-        if self.state == VQRFsmState.SAFE_RECOVERY:
+        elif self.state == VQRFsmState.SAFE_RECOVERY:
             if four_stand_ready:
                 self._recovery_safe_time += self.dt
             else:
@@ -74,9 +114,8 @@ class VQRYawFSM:
             if self._recovery_safe_time >= self.recovery_dwell:
                 self.state = VQRFsmState.FOUR_STAND
                 self._recovery_safe_time = 0.0
-            return self.state
 
-        if self.state == VQRFsmState.FOUR_STAND:
+        elif self.state == VQRFsmState.FOUR_STAND:
             if yaw_cmd > self.yaw_enter:
                 self.state = VQRFsmState.TRANSITION_POS
 
@@ -91,7 +130,7 @@ class VQRYawFSM:
                 self.state = VQRFsmState.YAW_POS
 
         elif self.state == VQRFsmState.YAW_POS:
-            if yaw_cmd < self.yaw_exit:
+            if self.state_time >= self.yaw_min_dwell and yaw_cmd < self.yaw_exit:
                 self.state = VQRFsmState.RETURN_TO_4
 
         elif self.state == VQRFsmState.TRANSITION_NEG:
@@ -102,13 +141,14 @@ class VQRYawFSM:
                 self.state = VQRFsmState.YAW_NEG
 
         elif self.state == VQRFsmState.YAW_NEG:
-            if yaw_cmd > -self.yaw_exit:
+            if self.state_time >= self.yaw_min_dwell and yaw_cmd > -self.yaw_exit:
                 self.state = VQRFsmState.RETURN_TO_4
 
         elif self.state == VQRFsmState.RETURN_TO_4:
             if four_stand_ready:
                 self.state = VQRFsmState.FOUR_STAND
 
+        self.state_time = 0.0 if self.state != previous else self.state_time + self.dt
         return self.state
 
 
@@ -125,6 +165,8 @@ class YawFSMVectorized:
         yaw_enter: Positive command threshold that starts a transition.
         yaw_exit: Hysteresis threshold used to abort a transition.
         dt: Duration represented by one update, in seconds.
+        yaw_min_dwell: Minimum duration in a YAW state before a command-driven
+            exit to ``RETURN_TO_4`` is accepted. Unsafe always bypasses it.
         recovery_dwell: Continuous safe/four-wheel-ready time required to
             leave ``SAFE_RECOVERY``.
     """
@@ -136,6 +178,7 @@ class YawFSMVectorized:
         yaw_enter: float = 0.10,
         yaw_exit: float = 0.05,
         dt: float = 0.02,
+        yaw_min_dwell: float = 0.20,
         recovery_dwell: float = 0.5,
     ):
         self.num_envs = int(num_envs)
@@ -149,6 +192,9 @@ class YawFSMVectorized:
         self.yaw_enter = torch.as_tensor(yaw_enter, dtype=torch.float64, device=self.device)
         self.yaw_exit = torch.as_tensor(yaw_exit, dtype=torch.float64, device=self.device)
         self.dt = torch.as_tensor(dt, dtype=torch.float32, device=self.device)
+        self.yaw_min_dwell = torch.as_tensor(
+            yaw_min_dwell, dtype=torch.float32, device=self.device
+        )
         self.recovery_dwell = torch.as_tensor(
             recovery_dwell, dtype=torch.float32, device=self.device
         )
@@ -167,9 +213,6 @@ class YawFSMVectorized:
         )
         self.just_switched = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
-        )
-        self.yaw_entry_pos = torch.zeros(
-            self.num_envs, 2, dtype=torch.float32, device=self.device
         )
         self._recovery_safe_time = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
@@ -220,7 +263,6 @@ class YawFSMVectorized:
         self.support_diagonal[index] = 0
         self.state_time[index] = 0.0
         self.just_switched[index] = False
-        self.yaw_entry_pos[index] = 0.0
         self._recovery_safe_time[index] = 0.0
 
     def update(
@@ -230,7 +272,6 @@ class YawFSMVectorized:
         negative_pose_ready: torch.Tensor,
         four_stand_ready: torch.Tensor,
         unsafe: torch.Tensor,
-        yaw_entry_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Advance every FSM by one update and return the live state buffer.
 
@@ -283,8 +324,17 @@ class YawFSMVectorized:
             next_state,
         )
 
-        abort_pos = active & (transition_pos | yaw_pos) & (yaw < self.yaw_exit)
-        abort_neg = active & (transition_neg | yaw_neg) & (yaw > -self.yaw_exit)
+        # TRANSITION may always abort.  YAW exits are intentionally held for a
+        # short dwell so a resampled/noisy command cannot immediately undo a
+        # completed lift.  The unsafe branch above bypasses this dwell.
+        abort_pos = active & (
+            (transition_pos & (yaw < self.yaw_exit))
+            | (yaw_pos & (self.state_time >= self.yaw_min_dwell) & (yaw < self.yaw_exit))
+        )
+        abort_neg = active & (
+            (transition_neg & (yaw > -self.yaw_exit))
+            | (yaw_neg & (self.state_time >= self.yaw_min_dwell) & (yaw > -self.yaw_exit))
+        )
         next_state = torch.where(
             abort_pos | abort_neg,
             torch.full_like(previous, int(VQRFsmState.RETURN_TO_4)),
@@ -359,21 +409,6 @@ class YawFSMVectorized:
             )
         )
 
-        if yaw_entry_pos is not None:
-            entry_pos = torch.as_tensor(yaw_entry_pos, device=self.device).to(dtype=torch.float32)
-            if entry_pos.shape != (self.num_envs, 2):
-                raise ValueError(
-                    f"yaw_entry_pos must have shape ({self.num_envs}, 2), "
-                    f"got {tuple(entry_pos.shape)}"
-                )
-            entering_yaw = (
-                (next_state == int(VQRFsmState.YAW_POS))
-                | (next_state == int(VQRFsmState.YAW_NEG))
-            ) & switched
-            self.yaw_entry_pos.copy_(
-                torch.where(entering_yaw.unsqueeze(1), entry_pos, self.yaw_entry_pos)
-            )
-
         return self.fsm_state
 
 
@@ -381,9 +416,10 @@ class YawFSMCommand(YawRateCommand):
     """Yaw-rate command coupled to the per-environment yaw FSM.
 
     ``VQRYawFSM`` is deliberately kept as the single source of truth for the
-    transition rules.  The readiness predicates are buffers rather than
-    callbacks so they can be computed from batched Isaac Lab sensor data by
-    the task and assigned without creating one Python callback per environment.
+    transition rules.  The readiness predicates are buffers populated from
+    batched Isaac Lab sensor data, without creating one Python callback per
+    environment.  ``set_fsm_inputs`` remains available for task-specific
+    callers that provide their own predicate implementation.
 
     The command itself remains ``(num_envs, 1)`` and is therefore compatible
     with existing yaw observations and rewards.
@@ -399,6 +435,9 @@ class YawFSMCommand(YawRateCommand):
             device=self.device,
             yaw_enter=cfg.yaw_enter,
             yaw_exit=cfg.yaw_exit,
+            dt=env.step_dt,
+            yaw_min_dwell=cfg.yaw_min_dwell,
+            recovery_dwell=cfg.recovery_dwell,
         )
         self._fsm_state = self._fsm.fsm_state
 
@@ -411,7 +450,30 @@ class YawFSMCommand(YawRateCommand):
         self.support_diagonal = self._fsm.support_diagonal
         self.state_time = self._fsm.state_time
         self.just_switched = self._fsm.just_switched
-        self.yaw_entry_pos = self._fsm.yaw_entry_pos
+        # This anchor belongs to the command, rather than the FSM helper or a
+        # reward-local cache.  The drift reward must consume this exact buffer.
+        self.yaw_entry_pos = torch.zeros(self.num_envs, 2, dtype=torch.float32, device=self.device)
+
+        # SceneEntityCfg resolution is intentionally lazy.  Command managers
+        # can be constructed before Isaac Lab starts the simulation, while the
+        # body/sensor views needed by resolve() only exist after play begins.
+        self._fsm_sensor_cfg_names = (
+            "support_sensor_cfg",
+            "support_sensor_cfg_mirror",
+            "lifted_asset_cfg",
+            "lifted_asset_cfg_mirror",
+            "all_wheel_sensor_cfg",
+            "torso_sensor_cfg",
+        )
+        configured = [getattr(cfg, name, None) for name in self._fsm_sensor_cfg_names]
+        if any(value is None for value in configured) and any(value is not None for value in configured):
+            missing = [name for name, value in zip(self._fsm_sensor_cfg_names, configured) if value is None]
+            raise ValueError(
+                "YawFSMCommand requires all sensor/body configs when predicate wiring is enabled; "
+                f"missing {missing}."
+            )
+        self._fsm_predicates_enabled = all(value is not None for value in configured)
+        self._fsm_scene_entities_resolved = False
 
     @property
     def fsm_state(self) -> torch.Tensor:
@@ -439,6 +501,7 @@ class YawFSMCommand(YawRateCommand):
 
     def _reset_fsm(self, env_ids: Sequence[int] | slice) -> None:
         self._fsm.reset(env_ids)
+        self.yaw_entry_pos[env_ids] = 0.0
 
         self.positive_pose_ready[env_ids] = False
         self.negative_pose_ready[env_ids] = False
@@ -452,6 +515,7 @@ class YawFSMCommand(YawRateCommand):
         return extras
 
     def _step_fsm(self) -> None:
+        self._update_fsm_predicates()
         self._fsm.update(
             yaw_cmd=self._command[:, 0],
             positive_pose_ready=self.positive_pose_ready,
@@ -459,6 +523,55 @@ class YawFSMCommand(YawRateCommand):
             four_stand_ready=self.four_stand_ready,
             unsafe=self.unsafe,
         )
+        entering_yaw = self.just_switched & (
+            (self.fsm_state == int(VQRFsmState.YAW_POS))
+            | (self.fsm_state == int(VQRFsmState.YAW_NEG))
+        )
+        current_xy = (
+            self.robot.data.root_pos_w[:, :2] - self._env.scene.env_origins[:, :2]
+        ).to(dtype=self.yaw_entry_pos.dtype)
+        self.yaw_entry_pos.copy_(
+            torch.where(entering_yaw.unsqueeze(1), current_xy, self.yaw_entry_pos)
+        )
+
+    def _update_fsm_predicates(self) -> None:
+        """Refresh FSM inputs from the current batched Isaac Lab sensor state."""
+        if not self._fsm_predicates_enabled:
+            # Preserve the explicit set_fsm_inputs() path for CPU-only FSM
+            # tests and callers that provide task-specific predicates.
+            return
+
+        configs = [getattr(self.cfg, name) for name in self._fsm_sensor_cfg_names]
+        if not self._fsm_scene_entities_resolved:
+            for config in configs:
+                resolve = getattr(config, "resolve", None)
+                if resolve is None:
+                    raise TypeError(
+                        "YawFSMCommand sensor/body configs must be SceneEntityCfg instances."
+                    )
+                resolve(self._env.scene)
+            self._fsm_scene_entities_resolved = True
+
+        from .observations import yaw_fsm_predicates
+
+        predicates = yaw_fsm_predicates(
+            self._env,
+            robot_name=self.cfg.asset_name,
+            support_sensor_cfg=configs[0],
+            support_sensor_cfg_mirror=configs[1],
+            lifted_asset_cfg=configs[2],
+            lifted_asset_cfg_mirror=configs[3],
+            all_wheel_sensor_cfg=configs[4],
+            torso_sensor_cfg=configs[5],
+            target_clearance=self.cfg.target_clearance,
+            wheel_radius=self.cfg.wheel_radius,
+            contact_threshold=self.cfg.contact_threshold,
+            clearance_fraction=self.cfg.clearance_fraction,
+            pose_angle_limit=self.cfg.pose_angle_limit,
+            unsafe_angle_limit=self.cfg.unsafe_angle_limit,
+            minimum_base_height=self.cfg.minimum_base_height,
+        )
+        self.set_fsm_inputs(*predicates)
 
     def _update_command(self):
         """Keep the base command behavior, then advance the FSM once."""
@@ -473,54 +586,18 @@ class YawFSMCommandCfg(YawRateCommandCfg):
     class_type: type = YawFSMCommand
     yaw_enter: float = 0.10
     yaw_exit: float = 0.05
-
-
-def compute_fsm_reward_mask(
-    env,
-    command_name: str,
-    active_states: "tuple[VQRFsmState, ...]",
-) -> torch.Tensor:
-    """Return a per-environment reward mask that is 1.0 in ``active_states``.
-
-    The mask reads the batched FSM state exposed by ``YawFSMCommand`` and is
-    cached per step so that multiple reward terms sharing one gate evaluate
-    the FSM only once per environment step.
-
-    Args:
-        env: The manager-based environment.
-        command_name: Name of the ``YawFSMCommand`` term holding the FSM.
-        active_states: FSM states in which the mask is 1.0; it is 0.0
-            everywhere else.
-
-    Returns:
-        A float tensor of shape ``(num_envs,)`` in ``{0.0, 1.0}``.
-    """
-    if not active_states:
-        raise ValueError("active_states must be non-empty.")
-
-    command = env.command_manager.get_term(command_name)
-    states = command.fsm_state  # (num_envs,) int64 tensor
-
-    key = tuple(int(state) for state in sorted(active_states))
-    cache_token = (command_name, key)
-
-    # common_step_counter is a scalar and advances once per env step, so all
-    # reward terms sharing one gate reuse the same mask within a step.
-    step = env.common_step_counter
-    if getattr(env, "_fsm_mask_step", None) == step:
-        cached = env._fsm_mask_cache.get(cache_token)
-        if cached is not None:
-            return cached
-
-    active = torch.zeros_like(states, dtype=torch.bool)
-    for state in key:
-        active |= states == state
-    mask = active.to(torch.float32).to(env.device)
-
-    if getattr(env, "_fsm_mask_step", None) == step:
-        env._fsm_mask_cache[cache_token] = mask
-    else:
-        env._fsm_mask_step = step
-        env._fsm_mask_cache = {cache_token: mask}
-
-    return mask
+    yaw_min_dwell: float = 0.20
+    recovery_dwell: float = 0.50
+    support_sensor_cfg: SceneEntityCfg | None = None
+    support_sensor_cfg_mirror: SceneEntityCfg | None = None
+    lifted_asset_cfg: SceneEntityCfg | None = None
+    lifted_asset_cfg_mirror: SceneEntityCfg | None = None
+    all_wheel_sensor_cfg: SceneEntityCfg | None = None
+    torso_sensor_cfg: SceneEntityCfg | None = None
+    target_clearance: float = 0.20
+    wheel_radius: float = 0.091
+    contact_threshold: float = 1.0
+    clearance_fraction: float = 0.8
+    pose_angle_limit: float = 0.35
+    unsafe_angle_limit: float = 0.80
+    minimum_base_height: float = 0.35

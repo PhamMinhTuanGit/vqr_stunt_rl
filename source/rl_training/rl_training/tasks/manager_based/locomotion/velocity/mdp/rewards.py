@@ -18,6 +18,9 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
+from .fsm_gates import fsm_gates
+from .fsm import select_swing_wheel_contact
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -183,12 +186,24 @@ def yaw_com_support(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
     std: float,
+    asset_cfg_mirror: SceneEntityCfg | None = None,
+    fsm_command_name: str | None = None,
 ) -> torch.Tensor:
     """Reward CoM proximity with a non-flat reciprocal-L1 kernel."""
     if std <= 0.0:
         raise ValueError("std must be positive.")
     distance, _, _ = _yaw_support_geometry(env, asset_cfg)
-    return 1.0 / (1.0 + distance / std)
+    score = 1.0 / (1.0 + distance / std)
+    if fsm_command_name is None:
+        return score
+    if asset_cfg_mirror is None:
+        raise ValueError("asset_cfg_mirror is required when fsm_command_name is set.")
+    mirror_distance, _, _ = _yaw_support_geometry(env, asset_cfg_mirror)
+    mirror_score = 1.0 / (1.0 + mirror_distance / std)
+    gates = fsm_gates(env, fsm_command_name)
+    reward = torch.where(gates["diag_pos"], score, mirror_score) * gates["f_geom"]
+    _fsm_record_positive_budget(env, gates, "com_support", reward)
+    return reward
 
 
 def yaw_base_height_tracking(
@@ -196,6 +211,7 @@ def yaw_base_height_tracking(
     target_height: float,
     error_scale: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    fsm_command_name: str | None = None,
 ) -> torch.Tensor:
     """Track TORSO height with non-saturating, normalized Huber shaping.
 
@@ -218,7 +234,13 @@ def yaw_base_height_tracking(
         0.5 * normalized_error.square(),
         normalized_error - 0.5,
     )
-    return 1.0 - huber
+    score = 1.0 - huber
+    if fsm_command_name is None:
+        return score
+    gates = fsm_gates(env, fsm_command_name)
+    reward = score * gates["f_yaw"]
+    _fsm_record_positive_budget(env, gates, "base_height", reward)
+    return reward
 
 
 def yaw_low_base_height_l1(
@@ -260,6 +282,8 @@ def yaw_support_span_band_l2(
     minimum_span: float,
     maximum_span: float,
     std: float,
+    asset_cfg_mirror: SceneEntityCfg | None = None,
+    fsm_command_name: str | None = None,
 ) -> torch.Tensor:
     """Penalize FL-HR span only outside the configured non-zero-width band."""
     if minimum_span < 0.0 or maximum_span <= minimum_span:
@@ -269,7 +293,16 @@ def yaw_support_span_band_l2(
 
     _, _, span = _yaw_support_geometry(env, asset_cfg)
     outside_distance = torch.relu(minimum_span - span) + torch.relu(span - maximum_span)
-    return (outside_distance / std).square()
+    score = (outside_distance / std).square()
+    if fsm_command_name is None:
+        return score
+    if asset_cfg_mirror is None:
+        raise ValueError("asset_cfg_mirror is required when fsm_command_name is set.")
+    _, _, mirror_span = _yaw_support_geometry(env, asset_cfg_mirror)
+    mirror_outside = torch.relu(minimum_span - mirror_span) + torch.relu(mirror_span - maximum_span)
+    mirror_score = (mirror_outside / std).square()
+    gates = fsm_gates(env, fsm_command_name)
+    return torch.where(gates["diag_pos"], score, mirror_score) * gates["f_geom"]
 
 
 def yaw_planar_velocity_l2(
@@ -312,6 +345,8 @@ def yaw_lift_clearance(
     asset_cfg: SceneEntityCfg,
     wheel_radius: float,
     target_clearance: float,
+    asset_cfg_mirror: SceneEntityCfg | None = None,
+    fsm_command_name: str | None = None,
 ) -> torch.Tensor:
     """Shape lifted-wheel clearance with partial credit and a four-wheel penalty.
 
@@ -321,23 +356,48 @@ def yaw_lift_clearance(
     """
     progress = _yaw_lift_progress(env, asset_cfg, wheel_radius, target_clearance)
 
-    # Keep a separate curriculum metric: the weaker wheel's progress, averaged
-    # over the episode. This must not be reconstructed from the signed mean
-    # reward because one fully lifted wheel can hide the other grounded wheel.
-    min_progress = progress.amin(dim=1)
+    score = 2.0 * progress.mean(dim=1) - 1.0
+    if fsm_command_name is None:
+        # Keep a separate curriculum metric: the weaker wheel's progress,
+        # averaged over the episode. This must not be reconstructed from the
+        # signed mean reward because one fully lifted wheel can hide the other.
+        min_progress = progress.amin(dim=1)
+        if not hasattr(env, "_yaw_lift_min_progress_sum"):
+            env._yaw_lift_min_progress_sum = torch.zeros_like(min_progress)
+            env._yaw_lift_min_progress_samples = torch.zeros_like(min_progress, dtype=torch.long)
+        env._yaw_lift_min_progress_sum += min_progress
+        env._yaw_lift_min_progress_samples += 1
+        return score
+    if asset_cfg_mirror is None:
+        raise ValueError("asset_cfg_mirror is required when fsm_command_name is set.")
+    mirror_progress = _yaw_lift_progress(
+        env,
+        asset_cfg_mirror,
+        wheel_radius,
+        target_clearance,
+    )
+    mirror_score = 2.0 * mirror_progress.mean(dim=1) - 1.0
+    gates = fsm_gates(env, fsm_command_name)
+    selected_progress = torch.where(gates["diag_pos"].unsqueeze(1), progress, mirror_progress)
+    min_progress = selected_progress.amin(dim=1)
     if not hasattr(env, "_yaw_lift_min_progress_sum"):
         env._yaw_lift_min_progress_sum = torch.zeros_like(min_progress)
         env._yaw_lift_min_progress_samples = torch.zeros_like(min_progress, dtype=torch.long)
     env._yaw_lift_min_progress_sum += min_progress
     env._yaw_lift_min_progress_samples += 1
-
-    return 2.0 * progress.mean(dim=1) - 1.0
+    reward = torch.where(gates["diag_pos"], score, mirror_score) * (
+        gates["f_trans"] + gates["f_yaw"]
+    )
+    _fsm_record_positive_budget(env, gates, "lift_clearance", reward)
+    return reward
 
 
 def yaw_com_inside_support_segment(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
     std: float,
+    asset_cfg_mirror: SceneEntityCfg | None = None,
+    fsm_command_name: str | None = None,
 ) -> torch.Tensor:
     """Reward CoM projection inside the finite FL-HR support segment.
 
@@ -348,7 +408,20 @@ def yaw_com_inside_support_segment(
     outside_distance = (
         torch.relu(-projection) + torch.relu(projection - 1.0)
     ) * segment_length
-    return torch.exp(-outside_distance.square() / std**2)
+    score = torch.exp(-outside_distance.square() / std**2)
+    if fsm_command_name is None:
+        return score
+    if asset_cfg_mirror is None:
+        raise ValueError("asset_cfg_mirror is required when fsm_command_name is set.")
+    _, mirror_projection, mirror_segment_length = _yaw_support_geometry(env, asset_cfg_mirror)
+    mirror_outside_distance = (
+        torch.relu(-mirror_projection) + torch.relu(mirror_projection - 1.0)
+    ) * mirror_segment_length
+    mirror_score = torch.exp(-mirror_outside_distance.square() / std**2)
+    gates = fsm_gates(env, fsm_command_name)
+    reward = torch.where(gates["diag_pos"], score, mirror_score) * gates["f_geom"]
+    _fsm_record_positive_budget(env, gates, "com_inside_segment", reward)
+    return reward
 
 
 def yaw_balance(
@@ -357,13 +430,22 @@ def yaw_balance(
     nominal_roll: float = 0.0,
     nominal_pitch: float = 0.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    fsm_command_name: str | None = None,
 ) -> torch.Tensor:
     """Reward roll and pitch near the configured diagonal-support equilibrium."""
     asset: Articulation = env.scene[asset_cfg.name]
     roll, pitch, _ = math_utils.euler_xyz_from_quat(asset.data.root_quat_w)
     roll_error = math_utils.wrap_to_pi(roll - nominal_roll)
     pitch_error = math_utils.wrap_to_pi(pitch - nominal_pitch)
-    return torch.exp(-(roll_error.square() + pitch_error.square()) / std**2)
+    score = torch.exp(-(roll_error.square() + pitch_error.square()) / std**2)
+    # ``None`` preserves the baseline task's exact calculation.  The FSM
+    # task suppresses this otherwise-positive term in SAFE_RECOVERY.
+    if fsm_command_name is None:
+        return score
+    gates = fsm_gates(env, fsm_command_name)
+    reward = score * (1.0 - gates["f_safe"])
+    _fsm_record_positive_budget(env, gates, "balance", reward)
+    return reward
 
 
 # def yaw_gated_tracking(
@@ -493,6 +575,407 @@ def yaw_gated_tracking(
     return support_gate * clearance_weight * yaw_tracking
 
 
+def _fsm_masked_accumulate(
+    env: ManagerBasedRLEnv,
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    sum_name: str,
+    samples_name: str,
+) -> None:
+    """Accumulate a metric only for the selected FSM state mask."""
+    if not hasattr(env, sum_name):
+        setattr(env, sum_name, torch.zeros_like(value))
+        setattr(env, samples_name, torch.zeros_like(value, dtype=torch.long))
+    getattr(env, sum_name).add_(value * mask)
+    getattr(env, samples_name).add_(mask.to(dtype=torch.long))
+
+
+def _fsm_masked_accumulate_pair(
+    env: ManagerBasedRLEnv,
+    first: torch.Tensor,
+    second: torch.Tensor,
+    mask: torch.Tensor,
+    first_sum_name: str,
+    second_sum_name: str,
+    samples_name: str,
+) -> None:
+    """Accumulate two metrics with one shared, masked sample count."""
+    if not hasattr(env, first_sum_name):
+        setattr(env, first_sum_name, torch.zeros_like(first))
+    if not hasattr(env, second_sum_name):
+        setattr(env, second_sum_name, torch.zeros_like(second))
+    if not hasattr(env, samples_name):
+        setattr(env, samples_name, torch.zeros_like(mask, dtype=torch.long))
+    getattr(env, first_sum_name).add_(first * mask)
+    getattr(env, second_sum_name).add_(second * mask)
+    getattr(env, samples_name).add_(mask.to(dtype=torch.long))
+
+
+def _fsm_episode_or(env: ManagerBasedRLEnv, name: str, mask: torch.Tensor) -> None:
+    """Remember whether an FSM event occurred in the current episode."""
+    if not hasattr(env, name):
+        setattr(env, name, torch.zeros_like(mask, dtype=torch.bool))
+    getattr(env, name).logical_or_(mask.to(dtype=torch.bool))
+
+
+def _fsm_step_telemetry(env: ManagerBasedRLEnv, gates: dict[str, torch.Tensor]) -> None:
+    """Accumulate per-episode FSM occupancy and switching telemetry.
+
+    This runs from the single FSM tracking term, which is evaluated once per
+    reward step.  It therefore records time rather than duplicating a reward
+    term or adding a manager callback just for diagnostics.
+    """
+    state = gates["fsm_state"]
+    if not hasattr(env, "_yaw_fsm_state_steps"):
+        env._yaw_fsm_state_steps = torch.zeros(
+            env.num_envs, 7, dtype=torch.long, device=state.device
+        )
+        env._yaw_fsm_switches = torch.zeros(env.num_envs, dtype=torch.long, device=state.device)
+        env._yaw_fsm_episode_steps = torch.zeros(env.num_envs, dtype=torch.long, device=state.device)
+    env._yaw_fsm_state_steps.scatter_add_(
+        1, state.unsqueeze(1), torch.ones_like(state, dtype=torch.long).unsqueeze(1)
+    )
+    env._yaw_fsm_switches += gates["just_switched"].to(dtype=torch.long)
+    env._yaw_fsm_episode_steps += 1
+
+
+def _fsm_record_positive_budget(
+    env: ManagerBasedRLEnv,
+    gates: dict[str, torch.Tensor],
+    term_name: str,
+    value: torch.Tensor,
+) -> None:
+    """Accumulate actual weighted positive reward by FSM state/direction.
+
+    Reward functions return unweighted values, so the manager's configured
+    term weight is applied here before taking the positive part.  This is
+    telemetry only; a missing lightweight test-double reward manager simply
+    leaves the diagnostic unset and never changes the reward value.
+    """
+    try:
+        weight = float(env.reward_manager.get_term_cfg(term_name).weight)
+    except (AttributeError, KeyError, TypeError):
+        return
+    positive = torch.relu(value * weight)
+    state = gates["fsm_state"]
+    if not hasattr(env, "_yaw_fsm_positive_budget"):
+        env._yaw_fsm_positive_budget = torch.zeros(
+            env.num_envs, 7, dtype=positive.dtype, device=positive.device
+        )
+        env._yaw_fsm_positive_budget_pos = torch.zeros_like(positive)
+        env._yaw_fsm_positive_budget_neg = torch.zeros_like(positive)
+    env._yaw_fsm_positive_budget.scatter_add_(1, state.unsqueeze(1), positive.unsqueeze(1))
+    env._yaw_fsm_positive_budget_pos += positive * gates["diag_pos"].to(positive.dtype)
+    env._yaw_fsm_positive_budget_neg += positive * gates["diag_neg"].to(positive.dtype)
+
+
+def fsm_gated_tracking(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    fsm_command_name: str,
+    support_sensor_cfg: SceneEntityCfg,
+    support_sensor_cfg_mirror: SceneEntityCfg,
+    lifted_asset_cfg: SceneEntityCfg,
+    lifted_asset_cfg_mirror: SceneEntityCfg,
+    wheel_radius: float,
+    target_clearance: float,
+    std: float,
+    contact_threshold: float = 1.0,
+    clearance_gate_floor: float = 0.0,
+    clearance_gate_floor_decay_s: float = 0.0,
+    edge_command_fraction: float = 0.80,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Track signed yaw commands during TRANSITION and YAW states.
+
+    The positive reward is available during transition, while the curriculum
+    tracking accumulators are updated only in ``YAW_POS``/``YAW_NEG``.  The
+    signed command is intentionally used directly, preserving the direction
+    constraint for the mirrored branch.
+    """
+    if std <= 0.0:
+        raise ValueError("std must be positive.")
+    if target_clearance <= 0.0:
+        raise ValueError("target_clearance must be positive.")
+    if not 0.0 <= clearance_gate_floor <= 1.0:
+        raise ValueError("clearance_gate_floor must be in [0, 1].")
+    if clearance_gate_floor_decay_s < 0.0:
+        raise ValueError("clearance_gate_floor_decay_s must be non-negative.")
+    if not 0.0 < edge_command_fraction <= 1.0:
+        raise ValueError("edge_command_fraction must be in (0, 1].")
+
+    gates = fsm_gates(env, fsm_command_name)
+    _fsm_step_telemetry(env, gates)
+    support_pos_contact = _yaw_wheel_contacts(env, support_sensor_cfg, contact_threshold)
+    support_neg_contact = _yaw_wheel_contacts(env, support_sensor_cfg_mirror, contact_threshold)
+    support_pos = support_pos_contact.to(dtype=torch.float32).prod(dim=1)
+    support_neg = support_neg_contact.to(dtype=torch.float32).prod(dim=1)
+    support_gate = torch.where(gates["diag_pos"], support_pos, support_neg)
+    # The opposite support diagonal is exactly the active swing diagonal.
+    swing_contact = select_swing_wheel_contact(
+        support_pos_contact,
+        support_neg_contact,
+        gates["support_diagonal"],
+    )
+
+    lift_pos = _yaw_lift_progress(
+        env, lifted_asset_cfg, wheel_radius, target_clearance
+    ).mean(dim=1)
+    lift_neg = _yaw_lift_progress(
+        env, lifted_asset_cfg_mirror, wheel_radius, target_clearance
+    ).mean(dim=1)
+    lift_progress = torch.where(gates["diag_pos"], lift_pos, lift_neg)
+
+    asset: RigidObject = env.scene[asset_cfg.name]
+    yaw_command = env.command_manager.get_command(command_name)[:, 0]
+    yaw_error = torch.abs(yaw_command - asset.data.root_ang_vel_b[:, 2])
+    yaw_tracking = torch.exp(-yaw_error.square() / std**2)
+
+    # Metrics are intentionally YAW-only; otherwise transition/FOUR steps
+    # dilute the curriculum score and make the scale ladder stall.
+    yaw_mask = gates["b_yaw"].to(dtype=yaw_command.dtype)
+    # Reuse the legacy yaw-curriculum accumulator names.  This keeps the
+    # existing checkpoint/export path valid while changing only the sample
+    # mask: FSM tracking statistics are normalized by YAW-state steps.
+    _fsm_masked_accumulate(
+        env,
+        support_gate,
+        yaw_mask,
+        "_yaw_support_score_sum",
+        "_yaw_support_score_samples",
+    )
+    _fsm_masked_accumulate(
+        env,
+        support_gate,
+        yaw_mask,
+        "_yaw_gate_open_sum",
+        "_yaw_gate_open_samples",
+    )
+    _fsm_masked_accumulate_pair(
+        env,
+        torch.abs(yaw_command),
+        yaw_error,
+        yaw_mask,
+        "_yaw_command_abs_sum",
+        "_yaw_rate_abs_error_sum",
+        "_yaw_tracking_metric_samples",
+    )
+
+    # The legacy accumulators above deliberately remain direction-agnostic:
+    # the original yaw curriculum and checkpoint export consume them.  The
+    # FSM curriculum additionally needs independent evidence for each
+    # diagonal; a strong POS branch must never promote a weak NEG branch.
+    yaw_pos_mask = gates["b_yaw"] & gates["diag_pos"]
+    yaw_neg_mask = gates["b_yaw"] & gates["diag_neg"]
+    for suffix, direction_mask in (("pos", yaw_pos_mask), ("neg", yaw_neg_mask)):
+        mask = direction_mask.to(dtype=yaw_command.dtype)
+        _fsm_masked_accumulate(
+            env,
+            lift_progress,
+            mask,
+            f"_yaw_fsm_{suffix}_lift_sum",
+            f"_yaw_fsm_{suffix}_yaw_samples",
+        )
+        _fsm_masked_accumulate(
+            env,
+            support_gate,
+            mask,
+            f"_yaw_fsm_{suffix}_support_sum",
+            f"_yaw_fsm_{suffix}_support_samples",
+        )
+        _fsm_masked_accumulate_pair(
+            env,
+            torch.abs(yaw_command),
+            yaw_error,
+            mask,
+            f"_yaw_fsm_{suffix}_command_abs_sum",
+            f"_yaw_fsm_{suffix}_yaw_abs_error_sum",
+            f"_yaw_fsm_{suffix}_tracking_samples",
+        )
+        _fsm_masked_accumulate(
+            env,
+            swing_contact.to(dtype=yaw_command.dtype),
+            mask,
+            f"_yaw_fsm_{suffix}_swing_contact_sum",
+            f"_yaw_fsm_{suffix}_swing_contact_samples",
+        )
+
+    # Phase B is an attempted transition that reaches its corresponding YAW
+    # state before reset.  Store booleans rather than a step count so a long
+    # transition cannot distort the episode success rate.
+    _fsm_episode_or(
+        env,
+        "_yaw_fsm_pos_transition_attempted",
+        gates["b_trans"] & gates["diag_pos"],
+    )
+    _fsm_episode_or(
+        env,
+        "_yaw_fsm_neg_transition_attempted",
+        gates["b_trans"] & gates["diag_neg"],
+    )
+    _fsm_episode_or(env, "_yaw_fsm_pos_transition_succeeded", yaw_pos_mask)
+    _fsm_episode_or(env, "_yaw_fsm_neg_transition_succeeded", yaw_neg_mask)
+    env._yaw_support_score_current = support_gate
+    env._yaw_gate_open_current = support_gate
+    env._yaw_command_abs_current = torch.abs(yaw_command)
+    env._yaw_rate_abs_error_current = yaw_error
+
+    command_term = env.command_manager.get_term(command_name)
+    yaw_limits = torch.as_tensor(
+        command_term.cfg.yaw_rate_range,
+        device=yaw_command.device,
+        dtype=yaw_command.dtype,
+    )
+    yaw_limit = yaw_limits.abs().amax()
+    edge_mask = (torch.abs(yaw_command) >= edge_command_fraction * yaw_limit) & gates["b_yaw"]
+    _fsm_masked_accumulate_pair(
+        env,
+        torch.abs(yaw_command),
+        yaw_error,
+        edge_mask.to(dtype=yaw_command.dtype),
+        "_yaw_edge_command_abs_sum",
+        "_yaw_edge_rate_abs_error_sum",
+        "_yaw_edge_tracking_samples",
+    )
+
+    # The phase-B floor provides a short exploration bridge at transition
+    # entry, then decays to zero so the policy cannot keep collecting reward
+    # without lifting.  A zero decay keeps the legacy/static-floor behavior.
+    if clearance_gate_floor_decay_s > 0.0:
+        floor = clearance_gate_floor * torch.clamp(
+            1.0 - gates["state_time"] / clearance_gate_floor_decay_s,
+            min=0.0,
+            max=1.0,
+        )
+    else:
+        floor = clearance_gate_floor
+    clearance_weight = floor + (1.0 - floor) * lift_progress
+    state_gate = gates["f_trans"] + gates["f_yaw"]
+    reward = support_gate * clearance_weight * yaw_tracking * state_gate
+    _fsm_record_positive_budget(env, gates, "fsm_gated_tracking", reward)
+    return reward
+
+
+def four_stand_stability(
+    env: ManagerBasedRLEnv,
+    fsm_command_name: str,
+    target_height: float,
+    height_std: float = 0.08,
+    attitude_std: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward a stable four-wheel pose with a soft FSM phase gate.
+
+    SAFE_RECOVERY is intentionally absent from the gate: recovery gets only
+    its entry cost and baseline penalties, never a positive stability reward.
+    """
+    if height_std <= 0.0 or attitude_std <= 0.0:
+        raise ValueError("height_std and attitude_std must be positive.")
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    base_height = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    roll, pitch, _ = math_utils.euler_xyz_from_quat(asset.data.root_quat_w)
+    height_score = torch.exp(-(base_height - target_height).square() / height_std**2)
+    attitude_score = torch.exp(-(roll.square() + pitch.square()) / attitude_std**2)
+    gates = fsm_gates(env, fsm_command_name)
+    reward = gates["f_stability"] * height_score * attitude_score
+    _fsm_record_positive_budget(env, gates, "four_stand_stability", reward)
+    return reward
+
+
+class TransitionProgress(ManagerTermBase):
+    """Potential-based lift/handoff shaping for TRANSITION and RETURN."""
+
+    def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.prev_phi = torch.zeros(env.num_envs, device=env.device)
+
+    def reset(self, env_ids=None) -> None:
+        if env_ids is None:
+            self.prev_phi.zero_()
+        else:
+            self.prev_phi[env_ids] = 0.0
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        asset_cfg: SceneEntityCfg,
+        asset_cfg_mirror: SceneEntityCfg,
+        wheel_radius: float,
+        target_clearance: float,
+        fsm_command_name: str,
+        gamma: float = 0.99,
+    ) -> torch.Tensor:
+        if not 0.0 < gamma <= 1.0:
+            raise ValueError("gamma must be in (0, 1].")
+
+        gates = fsm_gates(env, fsm_command_name)
+        progress_pos = _yaw_lift_progress(
+            env, asset_cfg, wheel_radius, target_clearance
+        ).mean(dim=1)
+        progress_neg = _yaw_lift_progress(
+            env, asset_cfg_mirror, wheel_radius, target_clearance
+        ).mean(dim=1)
+        progress = torch.where(gates["diag_pos"], progress_pos, progress_neg)
+        phi = torch.where(gates["b_return"], 1.0 - progress, progress)
+
+        # Always advance the potential, including FOUR/YAW/SAFE states.  This
+        # prevents a spurious pulse when the next gated phase begins.
+        reward = gamma * phi - self.prev_phi
+        self.prev_phi.copy_(phi)
+        reward = torch.where(gates["just_switched"], torch.zeros_like(reward), reward)
+        reward = reward * (gates["f_trans"] + gates["f_return"])
+        _fsm_record_positive_budget(env, gates, "transition_progress", reward)
+        return reward
+
+
+def spin_center_drift(
+    env: ManagerBasedRLEnv,
+    fsm_command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize accumulated XY drift from the yaw-entry position."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    current_xy = asset.data.root_pos_w[:, :2] - env.scene.env_origins[:, :2]
+    gates = fsm_gates(env, fsm_command_name)
+    command = env.command_manager.get_term(fsm_command_name)
+    entry_xy = command.yaw_entry_pos
+    drift = torch.linalg.vector_norm(current_xy - entry_xy, dim=1)
+    for suffix, direction_mask in (
+        ("pos", gates["b_yaw"] & gates["diag_pos"]),
+        ("neg", gates["b_yaw"] & gates["diag_neg"]),
+    ):
+        _fsm_masked_accumulate(
+            env,
+            drift,
+            direction_mask.to(dtype=drift.dtype),
+            f"_yaw_fsm_{suffix}_drift_sum",
+            f"_yaw_fsm_{suffix}_drift_samples",
+        )
+        # Record a single sample at the ten-second YAW milestone.  This is a
+        # radius-at-time metric, not an average that can hide late drift.
+        milestone = direction_mask & (gates["state_time"] >= 10.0) & (
+            gates["state_time"] < 10.0 + env.step_dt
+        )
+        _fsm_masked_accumulate(
+            env,
+            drift,
+            milestone.to(dtype=drift.dtype),
+            f"_yaw_fsm_{suffix}_drift_10s_sum",
+            f"_yaw_fsm_{suffix}_drift_10s_samples",
+        )
+    return drift * gates["f_yaw"]
+
+
+def safe_recovery_entry(
+    env: ManagerBasedRLEnv,
+    fsm_command_name: str,
+) -> torch.Tensor:
+    """Return one event pulse on entry to SAFE_RECOVERY."""
+    gates = fsm_gates(env, fsm_command_name)
+    return (gates["b_safe"] & gates["just_switched"]).to(dtype=torch.float32)
+
+
 def _yaw_command_penalty_scale(
     env: ManagerBasedRLEnv,
     command_name: str,
@@ -533,6 +1016,10 @@ def yaw_rolling_wheel_slip(
     command_name: str,
     yaw_reference: float,
     threshold: float = 1.0,
+    sensor_cfg_mirror: SceneEntityCfg | None = None,
+    body_asset_cfg_mirror: SceneEntityCfg | None = None,
+    joint_asset_cfg_mirror: SceneEntityCfg | None = None,
+    fsm_command_name: str | None = None,
 ) -> torch.Tensor:
     """Penalize rolling error less aggressively as requested yaw rises."""
     asset: Articulation = env.scene[body_asset_cfg.name]
@@ -543,7 +1030,27 @@ def yaw_rolling_wheel_slip(
     rolling_error = forward_velocity + wheel_radius * wheel_velocity
     in_contact = _yaw_wheel_contacts(env, sensor_cfg, threshold)
     penalty = torch.sum(in_contact * rolling_error.square(), dim=1)
-    return _yaw_command_penalty_scale(env, command_name, yaw_reference) * penalty
+    score = _yaw_command_penalty_scale(env, command_name, yaw_reference) * penalty
+    if fsm_command_name is None:
+        return score
+    if sensor_cfg_mirror is None or body_asset_cfg_mirror is None or joint_asset_cfg_mirror is None:
+        raise ValueError("rolling-slip mirror configs are required when fsm_command_name is set.")
+
+    mirror_asset: Articulation = env.scene[body_asset_cfg_mirror.name]
+    mirror_velocity_w = mirror_asset.data.body_lin_vel_w[:, body_asset_cfg_mirror.body_ids]
+    mirror_orientation_w = mirror_asset.data.body_quat_w[:, body_asset_cfg_mirror.body_ids]
+    mirror_forward_velocity = math_utils.quat_apply_inverse(
+        mirror_orientation_w, mirror_velocity_w
+    )[..., 0]
+    mirror_wheel_velocity = mirror_asset.data.joint_vel[:, joint_asset_cfg_mirror.joint_ids]
+    mirror_error = mirror_forward_velocity + wheel_radius * mirror_wheel_velocity
+    mirror_contact = _yaw_wheel_contacts(env, sensor_cfg_mirror, threshold)
+    mirror_penalty = torch.sum(mirror_contact * mirror_error.square(), dim=1)
+    mirror_score = _yaw_command_penalty_scale(
+        env, command_name, yaw_reference
+    ) * mirror_penalty
+    gates = fsm_gates(env, fsm_command_name)
+    return torch.where(gates["diag_pos"], score, mirror_score) * gates["f_yaw"]
 
 
 def yaw_action_rate_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -581,11 +1088,26 @@ def yaw_lifted_wheel_spin_l2(
     asset_cfg: SceneEntityCfg,
     command_name: str,
     yaw_reference: float,
+    asset_cfg_mirror: SceneEntityCfg | None = None,
+    fsm_command_name: str | None = None,
 ) -> torch.Tensor:
     """Penalize lifted-wheel spin with relief during intentional rotation."""
     asset: Articulation = env.scene[asset_cfg.name]
     penalty = torch.sum(asset.data.joint_vel[:, asset_cfg.joint_ids].square(), dim=1)
-    return _yaw_command_penalty_scale(env, command_name, yaw_reference) * penalty
+    score = _yaw_command_penalty_scale(env, command_name, yaw_reference) * penalty
+    if fsm_command_name is None:
+        return score
+    if asset_cfg_mirror is None:
+        raise ValueError("asset_cfg_mirror is required when fsm_command_name is set.")
+    mirror_asset: Articulation = env.scene[asset_cfg_mirror.name]
+    mirror_penalty = torch.sum(
+        mirror_asset.data.joint_vel[:, asset_cfg_mirror.joint_ids].square(), dim=1
+    )
+    mirror_score = _yaw_command_penalty_scale(
+        env, command_name, yaw_reference
+    ) * mirror_penalty
+    gates = fsm_gates(env, fsm_command_name)
+    return torch.where(gates["diag_pos"], score, mirror_score) * gates["f_yaw"]
 
 
 def track_lin_vel_xy_yaw_frame_exp(

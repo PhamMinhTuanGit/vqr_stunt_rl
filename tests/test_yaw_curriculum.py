@@ -260,3 +260,107 @@ def test_yaw_window_requires_every_gate(
         tracking_ratio_threshold=0.30,
         edge_tracking_ratio_threshold=0.20,
     ) is expected
+
+
+def test_fsm_curriculum_requires_both_diagonals_before_phase_promotion(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A perfect POS lift score must not certify a failed NEG diagonal."""
+    curriculum = _load_curriculums_module(monkeypatch)
+
+    class ConfigManager:
+        def __init__(self, configs):
+            self.configs = configs
+
+        def get_term_cfg(self, name):
+            return self.configs[name]
+
+        def set_term_cfg(self, name, cfg):
+            self.configs[name] = cfg
+
+    def reward_cfg(weight=1.0):
+        return SimpleNamespace(weight=weight, params={"target_clearance": 0.05})
+
+    command = SimpleNamespace(cfg=SimpleNamespace(yaw_rate_range=(-0.25, 0.25), target_clearance=0.05))
+    rewards = ConfigManager(
+        {
+            "lift_clearance": reward_cfg(3.0),
+            "fsm_gated_tracking": reward_cfg(8.0),
+            "transition_progress": reward_cfg(2.0),
+            "spin_center_drift": reward_cfg(0.0),
+            "safe_recovery_entry": reward_cfg(0.0),
+        }
+    )
+    events = ConfigManager(
+        {
+            "randomize_apply_external_force_torque": SimpleNamespace(
+                params={"force_range": (0.0, 0.0), "torque_range": (0.0, 0.0)}
+            ),
+            "randomize_actuator_gains": SimpleNamespace(
+                params={
+                    "stiffness_distribution_params": (1.0, 1.0),
+                    "damping_distribution_params": (1.0, 1.0),
+                }
+            ),
+            "randomize_push_robot": SimpleNamespace(params={"velocity_range": {}}),
+            "randomize_reset_base": SimpleNamespace(params={"pose_range": {}, "velocity_range": {}}),
+        }
+    )
+    env = SimpleNamespace(
+        common_step_counter=1,
+        num_envs=2,
+        device="cpu",
+        step_dt=0.02,
+        episode_length_buf=torch.ones(2, dtype=torch.long),
+        command_manager=SimpleNamespace(get_term=lambda _: command),
+        reward_manager=rewards,
+        event_manager=events,
+        # Both branches entered YAW, but only POS achieved lift/support.
+        _yaw_fsm_pos_yaw_samples=torch.tensor([1, 0]),
+        _yaw_fsm_neg_yaw_samples=torch.tensor([0, 1]),
+        _yaw_fsm_pos_lift_sum=torch.tensor([1.0, 0.0]),
+        _yaw_fsm_neg_lift_sum=torch.tensor([0.0, 0.0]),
+        _yaw_fsm_pos_support_sum=torch.tensor([1.0, 0.0]),
+        _yaw_fsm_neg_support_sum=torch.tensor([0.0, 1.0]),
+        _yaw_fsm_state_steps=torch.tensor(
+            [[2, 1, 0, 0, 0, 0, 0], [1, 0, 0, 0, 1, 0, 0]], dtype=torch.long
+        ),
+        _yaw_fsm_switches=torch.tensor([1, 2], dtype=torch.long),
+        _yaw_fsm_episode_steps=torch.tensor([3, 2], dtype=torch.long),
+    )
+    params = dict(
+        command_name="yaw_rate_cmd",
+        clearance_levels=(0.05,),
+        yaw_rate_levels=(0.25,),
+        dr_scale_levels=(0.30,),
+        tracking_ratio_thresholds=(0.30,),
+        edge_tracking_ratio_thresholds=(0.20,),
+        lift_reward_name="lift_clearance",
+        balance_reward_name="balance",
+        yaw_reward_name="fsm_gated_tracking",
+        torso_contact_termination_name="torso_contact",
+        minimum_base_height=0.35,
+        support_threshold=0.85,
+        lift_progress_threshold=0.80,
+        balance_threshold=0.75,
+        yaw_threshold=0.65,
+        min_evaluated_episodes=2,
+        required_success_rate=0.85,
+        required_consecutive_windows=1,
+        min_clearance_stage_steps=0,
+        min_yaw_stage_steps=0,
+        transition_reward_name="transition_progress",
+        min_directional_episodes=1,
+        reward_ramp_steps=0,
+    )
+
+    state = curriculum.yaw_fsm_task_levels(env, torch.tensor([0, 1]), **params)
+
+    assert state["phase"].item() == 0.0
+    assert state["pos/score"].item() == pytest.approx(1.0)
+    assert state["neg/score"].item() == pytest.approx(0.0)
+    assert state["state_fraction/0"].item() == pytest.approx(3.0 / 5.0)
+    assert state["state_fraction/1"].item() == pytest.approx(1.0 / 5.0)
+    assert state["state_fraction/4"].item() == pytest.approx(1.0 / 5.0)
+    assert state["switch_rate"].item() == pytest.approx(3.0 / 5.0)
+    assert torch.equal(env._yaw_fsm_episode_steps, torch.zeros(2, dtype=torch.long))

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_apply, quat_apply_inverse
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_apply_inverse
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
@@ -47,6 +47,54 @@ def fsm_state_one_hot(
         raise ValueError(f"FSM state values must be in [0, {num_states}), got {state}")
 
     return F.one_hot(state.to(dtype=torch.long), num_classes=num_states).to(dtype=torch.float32)
+
+
+def _fsm_vector_observation(command_term, name: str, num_envs: int) -> torch.Tensor:
+    """Read one per-environment FSM predicate with a stable shape."""
+    if not hasattr(command_term, name):
+        raise TypeError(
+            f"Command term does not expose '{name}'; "
+            "use YawFSMCommand for the FSM task."
+        )
+
+    value = torch.as_tensor(getattr(command_term, name))
+    if value.ndim != 1 or value.shape[0] != num_envs:
+        raise ValueError(
+            f"FSM predicate '{name}' must have shape ({num_envs},), "
+            f"got {tuple(value.shape)}"
+        )
+    return value
+
+
+def fsm_ready_flags(
+    env: ManagerBasedEnv,
+    command_name: str = "yaw_rate_cmd",
+) -> torch.Tensor:
+    """Return ``[positive, negative, four-stand, unsafe]`` FSM predicates.
+
+    The flags are critic-only in the FSM task.  They are kept as explicit
+    scalar channels instead of being inferred from the one-hot state because
+    readiness is useful before a transition is accepted and ``unsafe`` can be
+    true while the FSM is still exposing its previous state for one step.
+    """
+    command_term = env.command_manager.get_term(command_name)
+    flags = (
+        _fsm_vector_observation(command_term, "positive_pose_ready", env.num_envs),
+        _fsm_vector_observation(command_term, "negative_pose_ready", env.num_envs),
+        _fsm_vector_observation(command_term, "four_stand_ready", env.num_envs),
+        _fsm_vector_observation(command_term, "unsafe", env.num_envs),
+    )
+    return torch.stack(flags, dim=-1).to(dtype=torch.float32)
+
+
+def fsm_state_time(
+    env: ManagerBasedEnv,
+    command_name: str = "yaw_rate_cmd",
+) -> torch.Tensor:
+    """Return elapsed time in the current FSM state as one critic channel."""
+    command_term = env.command_manager.get_term(command_name)
+    state_time = _fsm_vector_observation(command_term, "state_time", env.num_envs)
+    return state_time.to(dtype=torch.float32).unsqueeze(-1)
 
 
 def joint_pos_rel_without_wheel(
@@ -108,6 +156,137 @@ def wheel_normal_force(
     fz = sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2]
 
     return torch.clamp(fz, min=0.0) / force_scale
+
+
+def yaw_fsm_predicates(
+    env: ManagerBasedEnv,
+    robot_name: str,
+    support_sensor_cfg: SceneEntityCfg,
+    support_sensor_cfg_mirror: SceneEntityCfg,
+    lifted_asset_cfg: SceneEntityCfg,
+    lifted_asset_cfg_mirror: SceneEntityCfg,
+    all_wheel_sensor_cfg: SceneEntityCfg,
+    torso_sensor_cfg: SceneEntityCfg,
+    target_clearance: float,
+    wheel_radius: float,
+    contact_threshold: float = 1.0,
+    clearance_fraction: float = 0.8,
+    pose_angle_limit: float = 0.35,
+    unsafe_angle_limit: float = 0.80,
+    minimum_base_height: float = 0.35,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute the four batched readiness predicates consumed by ``YawFSMCommand``.
+
+    The body selections are explicit and ordered in the command configuration:
+    ``support_sensor_cfg`` is the POS diagonal (FL, HR), while its mirror is
+    the NEG diagonal (FR, HL).  This keeps contact and clearance predicates on
+    the same canonical mapping used by the FSM rewards.
+    """
+    if target_clearance < 0.0:
+        raise ValueError("target_clearance must be non-negative.")
+    if contact_threshold < 0.0:
+        raise ValueError("contact_threshold must be non-negative.")
+    if wheel_radius < 0.0:
+        raise ValueError("wheel_radius must be non-negative.")
+    if not 0.0 <= clearance_fraction <= 1.0:
+        raise ValueError("clearance_fraction must be in [0, 1].")
+    if pose_angle_limit < 0.0 or unsafe_angle_limit < 0.0:
+        raise ValueError("Pose angle limits must be non-negative.")
+
+    positive_support_contact = wheel_contact(
+        env, support_sensor_cfg, threshold=contact_threshold
+    ).bool()
+    negative_support_contact = wheel_contact(
+        env, support_sensor_cfg_mirror, threshold=contact_threshold
+    ).bool()
+    four_wheel_contact = wheel_contact(
+        env, all_wheel_sensor_cfg, threshold=contact_threshold
+    ).bool()
+    torso_contact = wheel_contact(
+        env, torso_sensor_cfg, threshold=contact_threshold
+    ).bool()
+
+    lifted_clearance = wheel_clearance(
+        env, lifted_asset_cfg, wheel_radius=wheel_radius
+    )
+    lifted_clearance_mirror = wheel_clearance(
+        env, lifted_asset_cfg_mirror, wheel_radius=wheel_radius
+    )
+
+    if positive_support_contact.shape[-1] != 2 or negative_support_contact.shape[-1] != 2:
+        raise ValueError("Yaw FSM support contact selections must contain exactly two bodies.")
+    if lifted_clearance.shape[-1] != 2 or lifted_clearance_mirror.shape[-1] != 2:
+        raise ValueError("Yaw FSM lifted-body selections must contain exactly two bodies.")
+    if four_wheel_contact.shape[-1] != 4:
+        raise ValueError("Yaw FSM four-wheel contact selection must contain exactly four bodies.")
+    if torso_contact.shape[-1] != 1:
+        raise ValueError("Yaw FSM torso contact selection must contain exactly one body.")
+
+    robot = env.scene[robot_name]
+    roll, pitch, _ = euler_xyz_from_quat(robot.data.root_quat_w)
+    pose_is_safe = (torch.abs(roll) < pose_angle_limit) & (torch.abs(pitch) < pose_angle_limit)
+
+    clearance_threshold = clearance_fraction * target_clearance
+    positive_pose_ready = (
+        positive_support_contact.all(dim=-1)
+        & (lifted_clearance >= clearance_threshold).all(dim=-1)
+        & pose_is_safe
+    )
+    negative_pose_ready = (
+        negative_support_contact.all(dim=-1)
+        & (lifted_clearance_mirror >= clearance_threshold).all(dim=-1)
+        & pose_is_safe
+    )
+    four_stand_ready = four_wheel_contact.all(dim=-1) & pose_is_safe
+
+    unsafe = yaw_fsm_unsafe(
+        env,
+        robot_name=robot_name,
+        torso_sensor_cfg=torso_sensor_cfg,
+        minimum_base_height=minimum_base_height,
+        unsafe_angle_limit=unsafe_angle_limit,
+        contact_threshold=contact_threshold,
+    )
+
+    return positive_pose_ready, negative_pose_ready, four_stand_ready, unsafe
+
+
+def yaw_fsm_unsafe(
+    env: ManagerBasedEnv,
+    robot_name: str,
+    torso_sensor_cfg: SceneEntityCfg,
+    minimum_base_height: float,
+    unsafe_angle_limit: float,
+    contact_threshold: float = 1.0,
+) -> torch.Tensor:
+    """Return the single current-state unsafe predicate used by FSM and done.
+
+    Keeping this separate from :func:`yaw_fsm_predicates` is deliberate: a
+    termination term must inspect live sensor/pose data, not the command
+    buffer from the preceding command update.  Both paths nevertheless use
+    exactly the same thresholds and contact interpretation.
+    """
+    if minimum_base_height < 0.0:
+        raise ValueError("minimum_base_height must be non-negative.")
+    if unsafe_angle_limit < 0.0:
+        raise ValueError("unsafe_angle_limit must be non-negative.")
+    if contact_threshold < 0.0:
+        raise ValueError("contact_threshold must be non-negative.")
+
+    torso_contact = wheel_contact(
+        env, torso_sensor_cfg, threshold=contact_threshold
+    ).bool()
+    if torso_contact.ndim != 2 or torso_contact.shape[-1] != 1:
+        raise ValueError("Yaw FSM torso contact selection must contain exactly one body.")
+    robot: Articulation = env.scene[robot_name]
+    roll, pitch, _ = euler_xyz_from_quat(robot.data.root_quat_w)
+    base_height = robot.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    return (
+        torso_contact[:, 0]
+        | (base_height < minimum_base_height)
+        | (torch.abs(roll) > unsafe_angle_limit)
+        | (torch.abs(pitch) > unsafe_angle_limit)
+    )
 
 
 def base_height(

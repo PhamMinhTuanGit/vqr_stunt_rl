@@ -38,6 +38,12 @@ MỌI STATE ── unsafe ──> SAFE_RECOVERY
 SAFE_RECOVERY ── safe và four_stand_ready liên tục đủ dwell ──> FOUR_STAND
 ```
 
+`YAW_POS`/`YAW_NEG` chỉ nhận exit do command sau `yaw_min_dwell = 0.20 s`;
+`unsafe` luôn bỏ qua dwell. Recovery cần `safe` và `four_stand_ready` liên tục
+`0.50 s`. Ở curriculum phase A/B, unsafe terminate sau reset grace `0.15 s`;
+phase C chuyển vào SAFE_RECOVERY thay vì hard-terminate. Swing wheel contact
+liên tục quá `0.20 s` trong YAW vẫn là termination độc lập.
+
 Các bất biến bắt buộc:
 
 - Không tồn tại cạnh `YAW_POS ↔ YAW_NEG`.
@@ -53,6 +59,7 @@ Các bất biến bắt buộc:
   state.
 - `SAFE_RECOVERY` chỉ thoát về `FOUR_STAND` sau khi robot đã safe và
   `four_stand_ready` liên tục đủ dwell; không thoát thẳng sang transition.
+- SAFE không nhận reward dương; positive-reward budget của SAFE phải bằng 0.
 
 ## Quan hệ thời gian với reward và observation
 

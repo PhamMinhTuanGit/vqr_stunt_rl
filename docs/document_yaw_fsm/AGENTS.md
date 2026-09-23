@@ -8,9 +8,10 @@ Chỉ thị implement task `Flat-VQR-Wheel-Yaw-FSM`. Đọc hết file này trư
 2. **`mdp/commands.py` không đổi một ký tự.** Subclass đặt ở `mdp/fsm.py`.
 3. Baseline phải **bit-identical**, chứng minh bằng test, không bằng lập luận.
 4. Không đổi noise model của observation.
-5. Không xoá/đổi tên accumulator mà `_export_yaw_curriculum_state` trong `train.py` đang dùng.
+5. Không xoá/đổi tên accumulator mà task gốc và `_export_yaw_curriculum_state` trong `train.py` đang dùng.
+6. **Không sửa `train.py`, runner/framework training, checkpoint loader hoặc critic warm-up machinery.** Task FSM được train mới hoàn toàn từ iteration 0 bằng luồng training hiện có.
 
-Nếu một yêu cầu trong file này mâu thuẫn với 5 điểm trên → **dừng, hỏi lại**, đừng tự quyết.
+Nếu một yêu cầu trong file này mâu thuẫn với 6 điểm trên → **dừng, hỏi lại**, đừng tự quyết.
 
 ---
 
@@ -118,9 +119,10 @@ Mask cache theo `common_step_counter` trong `mdp/fsm_gates.py`, hàm `fsm_gates(
 
 ### Nhóm 1 — Nền (10, không gate, weight cố định suốt run)
 
-`balance` (+) · `torque` · `action_rate` · `joint_velocity` · `joint_limits` · `lateral_slip` · `undesired_contact` · `planar_velocity` · `low_base_height` · `downward_low_base_velocity`
+`balance` (+, trừ SAFE) · `torque` · `action_rate` · `joint_velocity` · `joint_limits` · `lateral_slip` · `undesired_contact` · `planar_velocity` · `low_base_height` · `downward_low_base_velocity`
 
-Tất cả giữ weight baseline. `balance` là term dương duy nhất luôn bật → lưới an toàn cho ràng buộc "mọi state có ít nhất một term dương".
+Tất cả giữ weight baseline. Trong task FSM, `balance` bị gate khỏi
+`SAFE_RECOVERY`; task gốc giữ nhánh `fsm_command_name=None` bit-identical.
 
 **Không đổi weight nhóm 1 giữa run.**
 
@@ -137,12 +139,12 @@ Tất cả giữ weight baseline. `balance` là term dương duy nhất luôn b�
 | `base_height` | 0.49 | − | − | ● | − | − |
 | `lifted_wheel_spin` | baseline | − | − | ● | − | − |
 | `rolling_slip` | baseline | − | − | ● | − | − |
-| `four_stand_stability` | **3.0** | ● | ◐ out | − | ◐ in | ● |
+| `four_stand_stability` | **3.0** | ● | ◐ out | − | ◐ in | − |
 
 Soft gate:
 ```python
 tau = state_time.clamp(0, 1)
-w = f_four + f_safe + f_trans*(1-tau) + f_return*tau
+w = f_four + f_trans*(1-tau) + f_return*tau
 ```
 
 Chọn chéo bằng **`support_diagonal`**, không bằng `fsm_state` — vì `RETURN_TO_4` phải nhớ chéo đang đỡ.
@@ -242,20 +244,22 @@ Metric `fsm_gated_tracking` chia cho **số step trong YAW_***, không chia tổ
 
 ### Đổi weight giữa pha
 
-Mọi lần đổi weight nhóm 3 làm value function sai ngay → KL spike, `explained_variance` tụt ~50 iter. **Mặc định: ramp tuyến tính 100–200 iter.** Hoặc critic-only warm-up tại biên pha (machinery đã có trong `train.py`).
+Mọi lần đổi weight nhóm 3 làm value function sai ngay → KL spike, `explained_variance` tụt ~50 iter. **Mặc định: ramp tuyến tính 100–200 iter ngay trong `yaw_fsm_task_levels`/reward config.** Không thêm critic-only warm-up hoặc logic đặc biệt vào framework training.
 
 ---
 
-## 8. Model surgery (obs 55→62)
+## 8. Train mới từ đầu (obs 55→62)
 
-**Không from-scratch.** Pad 7 cột vào input layer actor + critic, **init đúng bằng 0** → iteration 0 output bit-identical baseline.
+Task `Flat-VQR-Wheel-Yaw-FSM` được **train from-scratch từ iteration 0**. Không load checkpoint của `Flat-VQR-Wheel-Yaw`, không model surgery và không pad layer từ model cũ.
 
-Hai điều kiện bắt buộc kèm theo:
+- Policy input mới: 55 + one-hot 7 = **62**.
+- Critic input mới: 83 + one-hot 7 + 4 ready/unsafe flag + `state_time` = **95**.
+- Actor và critic được khởi tạo mới theo runner/config hiện hữu; input dimension được suy ra từ environment.
+- Dùng exploration noise khởi tạo bình thường của một run mới. Không có bước “reset `init_noise_std` từ checkpoint”.
+- Không critic warm-up, không freeze actor và không sửa checkpoint loader.
+- `resume=False`; checkpoint của task gốc không phải input của task FSM.
 
-1. **Reset `init_noise_std` lên 0.6–0.8.** Checkpoint hội tụ có std rất nhỏ; giữ nguyên thì policy không bao giờ explore ra transition. **Đây là thứ dễ quên nhất và nó làm hỏng cả run.**
-2. **Critic warm-up** 100–200 iter (freeze actor hoặc LR actor thấp). Reward structure đã đổi → value cũ sai.
-
-Obs: policy 55 + one-hot 7 = **62**. Critic 83 + one-hot 7 + 4 ready/unsafe flag + `state_time` = **95**.
+Nếu cần tách log, chỉ thay `experiment_name` bằng cấu hình khai báo sẵn hoặc CLI; không thêm nhánh xử lý task FSM vào `train.py`.
 
 ---
 
@@ -264,9 +268,9 @@ Obs: policy 55 + one-hot 7 = **62**. Critic 83 + one-hot 7 + 4 ready/unsafe flag
 Log `budget/<state>` = tổng reward **dương** trung bình/step theo state, kiểm mỗi ~100 iter:
 
 ```
-budget[SAFE_RECOVERY] ≤ budget[FOUR_STAND]
+budget[SAFE_RECOVERY] = 0
 budget[TRANSITION]    ≤ budget[YAW_*]
-budget[s] > 0  ∀ s
+budget[s] > 0  ∀ s != SAFE_RECOVERY
 |budget[POS] − budget[NEG]| / mean < 0.05
 ```
 
@@ -293,8 +297,8 @@ for tag, m in (("pos", b_yaw & diag_pos), ("neg", b_yaw & ~diag_pos)):
 | `mdp/terminations.py` | + `fsm_transition_timeout` |
 | `mdp/curriculums.py` | `yaw_fsm_task_levels` |
 | `config/.../yaw_env_fsm_cfg.py` | điền `VQRWheelFlatEnvFSMCfg` |
-| `agents/rsl_rl_ppo_cfg.py` | + `VQRWheelYawFlatFSMPPORunnerCfg` |
-| `scripts/.../train.py` | match 2 task cho checkpoint-injection + critic-warmup; hard-check 18-term **chỉ** task gốc |
+| `agents/rsl_rl_ppo_cfg.py` | Không bắt buộc đổi; ưu tiên tái dùng runner hiện có. Chỉ cho phép config khai báo riêng nếu cần `experiment_name`, không thêm training logic |
+| `scripts/.../train.py` | **KHÔNG ĐỔI** — không checkpoint injection, model surgery, task-specific warm-up hay nhánh FSM |
 | `tests/test_yaw_fsm.py` | mới |
 
 `YawFSMCommandCfg` phải có `class_type: type = YawFSMCommand`. Quên → chạy nhầm class cũ, **im lặng**.
@@ -346,7 +350,7 @@ Decision #5 và #6 đã được chốt; implementation và test phải coi đâ
 
 | # | Quyết định | Mặc định đang dùng |
 |---|---|---|
-| 3 | obs 55→62: resume hay scratch | **Model surgery** + reset `init_noise_std` + critic warm-up (§8) |
+| 3 | obs 55→62: resume hay scratch | **Train from-scratch**, `resume=False`; không model surgery, không load checkpoint task gốc, không critic warm-up (§8) |
 | 4 | SAFE_RECOVERY semantics | Pha A/B **terminate**; pha C bật, entry cost −2.0, **không term dương**, min dwell 0.5s rồi ép về FOUR_STAND (§4) |
 | 5 | Command resampling | Chỉ thay `yaw_cmd`; không reset/ghi FSM state. Abort, return và sign-flip do transition graph quyết định |
 | 6 | Recovery exit | `SAFE_RECOVERY → FOUR_STAND` chỉ khi đã safe và `four_stand_ready` liên tục đủ dwell; không exit thẳng sang `TRANSITION_*` |

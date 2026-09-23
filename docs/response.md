@@ -1,4 +1,6 @@
-Đã nắm đủ ngữ cảnh. Trình bày phương án chi tiết dưới đây — bám vào khung sườn đã tồn tại (file `yaw_env_fsm_cfg.py` trống + registration đã viết sẵn trong `__init__.py` trỏ đến `VQRWheelFlatEnvFSMCfg` và `VQRWheelYawFlatFSMPPORunnerCfg` chưa tồn tại, cùng `VQRYawFSM` 7 trạng thái trong `mdp/fsm.py`).
+> Cập nhật quyết định training: task FSM được train mới từ iteration 0. Không sửa `train.py` hoặc framework training, không resume checkpoint task gốc, không model surgery và không critic warm-up. `docs/document_yaw_fsm/AGENTS.md` là contract hiện hành nếu nội dung cũ bên dưới mâu thuẫn.
+
+Đã nắm đủ ngữ cảnh. Trình bày phương án chi tiết dưới đây — bám vào task `VQRWheelFlatEnvFSMCfg` và `VQRYawFSM` 7 trạng thái.
 
 # Phương án: task `Flat-VQR-Wheel-Yaw-FSM` kế thừa Flat-VQR-Wheel-Yaw + FSM
 
@@ -63,7 +65,7 @@ Cách impl dual-diagonal không copy-paste: reward hàm tính **cả hai chéo**
 ### 3.4 Curriculum — chèn 1 pha mới vào `yaw_task_levels`
 - **Pha A (lift)**: như hiện tại nhưng phải certify **cả 2 đường chéo** (đủ episode mỗi bên).
 - **Pha B (transition) — mới**: từ FOUR_STAND đạt `pose_ready` trong timeout (vd 3s) với success rate ≥0.85 trên 2048 episode, 3 cửa sổ liên tiếp, cả 2 hướng.
-- **Pha C (yaw+DR)**: giữ nguyên scale ladder, metrics chỉ đếm trong YAW_*, giữ accumulator names để `_export_yaw_curriculum_state` trong `train.py` dùng lại được.
+- **Pha C (yaw+DR)**: giữ nguyên scale ladder, metrics chỉ đếm trong YAW_*, giữ accumulator names để không làm hồi quy task gốc.
 - Hysteresis 0.10/0.05 với limit ±0.25: ~60% lệnh vào chuyển tiếp, ~20% đứng yên — cân bằng mode tự nhiên; có thể thêm `stand_probability` trong sampler nếu lệch.
 
 ### 3.5 Terminations
@@ -79,8 +81,8 @@ Giữ `torso_contact` grace 0.15s. Thêm tùy chọn `fsm_transition_timeout` (D
 | `mdp/terminations.py`                        | + `fsm_transition_timeout`                                                                        |
 | `mdp/curriculums.py`                         | `yaw_fsm_task_levels` (mở rộng từ `yaw_task_levels`)                                              |
 | `config/.../yaw_env_fsm_cfg.py` (đang trống) | điền `VQRWheelFlatEnvFSMCfg(VQRWheelFlatEnvCfg)`                                                  |
-| `agents/rsl_rl_ppo_cfg.py`                   | + `VQRWheelYawFlatFSMPPORunnerCfg` (đã được `__init__.py` reference)                              |
-| `scripts/.../train.py`                       | match cả 2 task cho checkpoint-injection + critic-warmup; hard-check 18-term chỉ giữ cho task gốc |
+| `agents/rsl_rl_ppo_cfg.py`                   | ưu tiên tái dùng runner hiện có; config riêng chỉ khi cần tách `experiment_name`                    |
+| `scripts/.../train.py`                       | **không đổi**; không checkpoint injection, model surgery hoặc critic warm-up cho FSM                |
 | `tests/test_yaw_fsm.py`                      | equivalence scalar↔vectorized, dual-diagonal gates, curriculum masking                            |
 
 ### 3.7 Quy trình nghiệm thu
@@ -91,7 +93,7 @@ Giữ `torso_contact` grace 0.15s. Thêm tùy chọn `fsm_transition_timeout` (D
 
 ## 4. Rủi ro chính & giảm thiểu
 - **Reward imbalance 2 mode** (policy "trốn" vào FOUR_STAND hoặc refuse hạ bánh) → ma trận gate ở trên + pha curriculum B ép certify cả 2 hướng.
-- **Obs đổi chiều (55→62)**: không resume trực tiếp checkpoint cũ; from-scratch hoặc model surgery (pad 7 zero vào hàng đầu input layer actor+critic) — chọn ở quyết định 3.
+- **Obs đổi chiều (55→62)**: train from-scratch với actor/critic khởi tạo mới; không load checkpoint cũ và không model surgery.
 - **Threshold predicate cứng** (0.8×target, ngưỡng roll/pitch) sai → bắt đầu hời hợt, tighten dần theo curriculum hoặc tune thủ công sau short run.
 
 Trước khi implement, có 4 quyết định thuộc về bạn:

@@ -277,6 +277,7 @@ class VQRWheelYawCurriculumCfg:
             "lift_reward_name": "lift_clearance",
             "balance_reward_name": "balance",
             "yaw_reward_name": "gated_yaw_tracking",
+            "transition_reward_name": None,
             "torso_contact_termination_name": "torso_contact",
             "minimum_base_height": MIN_BASE_HEIGHT,
             "support_threshold": 0.85,

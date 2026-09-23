@@ -18,6 +18,8 @@ from .commands import *  # noqa: F401, F403
 from .curriculums import *  # noqa: F401, F403
 from .events import *  # noqa: F401, F403
 from .fsm import *  # noqa: F401, F403
+from .fsm_gates import *  # noqa: F401, F403
+from .fsm_mirror import *  # noqa: F401, F403
 from .observations import *  # noqa: F401, F403
 from .rewards import *  # noqa: F401, F403
 from .terminations import *  # noqa: F401, F403
