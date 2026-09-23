@@ -48,6 +48,10 @@ Trong `env.step()`: reward đọc state cũ, obs thấy state mới, cùng một
 
 ## 2. FSM 7 trạng thái
 
+**Thứ tự triển khai bắt buộc:** hoàn thiện transition graph và cho test toàn bộ
+trajectory pass trước khi nối bất kỳ reward/gate FSM nào. Reward không được dùng
+để che hoặc bù cho một graph chuyển trạng thái chưa đúng.
+
 ```
 FOUR_STAND ──yaw>+0.10──► TRANSITION_POS ──pose_ready──► YAW_POS
      ▲                          │                           │
@@ -59,7 +63,9 @@ SAFE_RECOVERY ← unsafe, từ MỌI state
 ```
 
 - Hysteresis: enter `0.10`, exit `0.05`, limit `±0.25` (giữ như `VQRYawFSM` scalar hiện có).
-- **Không có cạnh `YAW_POS ↔ YAW_NEG`.** Sign-flip phải đi `RETURN_TO_4 → FOUR_STAND → TRANSITION_*`. Cấm set thẳng state trong `_resample_command()`.
+- **Không có cạnh `YAW_POS ↔ YAW_NEG` và không có cạnh `RETURN_TO_4 → TRANSITION_*`.** Sign-flip bắt buộc đi đủ trajectory `YAW_POS → RETURN_TO_4 → FOUR_STAND → TRANSITION_NEG` (nhánh ngược lại đối xứng).
+- Trong `RETURN_TO_4`, khi `four_stand_ready=True` thì state kế tiếp **luôn là `FOUR_STAND`**, bất kể `yaw_cmd` hiện tại. Chỉ ở lần update FSM kế tiếp, logic của `FOUR_STAND` mới được phép xét `yaw_cmd` để vào `TRANSITION_POS` hoặc `TRANSITION_NEG`.
+- Command resampling chỉ thay `yaw_cmd`; **không bao giờ reset hoặc ghi trực tiếp FSM state**. FSM tự quyết định abort, return và sign-flip qua transition graph.
 - `TRANSITION_* → RETURN_TO_4` (abort) là cạnh **bắt buộc**. Thiếu nó, lệnh về 0 giữa lúc nâng bánh sẽ không có đường ra hợp lệ.
 - `transition_timeout = 3.0s` → `DoneTerm` (mặc định bật).
 
@@ -301,6 +307,9 @@ for tag, m in (("pos", b_yaw & diag_pos), ("neg", b_yaw & ~diag_pos)):
 test_baseline_bit_identical()   # fsm_command_name=None → torch.equal với ref
 test_fsm_equivalence()          # fuzz 10k step × 1024 env, bit-exact TOÀN BỘ quỹ đạo
                                 # state so với VQRYawFSM scalar — không chỉ state cuối
+test_sign_flip_visits_four()    # YAW_POS → RETURN_TO_4 → FOUR_STAND → TRANSITION_NEG
+                                # cấm RETURN_TO_4 → TRANSITION_NEG trong cùng update
+test_resample_preserves_fsm()   # resample chỉ đổi yaw_cmd, không reset/ghi state
 test_mirror_is_exact()          # lật y mọi body + dấu ω_z,cmd → allclose(r_pos, r_neg)
 test_gate_coverage()            # mọi state có ≥1 term dương
 test_pbs_no_spurious_spike()    # |r_progress| tại just_switched == 0
@@ -331,16 +340,16 @@ Ngưỡng theo dõi:
 
 ---
 
-## 13. Quyết định còn treo
+## 13. Quyết định thiết kế
 
-Danh sách "4 quyết định" từ plan trước **bị cắt cụt, còn thiếu 2**. Mặc định tạm dùng, đánh dấu `TODO(decision)` tại chỗ code để dễ sửa:
+Decision #5 và #6 đã được chốt; implementation và test phải coi đây là contract:
 
 | # | Quyết định | Mặc định đang dùng |
 |---|---|---|
 | 3 | obs 55→62: resume hay scratch | **Model surgery** + reset `init_noise_std` + critic warm-up (§8) |
 | 4 | SAFE_RECOVERY semantics | Pha A/B **terminate**; pha C bật, entry cost −2.0, **không term dương**, min dwell 0.5s rồi ép về FOUR_STAND (§4) |
-| 5 | *(thiếu)* | — hỏi trước khi implement |
-| 6 | *(thiếu)* | — hỏi trước khi implement |
+| 5 | Command resampling | Chỉ thay `yaw_cmd`; không reset/ghi FSM state. Abort, return và sign-flip do transition graph quyết định |
+| 6 | Recovery exit | `SAFE_RECOVERY → FOUR_STAND` chỉ khi đã safe và `four_stand_ready` liên tục đủ dwell; không exit thẳng sang `TRANSITION_*` |
 
 ---
 
