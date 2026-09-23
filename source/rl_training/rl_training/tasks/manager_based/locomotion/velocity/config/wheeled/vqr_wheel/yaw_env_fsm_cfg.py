@@ -293,7 +293,12 @@ class VQRWheelFSMRewardsCfg:
     balance = RewTerm(
         func=mdp.yaw_balance,
         weight=2.0,
-        params={"nominal_roll": 0.0, "nominal_pitch": 0.0, "std": 0.25},
+        params={
+            "nominal_roll": 0.0,
+            "nominal_pitch": 0.0,
+            "std": 0.25,
+            "fsm_command_name": "yaw_rate_cmd",
+        },
     )
     torque = RewTerm(
         func=mdp.yaw_joint_torque_l2,

@@ -88,3 +88,12 @@ class VQRWheelYawFlatPPORunnerCfg(VQRWheelFlatPPORunnerCfg):
         # The yaw/DR curriculum has six yaw stages and needs a longer default
         # horizon than the generic flat locomotion task.
         self.max_iterations = 30000
+
+
+@configclass
+class VQRWheelYawFlatFSMPPORunnerCfg(VQRWheelYawFlatPPORunnerCfg):
+    """Runner settings with an isolated experiment directory for the FSM task."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "vqr_wheel_yaw_flat_fsm"

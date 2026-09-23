@@ -111,6 +111,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import rl_training.tasks  # noqa: F401
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.fsm import YawFSMCommand
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -123,6 +124,18 @@ _YAW_CURRICULUM_PERSISTENT_FIELDS = (
     "_yaw_task_curriculum_stage",
     "_yaw_task_curriculum_yaw_stage",
     "_yaw_task_curriculum_consecutive_passes",
+)
+
+_YAW_FSM_CURRICULUM_CHECKPOINT_KEY = "yaw_fsm_curriculum"
+_YAW_FSM_CURRICULUM_PERSISTENT_FIELDS = (
+    "_yaw_fsm_task_curriculum_phase",
+    "_yaw_task_curriculum_stage",
+    "_yaw_task_curriculum_yaw_stage",
+    "_yaw_task_curriculum_consecutive_passes",
+    "_yaw_fsm_task_curriculum_ramp_start_fsm_gated_tracking",
+    "_yaw_fsm_task_curriculum_ramp_start_transition_progress",
+    "_yaw_fsm_task_curriculum_ramp_start_spin_center_drift",
+    "_yaw_fsm_task_curriculum_ramp_start_safe_recovery_entry",
 )
 
 
@@ -194,6 +207,113 @@ def _install_yaw_curriculum_checkpointing(runner: OnPolicyRunner, task_env) -> N
     runner.save = save_with_yaw_curriculum
 
 
+def _export_yaw_fsm_curriculum_state(task_env) -> dict:
+    """Serialize only scalar FSM curriculum state and relative timing."""
+    values = {
+        name: getattr(task_env, name)
+        for name in _YAW_FSM_CURRICULUM_PERSISTENT_FIELDS
+        if hasattr(task_env, name) and isinstance(getattr(task_env, name), (bool, int, float))
+    }
+    current_step = int(task_env.common_step_counter)
+    stage_start_step = int(
+        getattr(task_env, "_yaw_fsm_task_curriculum_stage_start_step", current_step)
+    )
+    reward_ramp_start_step = int(
+        getattr(task_env, "_yaw_fsm_task_curriculum_reward_ramp_start_step", current_step)
+    )
+    term_params = task_env.cfg.curriculum.task_levels.params
+    return {
+        "version": 1,
+        "values": values,
+        "stage_elapsed_steps": max(0, current_step - stage_start_step),
+        "reward_ramp_elapsed_steps": max(0, current_step - reward_ramp_start_step),
+        "clearance_levels": list(term_params["clearance_levels"]),
+        "yaw_rate_levels": list(term_params["yaw_rate_levels"]),
+        "dr_scale_levels": list(term_params["dr_scale_levels"]),
+    }
+
+
+def _restore_yaw_fsm_curriculum_state(task_env, checkpoint_infos) -> bool:
+    """Restore FSM phase/stages and reapply all phase-dependent configuration."""
+    if not isinstance(checkpoint_infos, dict):
+        return False
+    payload = checkpoint_infos.get(_YAW_FSM_CURRICULUM_CHECKPOINT_KEY)
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return False
+
+    term_cfg = task_env.cfg.curriculum.task_levels
+    term_params = term_cfg.params
+    saved_tables = (
+        payload.get("clearance_levels"),
+        payload.get("yaw_rate_levels"),
+        payload.get("dr_scale_levels"),
+    )
+    active_tables = (
+        list(term_params["clearance_levels"]),
+        list(term_params["yaw_rate_levels"]),
+        list(term_params["dr_scale_levels"]),
+    )
+    if saved_tables != active_tables:
+        print("[WARN] Saved FSM curriculum stage table differs from the active config; ignoring saved state.")
+        return False
+
+    values = payload.get("values")
+    if not isinstance(values, dict):
+        return False
+    allowed_fields = set(_YAW_FSM_CURRICULUM_PERSISTENT_FIELDS)
+    for name, value in values.items():
+        if name in allowed_fields and isinstance(value, (bool, int, float)):
+            setattr(task_env, name, value)
+
+    current_step = int(task_env.common_step_counter)
+    stage_elapsed_steps = max(0, int(payload.get("stage_elapsed_steps", 0)))
+    reward_ramp_elapsed_steps = max(0, int(payload.get("reward_ramp_elapsed_steps", 0)))
+    task_env._yaw_fsm_task_curriculum_stage_start_step = current_step - stage_elapsed_steps
+    task_env._yaw_fsm_task_curriculum_reward_ramp_start_step = (
+        current_step - reward_ramp_elapsed_steps
+    )
+
+    # If a checkpoint is taken exactly on a phase boundary, the curriculum
+    # refreshes these start values on its next call. Seed the active configs
+    # first so a Phase-C restore cannot accidentally restart from Phase A.
+    phase_reward_names = (
+        term_params["yaw_reward_name"],
+        term_params["transition_reward_name"],
+        term_params.get("spin_center_drift_reward_name", "spin_center_drift"),
+        term_params.get("safe_recovery_reward_name", "safe_recovery_entry"),
+    )
+    for reward_name in phase_reward_names:
+        start_name = f"_yaw_fsm_task_curriculum_ramp_start_{reward_name}"
+        if hasattr(task_env, start_name):
+            reward_cfg = task_env.reward_manager.get_term_cfg(reward_name)
+            reward_cfg.weight = float(getattr(task_env, start_name))
+            task_env.reward_manager.set_term_cfg(reward_name, reward_cfg)
+
+    # An empty completion list prevents accumulator consumption while the
+    # curriculum reapplies clearance, command range, DR, gates, and weights.
+    term_cfg.func(task_env, [], **term_params)
+    command_term = task_env.command_manager.get_term(term_params["command_name"])
+    all_env_ids = torch.arange(task_env.num_envs, device=task_env.device)
+    command_term.reset(all_env_ids)
+    return True
+
+
+def _install_yaw_fsm_curriculum_checkpointing(runner: OnPolicyRunner, task_env) -> None:
+    """Inject the distinct FSM curriculum payload into every checkpoint."""
+    original_save = runner.save
+
+    def save_with_yaw_fsm_curriculum(path: str, infos: dict | None = None) -> None:
+        checkpoint_infos = dict(infos) if isinstance(infos, dict) else {}
+        if infos is not None and not isinstance(infos, dict):
+            checkpoint_infos["runner_infos"] = infos
+        checkpoint_infos[_YAW_FSM_CURRICULUM_CHECKPOINT_KEY] = (
+            _export_yaw_fsm_curriculum_state(task_env)
+        )
+        original_save(path, checkpoint_infos)
+
+    runner.save = save_with_yaw_fsm_curriculum
+
+
 def _verify_yaw_reward_config(env, env_cfg) -> None:
     """Print and enforce the source reward contract before any PPO update."""
     reward_manager = env.unwrapped.reward_manager
@@ -211,6 +331,55 @@ def _verify_yaw_reward_config(env, env_cfg) -> None:
     if len(term_names) != 18 or yaw_weight != 8.0:
         raise RuntimeError(
             "Unexpected Flat-VQR-Wheel-Yaw reward config: expected 18 terms and gated_yaw_tracking weight 8.0."
+        )
+
+
+def _verify_yaw_fsm_contract(env, env_cfg) -> None:
+    """Enforce the FSM task contract before constructing the PPO runner."""
+    task_env = env.unwrapped
+    reward_manager = task_env.reward_manager
+    term_names = list(reward_manager.active_terms)
+    required_reward_terms = {
+        "fsm_gated_tracking",
+        "transition_progress",
+        "spin_center_drift",
+        "safe_recovery_entry",
+    }
+    missing_reward_terms = sorted(required_reward_terms.difference(term_names))
+    tracking_weight = (
+        float(reward_manager.get_term_cfg("fsm_gated_tracking").weight)
+        if "fsm_gated_tracking" in term_names
+        else float("nan")
+    )
+    command = task_env.command_manager.get_term("yaw_rate_cmd")
+    required_command_buffers = (
+        "fsm_state",
+        "support_diagonal",
+        "state_time",
+        "just_switched",
+        "positive_pose_ready",
+        "negative_pose_ready",
+        "four_stand_ready",
+        "unsafe",
+        "yaw_entry_pos",
+    )
+    missing_command_buffers = [
+        name for name in required_command_buffers if not hasattr(command, name)
+    ]
+
+    print(f"[INFO] Flat-VQR-Wheel-Yaw-FSM env config source: {inspect.getfile(type(env_cfg))}")
+    print(f"[INFO] Flat-VQR-Wheel-Yaw-FSM reward terms ({len(term_names)}): {term_names}")
+    print(f"[INFO] Flat-VQR-Wheel-Yaw-FSM fsm_gated_tracking weight: {tracking_weight}")
+    if len(term_names) != 22 or missing_reward_terms or tracking_weight != 8.0:
+        raise RuntimeError(
+            "Unexpected Flat-VQR-Wheel-Yaw-FSM reward config: expected 22 terms, "
+            "fsm_gated_tracking weight 8.0, and all required FSM reward terms; "
+            f"missing={missing_reward_terms}."
+        )
+    if not isinstance(command, YawFSMCommand) or missing_command_buffers:
+        raise RuntimeError(
+            "Unexpected Flat-VQR-Wheel-Yaw-FSM command contract: expected YawFSMCommand "
+            f"with all public FSM buffers; missing={missing_command_buffers}."
         )
 
 
@@ -296,8 +465,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     yaw_task_env = env.unwrapped if task_name == "Flat-VQR-Wheel-Yaw" else None
+    yaw_fsm_task_env = env.unwrapped if task_name == "Flat-VQR-Wheel-Yaw-FSM" else None
     if task_name == "Flat-VQR-Wheel-Yaw":
         _verify_yaw_reward_config(env, env_cfg)
+    elif task_name == "Flat-VQR-Wheel-Yaw-FSM":
+        _verify_yaw_fsm_contract(env, env_cfg)
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -346,6 +518,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         elif agent_cfg.resume:
             print("[WARN] Checkpoint has no yaw curriculum state; starting curriculum from stage zero.")
         _install_yaw_curriculum_checkpointing(runner, yaw_task_env)
+
+    if yaw_fsm_task_env is not None:
+        restored = _restore_yaw_fsm_curriculum_state(yaw_fsm_task_env, checkpoint_infos)
+        if restored:
+            print(
+                "[INFO] Restored Flat-VQR-Wheel-Yaw-FSM curriculum: "
+                f"phase={yaw_fsm_task_env._yaw_fsm_task_curriculum_phase}, "
+                f"lift_stage={yaw_fsm_task_env._yaw_task_curriculum_stage}, "
+                f"yaw_stage={yaw_fsm_task_env._yaw_task_curriculum_yaw_stage}."
+            )
+        elif agent_cfg.resume:
+            print(
+                "[WARN] Checkpoint has no FSM yaw curriculum state; "
+                "starting FSM curriculum from Phase A."
+            )
+        _install_yaw_fsm_curriculum_checkpointing(runner, yaw_fsm_task_env)
 
     critic_warmup_iterations = args_cli.critic_warmup_iterations
     if critic_warmup_iterations is None:

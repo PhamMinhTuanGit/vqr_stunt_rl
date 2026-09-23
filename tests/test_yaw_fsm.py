@@ -143,7 +143,9 @@ def test_recovery_needs_continuous_safe_four_stand_and_sign_flip_visits_four():
 
 def test_scalar_and_vector_fsm_are_equivalent_for_batched_trajectories():
     fsm_module = _load_fsm_module()
-    num_envs = 8
+    # 8,192 independently randomized transitions gives the vectorized path
+    # meaningful coverage while keeping this test comfortably CPU-only.
+    num_envs = 32
     vector = fsm_module.YawFSMVectorized(
         num_envs=num_envs, dt=0.02, yaw_min_dwell=0.20, recovery_dwell=0.50
     )
@@ -152,7 +154,7 @@ def test_scalar_and_vector_fsm_are_equivalent_for_batched_trajectories():
         for _ in range(num_envs)
     ]
     generator = torch.Generator().manual_seed(11)
-    for _ in range(60):
+    for _ in range(256):
         yaw = torch.empty(num_envs).uniform_(-0.4, 0.4, generator=generator)
         pos = torch.rand(num_envs, generator=generator) > 0.75
         neg = torch.rand(num_envs, generator=generator) > 0.75
@@ -166,6 +168,20 @@ def test_scalar_and_vector_fsm_are_equivalent_for_batched_trajectories():
             ]
         )
         assert torch.equal(observed.cpu(), expected)
+
+
+def test_vector_fsm_reset_restores_the_canonical_four_stand_state():
+    fsm_module = _load_fsm_module()
+    fsm = fsm_module.YawFSMVectorized(num_envs=4, dt=0.02)
+    fsm.fsm_state[:] = torch.tensor([1, 2, 4, 6])
+    fsm.support_diagonal[:] = torch.tensor([1, 1, -1, -1])
+    fsm.state_time[:] = torch.tensor([0.1, 0.2, 0.3, 0.4])
+
+    fsm.reset(torch.tensor([0, 2, 3]))
+
+    assert torch.equal(fsm.fsm_state, torch.tensor([0, 2, 0, 0]))
+    assert torch.equal(fsm.support_diagonal, torch.tensor([0, 1, 0, 0]))
+    assert torch.equal(fsm.state_time, torch.tensor([0.0, 0.2, 0.0, 0.0]))
 
 
 def test_swing_contact_selection_uses_any_wheel_and_mirrors_exactly():
