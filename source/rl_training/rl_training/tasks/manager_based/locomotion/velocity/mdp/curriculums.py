@@ -767,11 +767,19 @@ def yaw_fsm_task_levels(
                 f"_yaw_fsm_task_curriculum_{suffix}_successes": 0,
                 f"_yaw_fsm_task_curriculum_{suffix}_lift_sum": 0.0,
                 f"_yaw_fsm_task_curriculum_{suffix}_lift_samples": 0,
+                f"_yaw_fsm_task_curriculum_{suffix}_support_sum": 0.0,
+                f"_yaw_fsm_task_curriculum_{suffix}_support_samples": 0,
+                f"_yaw_fsm_task_curriculum_{suffix}_lift_failures": 0,
+                f"_yaw_fsm_task_curriculum_{suffix}_support_failures": 0,
                 f"_yaw_fsm_task_curriculum_{suffix}_command_sum": 0.0,
                 f"_yaw_fsm_task_curriculum_{suffix}_error_sum": 0.0,
                 f"_yaw_fsm_task_curriculum_{suffix}_tracking_samples": 0,
                 f"_yaw_fsm_task_curriculum_{suffix}_drift_sum": 0.0,
                 f"_yaw_fsm_task_curriculum_{suffix}_drift_samples": 0,
+                f"_yaw_fsm_task_curriculum_last_{suffix}_mean_lift_progress": 0.0,
+                f"_yaw_fsm_task_curriculum_last_{suffix}_mean_support_score": 0.0,
+                f"_yaw_fsm_task_curriculum_last_{suffix}_fail_lift_rate": 0.0,
+                f"_yaw_fsm_task_curriculum_last_{suffix}_fail_support_rate": 0.0,
             }
         )
     for name, default in defaults.items():
@@ -798,7 +806,12 @@ def yaw_fsm_task_levels(
             f"_yaw_fsm_telemetry_{suffix}_drift_10s_samples": 0,
             f"_yaw_fsm_telemetry_{suffix}_swing_contact_sum": 0.0,
             f"_yaw_fsm_telemetry_{suffix}_swing_contact_samples": 0,
+            f"_yaw_fsm_telemetry_{suffix}_support_loss_max_steps_sum": 0,
+            f"_yaw_fsm_telemetry_{suffix}_support_loss_episodes": 0,
         })
+        for wheel_name in (("FL", "HR") if suffix == "pos" else ("FR", "HL")):
+            telemetry_defaults[f"_yaw_fsm_telemetry_{suffix}_support_{wheel_name}_sum"] = 0.0
+            telemetry_defaults[f"_yaw_fsm_telemetry_{suffix}_support_{wheel_name}_samples"] = 0
     for name, default in telemetry_defaults.items():
         if not hasattr(env, name):
             setattr(env, name, default)
@@ -855,6 +868,29 @@ def yaw_fsm_task_levels(
             setattr(env, f"{env_name}_lift_samples", getattr(env, f"{env_name}_lift_samples") + int(yaw_samples.sum().item()))
             setattr(
                 env,
+                f"{env_name}_support_sum",
+                getattr(env, f"{env_name}_support_sum") + float(support_sum.sum().item()),
+            )
+            setattr(
+                env,
+                f"{env_name}_support_samples",
+                getattr(env, f"{env_name}_support_samples") + int(yaw_samples.sum().item()),
+            )
+            if phase == 0:
+                setattr(
+                    env,
+                    f"{env_name}_lift_failures",
+                    getattr(env, f"{env_name}_lift_failures")
+                    + int(((lift_score < lift_progress_threshold) & evaluated).sum().item()),
+                )
+                setattr(
+                    env,
+                    f"{env_name}_support_failures",
+                    getattr(env, f"{env_name}_support_failures")
+                    + int(((support_score < support_threshold) & evaluated).sum().item()),
+                )
+            setattr(
+                env,
                 f"{env_name}_command_sum",
                 getattr(env, f"{env_name}_command_sum")
                 + float(episode_buffer(f"_yaw_fsm_{suffix}_command_abs_sum", torch.float32).sum().item()),
@@ -882,6 +918,33 @@ def yaw_fsm_task_levels(
                 getattr(env, f"{env_name}_drift_samples")
                 + int(episode_buffer(f"_yaw_fsm_{suffix}_drift_samples", torch.long).sum().item()),
             )
+
+        if phase == 0:
+            for suffix in ("pos", "neg"):
+                prefix = f"_yaw_fsm_task_curriculum_{suffix}"
+                episodes = max(getattr(env, f"{prefix}_episodes"), 1)
+                setattr(
+                    env,
+                    f"_yaw_fsm_task_curriculum_last_{suffix}_mean_lift_progress",
+                    getattr(env, f"{prefix}_lift_sum")
+                    / max(getattr(env, f"{prefix}_lift_samples"), 1),
+                )
+                setattr(
+                    env,
+                    f"_yaw_fsm_task_curriculum_last_{suffix}_mean_support_score",
+                    getattr(env, f"{prefix}_support_sum")
+                    / max(getattr(env, f"{prefix}_support_samples"), 1),
+                )
+                setattr(
+                    env,
+                    f"_yaw_fsm_task_curriculum_last_{suffix}_fail_lift_rate",
+                    getattr(env, f"{prefix}_lift_failures") / episodes,
+                )
+                setattr(
+                    env,
+                    f"_yaw_fsm_task_curriculum_last_{suffix}_fail_support_rate",
+                    getattr(env, f"{prefix}_support_failures") / episodes,
+                )
 
         if hasattr(env, "_yaw_fsm_state_steps"):
             state_steps = env._yaw_fsm_state_steps[completed_env_ids]
@@ -926,6 +989,17 @@ def yaw_fsm_task_levels(
             setattr(env, f"{prefix}_swing_contact_samples", getattr(env, f"{prefix}_swing_contact_samples") + int(
                 episode_buffer(f"_yaw_fsm_{suffix}_swing_contact_samples", torch.long).sum().item()
             ))
+            setattr(env, f"{prefix}_support_loss_max_steps_sum", getattr(env, f"{prefix}_support_loss_max_steps_sum") + int(
+                episode_buffer(f"_yaw_fsm_{suffix}_support_loss_max_steps", torch.long).sum().item()
+            ))
+            setattr(env, f"{prefix}_support_loss_episodes", getattr(env, f"{prefix}_support_loss_episodes") + int(
+                (episode_buffer(f"_yaw_fsm_{suffix}_yaw_samples", torch.long) > 0).sum().item()
+            ))
+            for wheel_name in (("FL", "HR") if suffix == "pos" else ("FR", "HL")):
+                for field, dtype in (("sum", torch.float32), ("samples", torch.long)):
+                    name = f"support_{wheel_name}_{field}"
+                    increment = episode_buffer(f"_yaw_fsm_{suffix}_{name}", dtype).sum().item()
+                    setattr(env, f"{prefix}_{name}", getattr(env, f"{prefix}_{name}") + increment)
 
     # These are reward-owned episode buffers.  Curriculum executes before
     # manager reset, hence it must clear them after consuming completed data.
@@ -937,7 +1011,17 @@ def yaw_fsm_task_levels(
         env._yaw_fsm_positive_budget[selected_env_ids] = 0.0
         env._yaw_fsm_positive_budget_pos[selected_env_ids] = 0.0
         env._yaw_fsm_positive_budget_neg[selected_env_ids] = 0.0
+    if hasattr(env, "_yaw_fsm_support_loss_run_steps"):
+        env._yaw_fsm_support_loss_run_steps[selected_env_ids] = 0
     for suffix in ("pos", "neg"):
+        name = f"_yaw_fsm_{suffix}_support_loss_max_steps"
+        if hasattr(env, name):
+            getattr(env, name)[selected_env_ids] = 0
+        for wheel_name in (("FL", "HR") if suffix == "pos" else ("FR", "HL")):
+            for field in ("sum", "samples"):
+                name = f"_yaw_fsm_{suffix}_support_{wheel_name}_{field}"
+                if hasattr(env, name):
+                    getattr(env, name)[selected_env_ids] = 0
         for name in (
             f"_yaw_fsm_{suffix}_lift_sum",
             f"_yaw_fsm_{suffix}_support_sum",
@@ -1038,10 +1122,19 @@ def yaw_fsm_task_levels(
         for suffix in ("pos", "neg"):
             prefix = f"_yaw_fsm_task_curriculum_{suffix}"
             for field in (
-                "episodes", "successes", "lift_sum", "lift_samples", "command_sum",
+                "episodes", "successes", "lift_sum", "lift_samples", "support_sum",
+                "support_samples", "lift_failures", "support_failures", "command_sum",
                 "error_sum", "tracking_samples", "drift_sum", "drift_samples",
             ):
-                setattr(env, f"{prefix}_{field}", 0 if field.endswith("samples") or field in {"episodes", "successes", "tracking_samples"} else 0.0)
+                integer_fields = {
+                    "episodes", "successes", "tracking_samples",
+                    "lift_failures", "support_failures",
+                }
+                setattr(
+                    env,
+                    f"{prefix}_{field}",
+                    0 if field.endswith("samples") or field in integer_fields else 0.0,
+                )
 
     phase = env._yaw_fsm_task_curriculum_phase
     lift_stage = env._yaw_task_curriculum_stage
@@ -1148,6 +1241,15 @@ def yaw_fsm_task_levels(
             getattr(env, f"{prefix}_swing_contact_sum")
             / max(getattr(env, f"{prefix}_swing_contact_samples"), 1)
         )
+        telemetry[f"{suffix}/support_loss_max_dwell_s"] = scalar(
+            env.step_dt * getattr(env, f"{prefix}_support_loss_max_steps_sum")
+            / max(getattr(env, f"{prefix}_support_loss_episodes"), 1)
+        )
+        for wheel_name in (("FL", "HR") if suffix == "pos" else ("FR", "HL")):
+            telemetry[f"{suffix}/support_{wheel_name}_rate"] = scalar(
+                getattr(env, f"{prefix}_support_{wheel_name}_sum")
+                / max(getattr(env, f"{prefix}_support_{wheel_name}_samples"), 1)
+            )
 
     return {
         "phase": scalar(phase), "lift_stage": scalar(lift_stage), "yaw_stage": scalar(yaw_stage),
@@ -1158,6 +1260,14 @@ def yaw_fsm_task_levels(
         "neg/episodes": scalar(env._yaw_fsm_task_curriculum_neg_episodes),
         "pos/score": scalar(env._yaw_fsm_task_curriculum_last_pos_score),
         "neg/score": scalar(env._yaw_fsm_task_curriculum_last_neg_score),
+        "pos/mean_lift_progress": scalar(env._yaw_fsm_task_curriculum_last_pos_mean_lift_progress),
+        "neg/mean_lift_progress": scalar(env._yaw_fsm_task_curriculum_last_neg_mean_lift_progress),
+        "pos/mean_support_score": scalar(env._yaw_fsm_task_curriculum_last_pos_mean_support_score),
+        "neg/mean_support_score": scalar(env._yaw_fsm_task_curriculum_last_neg_mean_support_score),
+        "pos/fail_lift_rate": scalar(env._yaw_fsm_task_curriculum_last_pos_fail_lift_rate),
+        "neg/fail_lift_rate": scalar(env._yaw_fsm_task_curriculum_last_neg_fail_lift_rate),
+        "pos/fail_support_rate": scalar(env._yaw_fsm_task_curriculum_last_pos_fail_support_rate),
+        "neg/fail_support_rate": scalar(env._yaw_fsm_task_curriculum_last_neg_fail_support_rate),
         "pos/tracking_ratio": scalar(env._yaw_fsm_task_curriculum_last_pos_tracking_ratio),
         "neg/tracking_ratio": scalar(env._yaw_fsm_task_curriculum_last_neg_tracking_ratio),
         "pos/drift": scalar(env._yaw_fsm_task_curriculum_last_pos_drift),

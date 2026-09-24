@@ -153,6 +153,14 @@ def _yaw_wheel_contacts(
     return torch.linalg.vector_norm(forces, dim=-1) > threshold
 
 
+def _yaw_support_shape(contacts: torch.Tensor) -> torch.Tensor:
+    """Give nearly all support credit only when both selected wheels contact."""
+    c1, c2 = contacts.to(dtype=torch.float32).unbind(dim=1)
+    partial = 0.5 * (c1 + c2)
+    both = c1 * c2
+    return 0.1 * partial + 0.9 * both
+
+
 def _yaw_whole_body_com_xy(asset: Articulation) -> torch.Tensor:
     """Return the mass-weighted whole-body CoM projected onto the ground plane."""
     masses = asset.root_physx_view.get_masses().to(asset.device)
@@ -688,10 +696,9 @@ def fsm_gated_tracking(
 ) -> torch.Tensor:
     """Track signed yaw commands during TRANSITION and YAW states.
 
-    The positive reward is available during transition, while the curriculum
-    tracking accumulators are updated only in ``YAW_POS``/``YAW_NEG``.  The
-    signed command is intentionally used directly, preserving the direction
-    constraint for the mirrored branch.
+    Tracking and lift-scaled support contact are available during transition;
+    curriculum tracking accumulators update only in ``YAW_POS``/``YAW_NEG``.
+    The signed command preserves the direction constraint for either branch.
     """
     if std <= 0.0:
         raise ValueError("std must be positive.")
@@ -711,6 +718,30 @@ def fsm_gated_tracking(
     support_pos = support_pos_contact.to(dtype=torch.float32).prod(dim=1)
     support_neg = support_neg_contact.to(dtype=torch.float32).prod(dim=1)
     support_gate = torch.where(gates["diag_pos"], support_pos, support_neg)
+    lost_support = gates["b_yaw"] & (support_gate == 0.0)
+    if not hasattr(env, "_yaw_fsm_support_loss_run_steps"):
+        env._yaw_fsm_support_loss_run_steps = torch.zeros(
+            env.num_envs, device=support_gate.device, dtype=torch.long
+        )
+    env._yaw_fsm_support_loss_run_steps = torch.where(
+        lost_support,
+        env._yaw_fsm_support_loss_run_steps + 1,
+        torch.zeros_like(env._yaw_fsm_support_loss_run_steps),
+    )
+    for suffix, direction in (("pos", gates["diag_pos"]), ("neg", gates["diag_neg"])):
+        name = f"_yaw_fsm_{suffix}_support_loss_max_steps"
+        if not hasattr(env, name):
+            setattr(env, name, torch.zeros_like(env._yaw_fsm_support_loss_run_steps))
+        previous_max = getattr(env, name)
+        previous_max.copy_(torch.where(
+            direction & lost_support,
+            torch.maximum(previous_max, env._yaw_fsm_support_loss_run_steps),
+            previous_max,
+        ))
+    support_contacts = torch.where(
+        gates["diag_pos"].unsqueeze(1), support_pos_contact, support_neg_contact
+    )
+    support_shape = _yaw_support_shape(support_contacts)
     # The opposite support diagonal is exactly the active swing diagonal.
     swing_contact = select_swing_wheel_contact(
         support_pos_contact,
@@ -767,6 +798,18 @@ def fsm_gated_tracking(
     # diagonal; a strong POS branch must never promote a weak NEG branch.
     yaw_pos_mask = gates["b_yaw"] & gates["diag_pos"]
     yaw_neg_mask = gates["b_yaw"] & gates["diag_neg"]
+    for suffix, contacts, direction_mask, wheel_names in (
+        ("pos", support_pos_contact, yaw_pos_mask, ("FL", "HR")),
+        ("neg", support_neg_contact, yaw_neg_mask, ("FR", "HL")),
+    ):
+        for index, wheel_name in enumerate(wheel_names):
+            _fsm_masked_accumulate(
+                env,
+                contacts[:, index].to(dtype=yaw_command.dtype),
+                direction_mask.to(dtype=yaw_command.dtype),
+                f"_yaw_fsm_{suffix}_support_{wheel_name}_sum",
+                f"_yaw_fsm_{suffix}_support_{wheel_name}_samples",
+            )
     for suffix, direction_mask in (("pos", yaw_pos_mask), ("neg", yaw_neg_mask)):
         mask = direction_mask.to(dtype=yaw_command.dtype)
         _fsm_masked_accumulate(
@@ -851,7 +894,10 @@ def fsm_gated_tracking(
         floor = clearance_gate_floor
     clearance_weight = floor + (1.0 - floor) * lift_progress
     state_gate = gates["f_trans"] + gates["f_yaw"]
-    reward = support_gate * clearance_weight * yaw_tracking * state_gate
+    tracking = support_gate * clearance_weight * yaw_tracking * state_gate
+    # Contact alone gives no bonus while the swing pair is still on the ground.
+    support_bonus = 0.25 * support_shape * lift_progress * state_gate
+    reward = tracking + support_bonus
     _fsm_record_positive_budget(env, gates, "fsm_gated_tracking", reward)
     return reward
 

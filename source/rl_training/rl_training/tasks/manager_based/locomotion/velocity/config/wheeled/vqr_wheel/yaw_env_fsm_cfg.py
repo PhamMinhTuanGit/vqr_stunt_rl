@@ -915,6 +915,30 @@ class VQRWheelFSMObservationsCfg(ObservationsCfg):
 
     @configclass
     class CriticCfg(ObservationsCfg.CriticCfg):
+        support_wheel_alignment = ObsTerm(
+            func=mdp.fsm_support_wheel_alignment,
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+                ),
+                "asset_cfg_mirror": SceneEntityCfg(
+                    "robot", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+                ),
+                "command_name": "yaw_rate_cmd",
+            },
+        )
+        com_support_coordinate = ObsTerm(
+            func=mdp.fsm_com_support_coordinate,
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+                ),
+                "asset_cfg_mirror": SceneEntityCfg(
+                    "robot", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+                ),
+                "command_name": "yaw_rate_cmd",
+            },
+        )
         fsm_state = ObsTerm(
             func=mdp.fsm_state_one_hot,
             params={"command_name": "yaw_rate_cmd", "num_states": 7},

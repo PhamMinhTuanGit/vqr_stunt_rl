@@ -304,10 +304,11 @@ def com_support_coordinate(
 ) -> torch.Tensor:
     """Return whole-body CoM coordinates in the two-wheel support frame.
 
-    The selected bodies must be ordered ``[FL_WHEEL, HR_WHEEL]``.  The output
-    is ``[along_support, lateral_to_support]`` in meters, measured from the
-    support-segment midpoint.  Positive ``along_support`` points from FL to HR;
-    positive lateral is the left normal of that direction in the world XY plane.
+    The selected bodies must be ordered front wheel then hind wheel: FL->HR
+    or FR->HL. The output is ``[along_support, lateral_to_support]`` in meters,
+    measured from the support-segment midpoint. Positive ``along_support``
+    points from the first wheel to the second; positive lateral is the left
+    normal of that direction in the world XY plane.
     """
     robot: Articulation = env.scene[asset_cfg.name]
     support_xy = robot.data.body_pos_w[:, asset_cfg.body_ids, :2]
@@ -332,6 +333,36 @@ def com_support_coordinate(
     along_support = torch.sum(relative_com * tangent, dim=-1)
     lateral_to_support = torch.sum(relative_com * normal, dim=-1)
     return torch.stack((along_support, lateral_to_support), dim=-1)
+
+
+def _fsm_select_support_geometry(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    positive: torch.Tensor,
+    negative: torch.Tensor,
+) -> torch.Tensor:
+    """Select the active support diagonal, with zero geometry in four-wheel stand."""
+    command = env.command_manager.get_term(command_name)
+    diagonal = torch.as_tensor(command.support_diagonal, device=positive.device)
+    if diagonal.shape != positive.shape[:1] or negative.shape != positive.shape:
+        raise ValueError("FSM support geometry requires matching (num_envs, 2) inputs and diagonal state.")
+    return torch.where(
+        (diagonal == 1).unsqueeze(-1),
+        positive,
+        torch.where((diagonal == -1).unsqueeze(-1), negative, torch.zeros_like(positive)),
+    )
+
+
+def fsm_com_support_coordinate(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    asset_cfg_mirror: SceneEntityCfg,
+    command_name: str,
+) -> torch.Tensor:
+    """CoM in FL->HR for POS or FR->HL for NEG; zero when no diagonal is active."""
+    positive = com_support_coordinate(env, asset_cfg)
+    negative = com_support_coordinate(env, asset_cfg_mirror)
+    return _fsm_select_support_geometry(env, command_name, positive, negative)
 
 
 def rolling_lateral_contact_velocity(
@@ -439,3 +470,15 @@ def support_wheel_alignment(
     alignment = torch.abs(torch.sum(axle_w * body_lateral_w.unsqueeze(1), dim=-1))
 
     return alignment
+
+
+def fsm_support_wheel_alignment(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    asset_cfg_mirror: SceneEntityCfg,
+    command_name: str,
+) -> torch.Tensor:
+    """Alignment of the active POS or NEG support pair; zero in four-wheel stand."""
+    positive = support_wheel_alignment(env, asset_cfg)
+    negative = support_wheel_alignment(env, asset_cfg_mirror)
+    return _fsm_select_support_geometry(env, command_name, positive, negative)

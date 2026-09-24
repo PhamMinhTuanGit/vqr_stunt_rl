@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,8 @@ FSM_PATH = (
     / "mdp"
     / "fsm.py"
 )
+FSM_GATES_PATH = FSM_PATH.with_name("fsm_gates.py")
+REWARDS_PATH = FSM_PATH.with_name("rewards.py")
 
 
 def _load_fsm_module():
@@ -31,6 +34,65 @@ def _load_fsm_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_fsm_tracking_reward():
+    """Load the real FSM pose rewards and gates without importing Isaac Sim."""
+    fsm_module = _load_fsm_module()
+    gate_tree = ast.parse(FSM_GATES_PATH.read_text(encoding="utf-8"))
+    gate_names = {"_CACHE_STEP_ATTR", "_CACHE_ATTR", "_step_key", "_required_tensor", "fsm_gates"}
+    gate_nodes = []
+    for node in gate_tree.body:
+        if isinstance(node, ast.Assign) and node.targets[0].id in gate_names:
+            gate_nodes.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in gate_names:
+            gate_nodes.append(node)
+    namespace = {
+        "torch": torch,
+        "VQRFsmState": fsm_module.VQRFsmState,
+        "select_swing_wheel_contact": fsm_module.select_swing_wheel_contact,
+    }
+    exec(compile(ast.Module(body=gate_nodes, type_ignores=[]), FSM_GATES_PATH, "exec"), namespace)
+
+    reward_names = {
+        "_yaw_wheel_contacts",
+        "_yaw_support_shape",
+        "yaw_com_support",
+        "yaw_com_inside_support_segment",
+        "yaw_lift_clearance",
+        "fsm_gated_tracking",
+    }
+    reward_tree = ast.parse(REWARDS_PATH.read_text(encoding="utf-8"))
+    reward_nodes = [
+        node
+        for node in reward_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in reward_names
+    ]
+    class FakeSceneEntityCfg(SimpleNamespace):
+        def __init__(self, name):
+            super().__init__(name=name)
+
+    namespace.update(
+        {
+            "ManagerBasedRLEnv": object,
+            "SceneEntityCfg": FakeSceneEntityCfg,
+            "ContactSensor": object,
+            "RigidObject": object,
+            "_fsm_step_telemetry": lambda *args: None,
+            "_fsm_masked_accumulate": lambda *args: None,
+            "_fsm_masked_accumulate_pair": lambda *args: None,
+            "_fsm_episode_or": lambda *args: None,
+            "_fsm_record_positive_budget": lambda *args: None,
+        }
+    )
+    exec(compile(ast.Module(body=reward_nodes, type_ignores=[]), REWARDS_PATH, "exec"), namespace)
+    namespace["_yaw_lift_progress"] = lambda env, cfg, *args: env.lift_progress[cfg.name]
+    namespace["_yaw_support_geometry"] = lambda env, cfg: (
+        torch.zeros(env.num_envs),
+        torch.full((env.num_envs,), 0.5),
+        torch.ones(env.num_envs),
+    )
+    return namespace, fsm_module.VQRFsmState
 
 
 def test_command_owns_yaw_entry_position_and_reward_has_no_private_anchor():
@@ -81,7 +143,7 @@ def test_command_owns_yaw_entry_position_and_reward_has_no_private_anchor():
     assert "_fsm_spin_entry_pos" not in FSM_PATH.with_name("rewards.py").read_text(encoding="utf-8")
 
 
-def test_vector_fsm_holds_yaw_for_minimum_dwell_but_unsafe_bypasses_it():
+def test_vector_fsm_command_exit_and_unsafe_bypass_pose_loss_grace():
     fsm_module = _load_fsm_module()
     fsm = fsm_module.YawFSMVectorized(
         num_envs=1, dt=0.05, yaw_min_dwell=0.20, recovery_dwell=0.50
@@ -94,12 +156,10 @@ def test_vector_fsm_holds_yaw_for_minimum_dwell_but_unsafe_bypasses_it():
     fsm.update(yaw, true, false, false, false)   # TRANSITION_POS -> YAW_POS
     assert fsm.state.item() == fsm_module.VQRFsmState.YAW_POS
 
-    # A zero command cannot leave YAW for its first four 50 ms frames.
-    for _ in range(4):
-        fsm.update(torch.tensor([0.0]), false, false, false, false)
-        assert fsm.state.item() == fsm_module.VQRFsmState.YAW_POS
+    # A zero command exits immediately, even when pose readiness is lost.
     fsm.update(torch.tensor([0.0]), false, false, false, false)
     assert fsm.state.item() == fsm_module.VQRFsmState.RETURN_TO_4
+    assert fsm._yaw_pose_invalid_time.item() == 0.0
 
     # Safety has absolute priority and does not wait for any command dwell.
     fsm.reset()
@@ -132,8 +192,7 @@ def test_recovery_needs_continuous_safe_four_stand_and_sign_flip_visits_four():
     # in FOUR_STAND; it cannot take a direct sign-flip edge.
     fsm.update(torch.tensor([0.2]), false, false, false, false)
     fsm.update(torch.tensor([0.2]), true, false, false, false)
-    for _ in range(3):
-        fsm.update(torch.tensor([0.0]), false, false, false, false)
+    fsm.update(torch.tensor([0.0]), false, false, false, false)
     assert fsm.state.item() == fsm_module.VQRFsmState.RETURN_TO_4
     fsm.update(torch.tensor([-0.2]), false, false, true, false)
     assert fsm.state.item() == fsm_module.VQRFsmState.FOUR_STAND
@@ -176,12 +235,85 @@ def test_vector_fsm_reset_restores_the_canonical_four_stand_state():
     fsm.fsm_state[:] = torch.tensor([1, 2, 4, 6])
     fsm.support_diagonal[:] = torch.tensor([1, 1, -1, -1])
     fsm.state_time[:] = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    fsm._yaw_pose_invalid_time[:] = torch.tensor([0.02, 0.04, 0.06, 0.08])
 
     fsm.reset(torch.tensor([0, 2, 3]))
 
     assert torch.equal(fsm.fsm_state, torch.tensor([0, 2, 0, 0]))
     assert torch.equal(fsm.support_diagonal, torch.tensor([0, 1, 0, 0]))
     assert torch.equal(fsm.state_time, torch.tensor([0.0, 0.2, 0.0, 0.0]))
+    assert torch.equal(fsm._yaw_pose_invalid_time, torch.tensor([0.0, 0.04, 0.0, 0.0]))
+
+
+def test_yaw_pose_loss_grace_reacquires_the_same_diagonal_after_continuous_loss():
+    fsm_module = _load_fsm_module()
+    state = fsm_module.VQRFsmState
+    false = torch.tensor([False])
+    true = torch.tensor([True])
+    for direction, yaw_state, transition_state in (
+        (1, state.YAW_POS, state.TRANSITION_POS),
+        (-1, state.YAW_NEG, state.TRANSITION_NEG),
+    ):
+        fsm = fsm_module.YawFSMVectorized(num_envs=1, dt=0.02, yaw_pose_loss_grace=0.10)
+        command = torch.tensor([0.2 * direction])
+        positive = true if direction == 1 else false
+        negative = true if direction == -1 else false
+        fsm.update(command, false, false, false, false)
+        fsm.update(command, positive, negative, false, false)
+        assert fsm.state.item() == yaw_state
+        assert fsm.support_diagonal.item() == direction
+
+        for step in range(4):
+            fsm.update(command, false, false, false, false)
+            assert fsm.state.item() == yaw_state
+            assert torch.allclose(fsm._yaw_pose_invalid_time, torch.tensor([0.02 * (step + 1)]))
+
+        # A recovered pose breaks the loss streak; the next four invalid
+        # frames must still be shorter than the five-step grace period.
+        fsm.update(command, positive, negative, false, false)
+        assert fsm._yaw_pose_invalid_time.item() == 0.0
+        for _ in range(4):
+            fsm.update(command, false, false, false, false)
+            assert fsm.state.item() == yaw_state
+        fsm.update(command, false, false, false, false)
+        assert fsm.state.item() == transition_state
+        assert fsm.support_diagonal.item() == direction
+        assert fsm._yaw_pose_invalid_time.item() == 0.0
+
+        fsm.update(command, positive, negative, false, false)
+        assert fsm.state.item() == yaw_state
+        assert fsm.support_diagonal.item() == direction
+
+
+def test_yaw_pose_loss_priority_unsafe_then_command_exit():
+    fsm_module = _load_fsm_module()
+    state = fsm_module.VQRFsmState
+    false = torch.tensor([False])
+    true = torch.tensor([True])
+    for direction, exit_command in ((1, 0.0), (-1, 0.2)):
+        fsm = fsm_module.YawFSMVectorized(num_envs=1, dt=0.02, yaw_pose_loss_grace=0.10)
+        command = torch.tensor([0.2 * direction])
+        positive = true if direction == 1 else false
+        negative = true if direction == -1 else false
+        fsm.update(command, false, false, false, false)
+        fsm.update(command, positive, negative, false, false)
+        for _ in range(4):
+            fsm.update(command, false, false, false, false)
+        fsm.update(torch.tensor([exit_command]), false, false, false, false)
+        assert fsm.state.item() == state.RETURN_TO_4
+        assert fsm._yaw_pose_invalid_time.item() == 0.0
+
+        fsm.reset()
+        fsm.update(command, false, false, false, false)
+        fsm.update(command, positive, negative, false, false)
+        fsm.update(torch.tensor([exit_command]), false, false, false, true)
+        assert fsm.state.item() == state.SAFE_RECOVERY
+        assert fsm._yaw_pose_invalid_time.item() == 0.0
+
+
+def test_yaw_pose_loss_grace_is_exposed_on_command_config():
+    fsm_module = _load_fsm_module()
+    assert fsm_module.YawFSMCommandCfg.yaw_pose_loss_grace == 0.10
 
 
 def test_swing_contact_selection_uses_any_wheel_and_mirrors_exactly():
@@ -210,3 +342,149 @@ def test_swing_contact_selection_uses_any_wheel_and_mirrors_exactly():
         -diagonal,
     )
     assert torch.equal(mirrored, selected)
+
+
+def test_fsm_tracking_support_bonus_requires_lift_and_is_independent_of_yaw_error():
+    rewards, state = _load_fsm_tracking_reward()
+    tracking_reward = rewards["fsm_gated_tracking"]
+    states = torch.tensor(
+        [
+            state.TRANSITION_POS,
+            state.TRANSITION_POS,
+            state.YAW_POS,
+            state.YAW_NEG,
+            state.FOUR_STAND,
+            state.RETURN_TO_4,
+            state.SAFE_RECOVERY,
+            state.TRANSITION_NEG,
+            state.YAW_POS,
+            state.YAW_POS,
+            state.YAW_NEG,
+            state.YAW_NEG,
+        ]
+    )
+    diagonal = torch.tensor([1, 1, 1, -1, 0, 1, 0, -1, 1, 1, -1, -1])
+    forces = torch.zeros(12, 4, 3)
+    forces[:, :, 2] = 2.0
+    forces[2, 3, 2] = 0.0  # POS loses HR: partial bonus, no tracking.
+    forces[9, [0, 3], 2] = 0.0  # POS loses both support wheels.
+    forces[10, 2, 2] = 0.0  # NEG loses HL: mirror of case 2.
+    forces[11, [1, 2], 2] = 0.0  # NEG loses both support wheels.
+    lift = torch.tensor([0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+    yaw_velocity = torch.tensor([0.0, 10.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    command = SimpleNamespace(
+        fsm_state=states,
+        support_diagonal=diagonal,
+        state_time=torch.zeros(12),
+        just_switched=torch.zeros(12, dtype=torch.bool),
+        cfg=SimpleNamespace(yaw_rate_range=(-1.0, 1.0)),
+    )
+    sensor = SimpleNamespace(data=SimpleNamespace(net_forces_w=forces))
+
+    class Scene(dict):
+        sensors = {"contact_forces": sensor}
+
+    root_ang_vel_b = torch.stack([torch.zeros(12), torch.zeros(12), yaw_velocity], dim=1)
+    env = SimpleNamespace(
+        num_envs=12,
+        device="cpu",
+        common_step_counter=0,
+        scene=Scene(robot=SimpleNamespace(data=SimpleNamespace(root_ang_vel_b=root_ang_vel_b))),
+        lift_progress={
+            "lift_pos": lift[:, None].expand(-1, 2),
+            "lift_neg": lift[:, None].expand(-1, 2),
+        },
+        command_manager=SimpleNamespace(
+            get_term=lambda _: command,
+            get_command=lambda _: torch.zeros(12, 1),
+        ),
+    )
+    positive_cfg = SimpleNamespace(name="contact_forces", body_ids=torch.tensor([0, 3]))
+    negative_cfg = SimpleNamespace(name="contact_forces", body_ids=torch.tensor([1, 2]))
+
+    observed = tracking_reward(
+        env,
+        command_name="yaw_rate_cmd",
+        fsm_command_name="yaw_rate_cmd",
+        support_sensor_cfg=positive_cfg,
+        support_sensor_cfg_mirror=negative_cfg,
+        lifted_asset_cfg=SimpleNamespace(name="lift_pos"),
+        lifted_asset_cfg_mirror=SimpleNamespace(name="lift_neg"),
+        wheel_radius=0.091,
+        target_clearance=0.05,
+        std=0.30,
+    )
+    expected = torch.tensor([
+        0.0, 0.25, 0.0125, 0.25, 0.0, 0.0,
+        0.0, 0.0, 1.25, 0.0, 0.0125, 0.0,
+    ])
+    assert torch.allclose(observed, expected, atol=1e-6)
+    # With lift=1 and tracking either blocked or negligible, the +2 maximum
+    # support bonus maps 0/1/2 support contacts to 0/0.05/1 respectively.
+    assert torch.allclose(observed[[9, 2, 1]] * 4.0, torch.tensor([0.0, 0.05, 1.0]))
+    assert torch.allclose(observed[[11, 10, 3]] * 4.0, torch.tensor([0.0, 0.05, 1.0]))
+    assert env._yaw_fsm_pos_support_loss_max_steps[[2, 9]].tolist() == [1, 1]
+    assert env._yaw_fsm_neg_support_loss_max_steps[[10, 11]].tolist() == [1, 1]
+
+
+def test_fsm_pose_rewards_keep_dense_yaw_signal_without_support_contact():
+    rewards, state = _load_fsm_tracking_reward()
+    n = 8
+    command = SimpleNamespace(
+        fsm_state=torch.tensor([
+            state.YAW_POS, state.YAW_POS, state.YAW_POS,
+            state.YAW_NEG, state.YAW_NEG, state.YAW_NEG,
+            state.TRANSITION_POS, state.RETURN_TO_4,
+        ]),
+        support_diagonal=torch.tensor([1, 1, 1, -1, -1, -1, 1, 1]),
+        state_time=torch.zeros(n),
+        just_switched=torch.zeros(n, dtype=torch.bool),
+    )
+    lift_pos = torch.ones(n, 2)
+    lift_neg = torch.ones(n, 2)
+    lift_pos[2] = 0.0
+    lift_neg[5] = 0.0
+    env = SimpleNamespace(
+        num_envs=n,
+        device="cpu",
+        common_step_counter=0,
+        scene={},
+        command_manager=SimpleNamespace(get_term=lambda _: command),
+        lift_progress={"lift_pos": lift_pos, "lift_neg": lift_neg},
+    )
+    fsm_args = {"fsm_command_name": "yaw_rate_cmd"}
+    geom_args = {
+        "asset_cfg": SimpleNamespace(name="robot"),
+        "asset_cfg_mirror": SimpleNamespace(name="robot"),
+    }
+    com = rewards["yaw_com_support"](env, std=0.08, **geom_args, **fsm_args)
+    inside = rewards["yaw_com_inside_support_segment"](
+        env, std=0.05, **geom_args, **fsm_args
+    )
+    expected_geom = torch.ones(n)
+    assert torch.allclose(com, expected_geom)
+    assert torch.allclose(inside, expected_geom)
+
+    lift = rewards["yaw_lift_clearance"](
+        env,
+        asset_cfg=SimpleNamespace(name="lift_pos"),
+        asset_cfg_mirror=SimpleNamespace(name="lift_neg"),
+        wheel_radius=0.091,
+        target_clearance=0.05,
+        **fsm_args,
+    )
+    expected_lift = torch.tensor([1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 0.0])
+    assert torch.allclose(lift, expected_lift)
+
+    # The legacy branch does not inspect FSM contact and retains exact values.
+    legacy_com = rewards["yaw_com_support"](env, geom_args["asset_cfg"], std=0.08)
+    legacy_inside = rewards["yaw_com_inside_support_segment"](
+        env, geom_args["asset_cfg"], std=0.05
+    )
+    legacy_lift = rewards["yaw_lift_clearance"](
+        env, SimpleNamespace(name="lift_pos"), wheel_radius=0.091, target_clearance=0.05
+    )
+    assert torch.equal(legacy_com, torch.ones(n))
+    assert torch.equal(legacy_inside, torch.ones(n))
+    assert torch.equal(legacy_lift, 2.0 * lift_pos.mean(dim=1) - 1.0)

@@ -322,7 +322,19 @@ def test_fsm_curriculum_requires_both_diagonals_before_phase_promotion(
         _yaw_fsm_pos_lift_sum=torch.tensor([1.0, 0.0]),
         _yaw_fsm_neg_lift_sum=torch.tensor([0.0, 0.0]),
         _yaw_fsm_pos_support_sum=torch.tensor([1.0, 0.0]),
-        _yaw_fsm_neg_support_sum=torch.tensor([0.0, 1.0]),
+        _yaw_fsm_neg_support_sum=torch.tensor([0.0, 0.0]),
+        _yaw_fsm_pos_support_loss_max_steps=torch.tensor([3, 0]),
+        _yaw_fsm_neg_support_loss_max_steps=torch.tensor([0, 5]),
+        _yaw_fsm_pos_support_samples=torch.tensor([1, 0]),
+        _yaw_fsm_neg_support_samples=torch.tensor([0, 1]),
+        _yaw_fsm_pos_support_FL_sum=torch.tensor([1.0, 0.0]),
+        _yaw_fsm_pos_support_FL_samples=torch.tensor([1, 0]),
+        _yaw_fsm_pos_support_HR_sum=torch.tensor([0.0, 0.0]),
+        _yaw_fsm_pos_support_HR_samples=torch.tensor([1, 0]),
+        _yaw_fsm_neg_support_FR_sum=torch.tensor([0.0, 0.0]),
+        _yaw_fsm_neg_support_FR_samples=torch.tensor([0, 1]),
+        _yaw_fsm_neg_support_HL_sum=torch.tensor([0.0, 1.0]),
+        _yaw_fsm_neg_support_HL_samples=torch.tensor([0, 1]),
         _yaw_fsm_state_steps=torch.tensor(
             [[2, 1, 0, 0, 0, 0, 0], [1, 0, 0, 0, 1, 0, 0]], dtype=torch.long
         ),
@@ -360,6 +372,24 @@ def test_fsm_curriculum_requires_both_diagonals_before_phase_promotion(
     assert state["phase"].item() == 0.0
     assert state["pos/score"].item() == pytest.approx(1.0)
     assert state["neg/score"].item() == pytest.approx(0.0)
+    assert state["pos/mean_lift_progress"].item() == pytest.approx(1.0)
+    assert state["neg/mean_lift_progress"].item() == pytest.approx(0.0)
+    assert state["pos/mean_support_score"].item() == pytest.approx(1.0)
+    assert state["neg/mean_support_score"].item() == pytest.approx(0.0)
+    assert state["pos/fail_lift_rate"].item() == pytest.approx(0.0)
+    assert state["neg/fail_lift_rate"].item() == pytest.approx(1.0)
+    assert state["pos/fail_support_rate"].item() == pytest.approx(0.0)
+    assert state["neg/fail_support_rate"].item() == pytest.approx(1.0)
+    assert state["pos/support_FL_rate"].item() == pytest.approx(1.0)
+    assert state["pos/support_HR_rate"].item() == pytest.approx(0.0)
+    assert state["neg/support_FR_rate"].item() == pytest.approx(0.0)
+    assert state["neg/support_HL_rate"].item() == pytest.approx(1.0)
+    assert state["pos/support_loss_max_dwell_s"].item() == pytest.approx(0.06)
+    assert state["neg/support_loss_max_dwell_s"].item() == pytest.approx(0.10)
+    assert env._yaw_fsm_pos_support_loss_max_steps.sum().item() == 0
+    assert env._yaw_fsm_neg_support_loss_max_steps.sum().item() == 0
+    assert env._yaw_fsm_pos_support_FL_sum.sum().item() == 0.0
+    assert env._yaw_fsm_neg_support_HL_samples.sum().item() == 0
     assert state["state_fraction/0"].item() == pytest.approx(3.0 / 5.0)
     assert state["state_fraction/1"].item() == pytest.approx(1.0 / 5.0)
     assert state["state_fraction/4"].item() == pytest.approx(1.0 / 5.0)

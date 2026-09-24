@@ -82,16 +82,21 @@ class VQRYawFSM:
         yaw_exit=0.05,
         dt=0.02,
         yaw_min_dwell=0.20,
+        yaw_pose_loss_grace=0.10,
         recovery_dwell=0.5,
     ):
         self.yaw_enter = yaw_enter
         self.yaw_exit = yaw_exit
         self.dt = dt
         self.yaw_min_dwell = yaw_min_dwell
+        if yaw_pose_loss_grace < 0.0:
+            raise ValueError("yaw_pose_loss_grace must be non-negative.")
+        self.yaw_pose_loss_grace = yaw_pose_loss_grace
         self.recovery_dwell = recovery_dwell
         self.state = VQRFsmState.FOUR_STAND
         self.state_time = 0.0
         self._recovery_safe_time = 0.0
+        self._yaw_pose_invalid_time = 0.0
 
     def update(
         self,
@@ -130,8 +135,14 @@ class VQRYawFSM:
                 self.state = VQRFsmState.YAW_POS
 
         elif self.state == VQRFsmState.YAW_POS:
-            if self.state_time >= self.yaw_min_dwell and yaw_cmd < self.yaw_exit:
+            if yaw_cmd < self.yaw_exit:
                 self.state = VQRFsmState.RETURN_TO_4
+            elif positive_pose_ready:
+                self._yaw_pose_invalid_time = 0.0
+            else:
+                self._yaw_pose_invalid_time += self.dt
+                if self._yaw_pose_invalid_time >= self.yaw_pose_loss_grace - 1.0e-6:
+                    self.state = VQRFsmState.TRANSITION_POS
 
         elif self.state == VQRFsmState.TRANSITION_NEG:
             if yaw_cmd > -self.yaw_exit:
@@ -141,13 +152,21 @@ class VQRYawFSM:
                 self.state = VQRFsmState.YAW_NEG
 
         elif self.state == VQRFsmState.YAW_NEG:
-            if self.state_time >= self.yaw_min_dwell and yaw_cmd > -self.yaw_exit:
+            if yaw_cmd > -self.yaw_exit:
                 self.state = VQRFsmState.RETURN_TO_4
+            elif negative_pose_ready:
+                self._yaw_pose_invalid_time = 0.0
+            else:
+                self._yaw_pose_invalid_time += self.dt
+                if self._yaw_pose_invalid_time >= self.yaw_pose_loss_grace - 1.0e-6:
+                    self.state = VQRFsmState.TRANSITION_NEG
 
         elif self.state == VQRFsmState.RETURN_TO_4:
             if four_stand_ready:
                 self.state = VQRFsmState.FOUR_STAND
 
+        if self.state not in (VQRFsmState.YAW_POS, VQRFsmState.YAW_NEG):
+            self._yaw_pose_invalid_time = 0.0
         self.state_time = 0.0 if self.state != previous else self.state_time + self.dt
         return self.state
 
@@ -165,8 +184,9 @@ class YawFSMVectorized:
         yaw_enter: Positive command threshold that starts a transition.
         yaw_exit: Hysteresis threshold used to abort a transition.
         dt: Duration represented by one update, in seconds.
-        yaw_min_dwell: Minimum duration in a YAW state before a command-driven
-            exit to ``RETURN_TO_4`` is accepted. Unsafe always bypasses it.
+        yaw_min_dwell: Retained for compatibility with existing configs.
+        yaw_pose_loss_grace: Continuous invalid YAW pose time before returning
+            to the same diagonal's transition state.
         recovery_dwell: Continuous safe/four-wheel-ready time required to
             leave ``SAFE_RECOVERY``.
     """
@@ -179,6 +199,7 @@ class YawFSMVectorized:
         yaw_exit: float = 0.05,
         dt: float = 0.02,
         yaw_min_dwell: float = 0.20,
+        yaw_pose_loss_grace: float = 0.10,
         recovery_dwell: float = 0.5,
     ):
         self.num_envs = int(num_envs)
@@ -194,6 +215,11 @@ class YawFSMVectorized:
         self.dt = torch.as_tensor(dt, dtype=torch.float32, device=self.device)
         self.yaw_min_dwell = torch.as_tensor(
             yaw_min_dwell, dtype=torch.float32, device=self.device
+        )
+        if yaw_pose_loss_grace < 0.0:
+            raise ValueError("yaw_pose_loss_grace must be non-negative.")
+        self.yaw_pose_loss_grace = torch.as_tensor(
+            yaw_pose_loss_grace, dtype=torch.float32, device=self.device
         )
         self.recovery_dwell = torch.as_tensor(
             recovery_dwell, dtype=torch.float32, device=self.device
@@ -215,6 +241,9 @@ class YawFSMVectorized:
             self.num_envs, dtype=torch.bool, device=self.device
         )
         self._recovery_safe_time = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._yaw_pose_invalid_time = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
         )
 
@@ -264,6 +293,7 @@ class YawFSMVectorized:
         self.state_time[index] = 0.0
         self.just_switched[index] = False
         self._recovery_safe_time[index] = 0.0
+        self._yaw_pose_invalid_time[index] = 0.0
 
     def update(
         self,
@@ -324,20 +354,40 @@ class YawFSMVectorized:
             next_state,
         )
 
-        # TRANSITION may always abort.  YAW exits are intentionally held for a
-        # short dwell so a resampled/noisy command cannot immediately undo a
-        # completed lift.  The unsafe branch above bypasses this dwell.
+        # A command exit takes priority over a temporary loss of pose readiness.
         abort_pos = active & (
             (transition_pos & (yaw < self.yaw_exit))
-            | (yaw_pos & (self.state_time >= self.yaw_min_dwell) & (yaw < self.yaw_exit))
+            | (yaw_pos & (yaw < self.yaw_exit))
         )
         abort_neg = active & (
             (transition_neg & (yaw > -self.yaw_exit))
-            | (yaw_neg & (self.state_time >= self.yaw_min_dwell) & (yaw > -self.yaw_exit))
+            | (yaw_neg & (yaw > -self.yaw_exit))
         )
         next_state = torch.where(
             abort_pos | abort_neg,
             torch.full_like(previous, int(VQRFsmState.RETURN_TO_4)),
+            next_state,
+        )
+
+        invalid_yaw_pose = active & ~(abort_pos | abort_neg) & (
+            (yaw_pos & ~positive_ready) | (yaw_neg & ~negative_ready)
+        )
+        invalid_time = torch.where(
+            invalid_yaw_pose,
+            self._yaw_pose_invalid_time + self.dt,
+            torch.zeros_like(self._yaw_pose_invalid_time),
+        )
+        pose_loss_elapsed = invalid_yaw_pose & (
+            invalid_time >= self.yaw_pose_loss_grace - 1.0e-6
+        )
+        next_state = torch.where(
+            pose_loss_elapsed & yaw_pos,
+            torch.full_like(previous, int(VQRFsmState.TRANSITION_POS)),
+            next_state,
+        )
+        next_state = torch.where(
+            pose_loss_elapsed & yaw_neg,
+            torch.full_like(previous, int(VQRFsmState.TRANSITION_NEG)),
             next_state,
         )
 
@@ -377,6 +427,12 @@ class YawFSMVectorized:
         )
         self._recovery_safe_time.copy_(recovery_time)
         self._recovery_safe_time.masked_fill_(recover, 0.0)
+        still_in_yaw = (next_state == int(VQRFsmState.YAW_POS)) | (
+            next_state == int(VQRFsmState.YAW_NEG)
+        )
+        self._yaw_pose_invalid_time.copy_(
+            torch.where(still_in_yaw, invalid_time, torch.zeros_like(invalid_time))
+        )
 
         switched = next_state != previous
 
@@ -437,6 +493,7 @@ class YawFSMCommand(YawRateCommand):
             yaw_exit=cfg.yaw_exit,
             dt=env.step_dt,
             yaw_min_dwell=cfg.yaw_min_dwell,
+            yaw_pose_loss_grace=cfg.yaw_pose_loss_grace,
             recovery_dwell=cfg.recovery_dwell,
         )
         self._fsm_state = self._fsm.fsm_state
@@ -587,6 +644,7 @@ class YawFSMCommandCfg(YawRateCommandCfg):
     yaw_enter: float = 0.10
     yaw_exit: float = 0.05
     yaw_min_dwell: float = 0.20
+    yaw_pose_loss_grace: float = 0.10
     recovery_dwell: float = 0.50
     support_sensor_cfg: SceneEntityCfg | None = None
     support_sensor_cfg_mirror: SceneEntityCfg | None = None

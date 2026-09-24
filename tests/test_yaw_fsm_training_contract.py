@@ -61,6 +61,7 @@ def test_fsm_balance_is_gated_and_reward_counts_are_isolated():
 
     assert len(baseline) == 18
     assert len(fsm) == 22
+    assert "support_contact" not in fsm
 
     fsm_balance_params = ast.literal_eval(_keyword(fsm["balance"], "params"))
     baseline_balance_params = ast.literal_eval(_keyword(baseline["balance"], "params"))
