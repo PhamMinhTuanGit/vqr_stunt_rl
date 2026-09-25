@@ -56,7 +56,9 @@ def _load_fsm_tracking_reward():
 
     reward_names = {
         "_yaw_wheel_contacts",
+        "_yaw_support_load_quality",
         "_yaw_support_shape",
+        "yaw_transition_support_load",
         "yaw_com_support",
         "yaw_com_inside_support_segment",
         "yaw_lift_clearance",
@@ -625,11 +627,14 @@ def test_fsm_pose_rewards_keep_dense_yaw_signal_without_support_contact():
     lift_neg = torch.ones(n, 2)
     lift_pos[2] = 0.0
     lift_neg[5] = 0.0
+    forces = torch.zeros(n, 4, 3)
+    forces[..., 2] = 80.0
+    sensor = SimpleNamespace(data=SimpleNamespace(net_forces_w=forces))
     env = SimpleNamespace(
         num_envs=n,
         device="cpu",
         common_step_counter=0,
-        scene={},
+        scene=SimpleNamespace(sensors={"contact_forces": sensor}),
         command_manager=SimpleNamespace(get_term=lambda _: command),
         lift_progress={"lift_pos": lift_pos, "lift_neg": lift_neg},
     )
@@ -653,6 +658,8 @@ def test_fsm_pose_rewards_keep_dense_yaw_signal_without_support_contact():
         asset_cfg_mirror=SimpleNamespace(name="lift_neg"),
         wheel_radius=0.091,
         target_clearance=0.05,
+        support_sensor_cfg=SimpleNamespace(name="contact_forces", body_ids=[0, 3]),
+        support_sensor_cfg_mirror=SimpleNamespace(name="contact_forces", body_ids=[1, 2]),
         **fsm_args,
     )
     expected_lift = torch.tensor([1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 0.0])
@@ -669,6 +676,82 @@ def test_fsm_pose_rewards_keep_dense_yaw_signal_without_support_contact():
     assert torch.equal(legacy_com, torch.ones(n))
     assert torch.equal(legacy_inside, torch.ones(n))
     assert torch.equal(legacy_lift, 2.0 * lift_pos.mean(dim=1) - 1.0)
+
+
+def test_transition_support_load_uses_normal_force_and_mirrors_diagonals():
+    rewards, state = _load_fsm_tracking_reward()
+    states = torch.tensor([
+        state.TRANSITION_POS, state.TRANSITION_NEG,
+        state.YAW_POS, state.RETURN_TO_4, state.TRANSITION_POS,
+    ])
+    command = SimpleNamespace(
+        fsm_state=states,
+        support_diagonal=torch.tensor([1, -1, 1, -1, 1]),
+        state_time=torch.zeros(5),
+        just_switched=torch.zeros(5, dtype=torch.bool),
+    )
+    forces = torch.zeros(5, 4, 3)
+    forces[0, 0, 2], forces[0, 3, 2] = 80.0, 40.0  # POS: FL + HR
+    forces[1, 1, 2], forces[1, 2, 2] = 80.0, 40.0  # NEG: FR + HL
+    forces[2, [0, 3], 2] = 80.0
+    forces[3, [1, 2], 2] = 80.0
+    forces[4, 0, 2] = 80.0
+    forces[4, 3, 0] = 500.0  # Large tangential force is not normal support.
+    sensor = SimpleNamespace(data=SimpleNamespace(net_forces_w=forces))
+    env = SimpleNamespace(
+        num_envs=5, device="cpu", common_step_counter=0,
+        scene=SimpleNamespace(sensors={"contact_forces": sensor}),
+        command_manager=SimpleNamespace(get_term=lambda _: command),
+    )
+    reward = rewards["yaw_transition_support_load"](
+        env,
+        sensor_cfg=SimpleNamespace(name="contact_forces", body_ids=[0, 3]),
+        sensor_cfg_mirror=SimpleNamespace(name="contact_forces", body_ids=[1, 2]),
+        fsm_command_name="yaw_rate_cmd",
+        target_force_n=80.0,
+    )
+    assert torch.allclose(reward, torch.tensor([0.55, 0.55, 0.0, 0.0, 0.10]))
+
+
+def test_transition_lift_keeps_exploration_credit_but_full_credit_needs_support():
+    rewards, state = _load_fsm_tracking_reward()
+    command = SimpleNamespace(
+        fsm_state=torch.tensor([
+            state.TRANSITION_POS, state.TRANSITION_NEG,
+            state.TRANSITION_POS, state.TRANSITION_NEG,
+            state.TRANSITION_POS, state.YAW_NEG, state.TRANSITION_POS,
+        ]),
+        support_diagonal=torch.tensor([1, -1, 1, -1, 1, -1, 1]),
+        state_time=torch.zeros(7),
+        just_switched=torch.zeros(7, dtype=torch.bool),
+    )
+    forces = torch.zeros(7, 4, 3)
+    forces[2, [0, 3], 2] = 80.0
+    forces[3, [1, 2], 2] = 80.0
+    forces[4, 0, 2], forces[4, 3, 2] = 80.0, 40.0
+    sensor = SimpleNamespace(data=SimpleNamespace(net_forces_w=forces))
+    lift_pos = torch.ones(7, 2)
+    lift_neg = torch.ones(7, 2)
+    lift_pos[6] = 0.0
+    env = SimpleNamespace(
+        num_envs=7, device="cpu", common_step_counter=0,
+        scene=SimpleNamespace(sensors={"contact_forces": sensor}),
+        command_manager=SimpleNamespace(get_term=lambda _: command),
+        lift_progress={"pos": lift_pos, "neg": lift_neg},
+    )
+    reward = rewards["yaw_lift_clearance"](
+        env,
+        asset_cfg=SimpleNamespace(name="pos"),
+        asset_cfg_mirror=SimpleNamespace(name="neg"),
+        support_sensor_cfg=SimpleNamespace(name="contact_forces", body_ids=[0, 3]),
+        support_sensor_cfg_mirror=SimpleNamespace(name="contact_forces", body_ids=[1, 2]),
+        wheel_radius=0.091, target_clearance=0.05,
+        fsm_command_name="yaw_rate_cmd",
+        support_force_target_n=80.0,
+        transition_ungated_fraction=0.35,
+    )
+    assert torch.allclose(reward, torch.tensor([0.35, 0.35, 1.0, 1.0, 0.7075, 1.0, -1.0]))
+    assert torch.equal(env._yaw_lift_min_progress_sum, torch.tensor([1., 1., 1., 1., 1., 1., 0.]))
 
 
 def test_return_landing_and_completion_bonus_are_mirrored_one_time_events():

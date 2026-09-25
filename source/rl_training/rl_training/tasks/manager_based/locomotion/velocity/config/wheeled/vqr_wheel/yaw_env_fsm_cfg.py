@@ -57,6 +57,8 @@ YAW_EDGE_TRACKING_RATIO_THRESHOLDS = (0.20, 0.25, 0.30, 0.35, 0.40, 0.45)
 # bound so the scale ladder cannot hide circular drift.
 FSM_DRIFT_THRESHOLDS = (0.08, 0.08, 0.08, 0.08, 0.08, 0.08)
 YAW_REF = 1.00
+SUPPORT_LOAD_TARGET_N = 80.0
+TRANSITION_LIFT_UNGATED_FRACTION = 0.35
 
 # Reward-rebalance baseline is stage-dependent. On resume at yaw_limit=0.25,
 # a null-yaw policy can start near mean reward 300 because yaw tracking is easy;
@@ -279,14 +281,11 @@ class VQRWheelRewardsCfg:
 
 @configclass
 class VQRWheelFSMRewardsCfg:
-    """The 22-term reward contract for ``Flat-VQR-Wheel-Yaw-FSM``.
+    """The 25-term reward contract for ``Flat-VQR-Wheel-Yaw-FSM``.
 
     The first ten terms are the unchanged baseline safety/regularization
-    terms.  The next eight terms are state-gated geometry terms, and the last
-    four terms provide FSM tracking, potential shaping, drift control, and
-    recovery-entry bookkeeping.  POS/NEG geometry is selected through the
-    command's ``support_diagonal`` buffer rather than by duplicating reward
-    terms.
+    terms.  POS/NEG phase rewards select their diagonal through the command's
+    ``support_diagonal`` buffer rather than duplicating terms.
     """
 
     # ------------------------------ Group 1: always-on baseline ------------------------------
@@ -421,6 +420,20 @@ class VQRWheelFSMRewardsCfg:
             "fsm_command_name": "yaw_rate_cmd",
         },
     )
+    transition_support_load = RewTerm(
+        func=mdp.yaw_transition_support_load,
+        weight=3.0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+            "sensor_cfg_mirror": SceneEntityCfg(
+                "contact_forces", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "fsm_command_name": "yaw_rate_cmd",
+            "target_force_n": SUPPORT_LOAD_TARGET_N,
+        },
+    )
     lift_clearance = RewTerm(
         func=mdp.yaw_lift_clearance,
         weight=3.0,
@@ -431,6 +444,14 @@ class VQRWheelFSMRewardsCfg:
             "asset_cfg_mirror": SceneEntityCfg(
                 "robot", body_names=LIFTED_WHEEL_NAMES_MIRROR, preserve_order=True
             ),
+            "support_sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+            "support_sensor_cfg_mirror": SceneEntityCfg(
+                "contact_forces", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "support_force_target_n": SUPPORT_LOAD_TARGET_N,
+            "transition_ungated_fraction": TRANSITION_LIFT_UNGATED_FRACTION,
             "wheel_radius": WHEEL_RADIUS,
             "target_clearance": LIFT_CLEARANCE_LEVELS[0],
             "fsm_command_name": "yaw_rate_cmd",

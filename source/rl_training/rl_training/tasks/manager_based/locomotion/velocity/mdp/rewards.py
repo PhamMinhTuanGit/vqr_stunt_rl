@@ -184,6 +184,40 @@ def _yaw_wheel_contacts(
     return torch.linalg.vector_norm(forces, dim=-1) > threshold
 
 
+def _yaw_support_load_quality(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    target_force_n: float,
+) -> torch.Tensor:
+    """Score both wheels' upward normal load on the flat ground in [0, 1]."""
+    if target_force_n <= 0.0:
+        raise ValueError("target_force_n must be positive.")
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    forces = sensor.data.net_forces_w[:, sensor_cfg.body_ids]
+    if forces.ndim != 3 or forces.shape[1:] != (2, 3):
+        raise ValueError("Support load requires exactly two wheel force vectors per environment.")
+    per_wheel = torch.clamp(forces[..., 2] / target_force_n, min=0.0, max=1.0)
+    # The weaker wheel dominates; one loaded wheel still provides a small
+    # exploration signal toward recovering the other contact.
+    return 0.8 * per_wheel.amin(dim=1) + 0.2 * per_wheel.mean(dim=1)
+
+
+def yaw_transition_support_load(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    sensor_cfg_mirror: SceneEntityCfg,
+    fsm_command_name: str,
+    target_force_n: float,
+) -> torch.Tensor:
+    """Reward load on the selected support diagonal during TRANSITION only."""
+    gates = fsm_gates(env, fsm_command_name)
+    pos = _yaw_support_load_quality(env, sensor_cfg, target_force_n)
+    neg = _yaw_support_load_quality(env, sensor_cfg_mirror, target_force_n)
+    reward = torch.where(gates["diag_pos"], pos, neg) * gates["f_trans"]
+    _fsm_record_positive_budget(env, gates, "transition_support_load", reward)
+    return reward
+
+
 def _yaw_support_shape(contacts: torch.Tensor) -> torch.Tensor:
     """Give nearly all support credit only when both selected wheels contact."""
     c1, c2 = contacts.to(dtype=torch.float32).unbind(dim=1)
@@ -386,12 +420,18 @@ def yaw_lift_clearance(
     target_clearance: float,
     asset_cfg_mirror: SceneEntityCfg | None = None,
     fsm_command_name: str | None = None,
+    support_sensor_cfg: SceneEntityCfg | None = None,
+    support_sensor_cfg_mirror: SceneEntityCfg | None = None,
+    support_force_target_n: float = 80.0,
+    transition_ungated_fraction: float = 0.35,
 ) -> torch.Tensor:
     """Shape lifted-wheel clearance with partial credit and a four-wheel penalty.
 
     Each selected wheel contributes independently. The returned score is in
     ``[-1, 1]``: both wheels on the ground score ``-1``, lifting either wheel
     improves the score, and both wheels must reach the target to score ``1``.
+    In FSM TRANSITION, positive credit is partly gated by support load;
+    the raw clearance metric and YAW reward are unchanged.
     """
     progress = _yaw_lift_progress(env, asset_cfg, wheel_radius, target_clearance)
 
@@ -409,6 +449,10 @@ def yaw_lift_clearance(
         return score
     if asset_cfg_mirror is None:
         raise ValueError("asset_cfg_mirror is required when fsm_command_name is set.")
+    if support_sensor_cfg is None or support_sensor_cfg_mirror is None:
+        raise ValueError("Both support sensor configs are required when fsm_command_name is set.")
+    if not 0.0 < transition_ungated_fraction < 1.0:
+        raise ValueError("transition_ungated_fraction must be in (0, 1).")
     mirror_progress = _yaw_lift_progress(
         env,
         asset_cfg_mirror,
@@ -424,9 +468,15 @@ def yaw_lift_clearance(
         env._yaw_lift_min_progress_samples = torch.zeros_like(min_progress, dtype=torch.long)
     env._yaw_lift_min_progress_sum += min_progress
     env._yaw_lift_min_progress_samples += 1
-    reward = torch.where(gates["diag_pos"], score, mirror_score) * (
-        gates["f_trans"] + gates["f_yaw"]
-    )
+    selected_score = torch.where(gates["diag_pos"], score, mirror_score)
+    support_pos = _yaw_support_load_quality(env, support_sensor_cfg, support_force_target_n)
+    support_neg = _yaw_support_load_quality(env, support_sensor_cfg_mirror, support_force_target_n)
+    support_quality = torch.where(gates["diag_pos"], support_pos, support_neg)
+    lift_gate = transition_ungated_fraction + (1.0 - transition_ungated_fraction) * support_quality
+    # Keep the no-lift penalty intact.  Only positive lift credit is reduced
+    # when support is weak, so dropping a wheel cannot erase that penalty.
+    transition_score = torch.clamp(selected_score, max=0.0) + torch.relu(selected_score) * lift_gate
+    reward = transition_score * gates["f_trans"] + selected_score * gates["f_yaw"]
     _fsm_record_positive_budget(env, gates, "lift_clearance", reward)
     return reward
 
