@@ -40,6 +40,35 @@ parser.add_argument("--real-time", action="store_true", default=False, help="Run
 parser.add_argument("--keyboard", action="store_true", default=False, help="Whether to use keyboard.")
 parser.add_argument("--max_steps", type=int, default=None, help="Stop playback after this many environment steps.")
 parser.add_argument(
+    "--yaw_contact_trace",
+    type=str,
+    default=None,
+    help="Write per-step yaw FSM wheel clearance and contact forces to this CSV path.",
+)
+parser.add_argument(
+    "--yaw_contact_env_id",
+    type=int,
+    default=0,
+    help="Environment index to record with --yaw_contact_trace; use -1 for all environments.",
+)
+parser.add_argument(
+    "--yaw_contact_limit",
+    type=float,
+    default=0.25,
+    help="Yaw command limit in rad/s for contact tracing (default: training stage 0).",
+)
+parser.add_argument(
+    "--yaw_contact_ready_dwell",
+    type=float,
+    default=0.0,
+    help="Continuous ready-pose dwell in seconds during tracing (default: 0, matching the 2026-09-24 run).",
+)
+parser.add_argument(
+    "--yaw_contact_stochastic",
+    action="store_true",
+    help="Sample actions from the checkpoint policy during contact tracing, as in PPO training.",
+)
+parser.add_argument(
     "--reward_diagnostics",
     action="store_true",
     default=False,
@@ -95,6 +124,7 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 """Rest everything follows."""
 
 import gymnasium as gym
+import csv
 import time
 import torch
 
@@ -129,11 +159,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     task_name = args_cli.task.split(":")[-1]
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
-    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else 50
+    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else (1 if args_cli.yaw_contact_trace else 50)
     if args_cli.reward_diagnostics_interval <= 0:
         raise ValueError("--reward_diagnostics_interval must be positive.")
     if args_cli.max_steps is not None and args_cli.max_steps <= 0:
         raise ValueError("--max_steps must be positive.")
+    if args_cli.yaw_contact_trace and not -1 <= args_cli.yaw_contact_env_id < env_cfg.scene.num_envs:
+        raise ValueError("--yaw_contact_env_id must be -1 or select an existing environment.")
+    if args_cli.yaw_contact_trace and args_cli.yaw_contact_limit <= 0.0:
+        raise ValueError("--yaw_contact_limit must be positive.")
+    if args_cli.yaw_contact_trace and args_cli.yaw_contact_ready_dwell < 0.0:
+        raise ValueError("--yaw_contact_ready_dwell must be non-negative.")
+    if args_cli.yaw_contact_stochastic and not args_cli.yaw_contact_trace:
+        raise ValueError("--yaw_contact_stochastic requires --yaw_contact_trace.")
 
     # handle deprecated configurations (convert old policy format to new actor/critic format)
     # agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
@@ -151,9 +189,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.scene.terrain.terrain_generator.num_cols = 5
         env_cfg.scene.terrain.terrain_generator.curriculum = False
 
-    # disable randomization and training-only curricula for play
-    env_cfg.observations.policy.enable_corruption = False
-    if env_cfg.events is not None:
+    # Contact tracing keeps the stage-0 training curriculum and perturbations.
+    # Ordinary playback retains its established evaluation behavior.
+    if not args_cli.yaw_contact_trace:
+        env_cfg.observations.policy.enable_corruption = False
+    if env_cfg.events is not None and not args_cli.yaw_contact_trace:
         for event_name in (
             "randomize_apply_external_force_torque",
             "randomize_push_robot",
@@ -162,7 +202,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if hasattr(env_cfg.events, event_name):
                 setattr(env_cfg.events, event_name, None)
 
-    if env_cfg.curriculum is not None:
+    if args_cli.yaw_contact_trace:
+        env_cfg.commands.yaw_rate_cmd.yaw_rate_range = (
+            -args_cli.yaw_contact_limit,
+            args_cli.yaw_contact_limit,
+        )
+        # The checkpoint used for this audit predates ready-pose dwell.  Keep
+        # playback's YAW-entry criterion aligned with its training run.
+        if hasattr(env_cfg.commands.yaw_rate_cmd, "yaw_pose_ready_dwell"):
+            env_cfg.commands.yaw_rate_cmd.yaw_pose_ready_dwell = args_cli.yaw_contact_ready_dwell
+    elif env_cfg.curriculum is not None:
         # A task-level curriculum initializes the yaw range at its easiest
         # stage.  Playback disables that curriculum, so first promote the
         # command to the final trained range instead of leaving it at ±0.25.
@@ -239,6 +288,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
+    if args_cli.yaw_contact_stochastic:
+        policy = ppo_runner.alg.policy.act
 
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
 
@@ -276,6 +327,51 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # reset environment
     obs, _ = env.reset()
 
+    contact_trace_file = None
+    contact_trace_writer = None
+    contact_trace_ids = None
+    contact_trace_env_ids = ()
+    contact_trace_history_length = 0
+    contact_trace_skipped_resets = 0
+    if args_cli.yaw_contact_trace:
+        raw = env.unwrapped
+        contact_trace_env_ids = (
+            range(raw.num_envs)
+            if args_cli.yaw_contact_env_id == -1
+            else (args_cli.yaw_contact_env_id,)
+        )
+        if "yaw_rate_cmd" not in raw.command_manager.active_terms:
+            raise ValueError("--yaw_contact_trace requires a yaw_rate_cmd task.")
+        wheel_names = ("FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL")
+        sensor = raw.scene.sensors["contact_forces"]
+        robot = raw.scene["robot"]
+        force_ids, force_names = sensor.find_bodies(list(wheel_names), preserve_order=True)
+        body_ids, body_names = robot.find_bodies(list(wheel_names), preserve_order=True)
+        if tuple(force_names) != wheel_names or tuple(body_names) != wheel_names:
+            raise RuntimeError(f"Wheel body resolution differs from {wheel_names}: {force_names}, {body_names}")
+        contact_trace_ids = (force_ids, body_ids)
+        if getattr(sensor.data, "net_forces_w_history", None) is not None:
+            contact_trace_history_length = int(sensor.data.net_forces_w_history.shape[1])
+        contact_trace_radius = float(raw.command_manager.get_term("yaw_rate_cmd").cfg.wheel_radius)
+        contact_trace_threshold = float(raw.command_manager.get_term("yaw_rate_cmd").cfg.contact_threshold)
+        trace_path = os.path.abspath(args_cli.yaw_contact_trace)
+        os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+        contact_trace_file = open(trace_path, "w", newline="", buffering=1)
+        contact_trace_writer = csv.writer(contact_trace_file)
+        header = ["step", "time_s", "env_id", "fsm_state", "support_diagonal", "yaw_command", "yaw_rate_b_z", "metric_support_gate"]
+        for name in wheel_names:
+            prefix = name.removesuffix("_WHEEL")
+            header += [f"{prefix}_clearance_m", f"{prefix}_fx_n", f"{prefix}_fy_n", f"{prefix}_fz_n", f"{prefix}_force_norm_n", f"{prefix}_norm_gt_threshold", f"{prefix}_fz_gt_threshold"]
+            for history_index in range(contact_trace_history_length):
+                header += [f"{prefix}_history_{history_index}_fz_n", f"{prefix}_history_{history_index}_norm_n"]
+        contact_trace_writer.writerow(header)
+        print(
+            f"[INFO] Yaw contact trace: {trace_path}; {len(contact_trace_env_ids)} environments, "
+            f"threshold={contact_trace_threshold} N, radius={contact_trace_radius} m, "
+            f"ready_dwell={args_cli.yaw_contact_ready_dwell} s, "
+            f"actions={'sampled' if args_cli.yaw_contact_stochastic else 'deterministic'}"
+        )
+
     reward_diagnostic_sum = None
     reward_diagnostic_samples = 0
     gate_open_sum = 0.0
@@ -301,7 +397,53 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             actions = policy(obs)
 
             # env stepping
-            obs, _, _, _ = env.step(actions)
+            obs, _, dones, _ = env.step(actions)
+        if contact_trace_writer is not None:
+            raw = env.unwrapped
+            sensor = raw.scene.sensors["contact_forces"]
+            robot = raw.scene["robot"]
+            command = raw.command_manager.get_term("yaw_rate_cmd")
+            force_ids, body_ids = contact_trace_ids
+            metric_gate = getattr(raw, "_yaw_support_score_current", None)
+            yaw_commands = raw.command_manager.get_command("yaw_rate_cmd")
+            # Isaac Lab auto-resets completed environments inside step(); their
+            # post-step sensor values no longer belong to the reward sample.
+            for env_id in contact_trace_env_ids:
+                if bool(dones[env_id]):
+                    contact_trace_skipped_resets += 1
+                    continue
+                forces = sensor.data.net_forces_w[env_id, force_ids, :].detach().cpu()
+                history = (
+                    [
+                        sensor.data.net_forces_w_history[env_id, :, int(force_id), :].detach().cpu()
+                        for force_id in force_ids
+                    ]
+                    if contact_trace_history_length
+                    else None
+                )
+                heights = robot.data.body_pos_w[env_id, body_ids, 2].detach().cpu()
+                origin_z = float(raw.scene.env_origins[env_id, 2].item())
+                row = [
+                    timestep,
+                    (timestep + 1) * dt,
+                    env_id,
+                    int(command.fsm_state[env_id].item()),
+                    int(command.support_diagonal[env_id].item()),
+                    float(yaw_commands[env_id, 0].item()),
+                    float(robot.data.root_ang_vel_b[env_id, 2].item()),
+                    float(metric_gate[env_id].item()) if metric_gate is not None else "",
+                ]
+                for wheel_index, (height, force) in enumerate(zip(heights, forces)):
+                    fx, fy, fz = (float(value) for value in force)
+                    norm = float(torch.linalg.vector_norm(force).item())
+                    row += [float(height) - origin_z - contact_trace_radius, fx, fy, fz, norm, int(norm > contact_trace_threshold), int(fz > contact_trace_threshold)]
+                    if history is not None:
+                        for history_force in history[wheel_index]:
+                            row += [
+                                float(history_force[2].item()),
+                                float(torch.linalg.vector_norm(history_force).item()),
+                            ]
+                contact_trace_writer.writerow(row)
         if args_cli.reward_diagnostics:
             reward_manager = env.unwrapped.reward_manager
             reward_diagnostic_sum += reward_manager._step_reward.mean(dim=0)
@@ -359,6 +501,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+
+    if contact_trace_file is not None:
+        contact_trace_file.close()
+        print(f"[INFO] Contact trace saved; skipped {contact_trace_skipped_resets} auto-reset steps.")
 
     # close the simulator
     env.close()

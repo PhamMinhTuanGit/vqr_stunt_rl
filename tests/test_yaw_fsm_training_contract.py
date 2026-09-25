@@ -60,8 +60,10 @@ def test_fsm_balance_is_gated_and_reward_counts_are_isolated():
     fsm = _reward_assignments(FSM_CONFIG, "VQRWheelFSMRewardsCfg")
 
     assert len(baseline) == 18
-    assert len(fsm) == 22
+    assert len(fsm) == 24
     assert "support_contact" not in fsm
+    assert "return_to_four_landing" in fsm
+    assert "four_stand_ready_bonus" in fsm
 
     fsm_balance_params = ast.literal_eval(_keyword(fsm["balance"], "params"))
     baseline_balance_params = ast.literal_eval(_keyword(baseline["balance"], "params"))
@@ -130,6 +132,7 @@ def test_fsm_startup_contract_checks_reward_and_command_runtime_objects():
         "support_diagonal",
         "state_time",
         "just_switched",
+        "just_returned_to_four",
         "positive_pose_ready",
         "negative_pose_ready",
         "four_stand_ready",
@@ -140,6 +143,8 @@ def test_fsm_startup_contract_checks_reward_and_command_runtime_objects():
     required = {
         "fsm_gated_tracking",
         "transition_progress",
+        "return_to_four_landing",
+        "four_stand_ready_bonus",
         "spin_center_drift",
         "safe_recovery_entry",
     }
@@ -157,5 +162,5 @@ def test_fsm_startup_contract_checks_reward_and_command_runtime_objects():
     namespace["_verify_yaw_fsm_contract"](env, SimpleNamespace())
 
     reward_manager.active_terms = active_terms[:-1]
-    with pytest.raises(RuntimeError, match="expected 22 terms"):
+    with pytest.raises(RuntimeError, match="expected 24 terms"):
         namespace["_verify_yaw_fsm_contract"](env, SimpleNamespace())

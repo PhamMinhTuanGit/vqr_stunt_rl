@@ -16,7 +16,7 @@ from isaaclab.managers import ManagerTermBase
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor, RayCaster
-from isaaclab.utils.math import quat_apply_inverse, yaw_quat
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply_inverse, yaw_quat
 
 from .fsm_gates import fsm_gates
 from .fsm import select_swing_wheel_contact
@@ -27,6 +27,37 @@ if TYPE_CHECKING:
 
 # Global curriculum scalar in [0, 1], updated from terrain-level mean.
 gait_level: float = 0.0
+
+#Reward mới cho task,làm lại
+#Phần phạt task chính:
+def custom_yaw_vel_tracking_exp(env: ManagerBasedRLEnv, std:float, command_name: str, 
+                            asset_cfg: SceneEntityCfg("robot")) -> torch.Tensor:
+    robot: RigidObject = env.scene[asset_cfg.name]
+    # Để lấy vận tốc góc yaw thực tế trong Isaaclab
+    # 
+    actual_yaw_vel = robot.data.root_ang_vel_b[:,2]
+    yaw_cmd = env.command_manager.get_command("command_name")
+    return torch.exp(-torch.sum(torch.square(actual_yaw_vel - yaw_cmd))/0.25)
+
+#Phần phạt lệnh điều khiển:
+def motor_effort_penalty_l2(env: ManagerBasedRLEnv, std:float, command_name: str,
+                            asset_cfg: SceneEntityCfg("robot")) -> torch.Tensor:
+    action_effort = env.command_manager.get_command("command_name")
+
+    raise NotImplementedError("motor_effort_penalty_l2 is not implemented")
+
+#Phần phạt dáng đứng:
+
+
+
+
+
+
+
+
+
+
+
 
 def update_gait_level_from_terrain_mean(terrain_level_mean: float | torch.Tensor) -> float:
     """Update global gait_level from mean terrain level.
@@ -645,6 +676,56 @@ def _fsm_step_telemetry(env: ManagerBasedRLEnv, gates: dict[str, torch.Tensor]) 
     )
     env._yaw_fsm_switches += gates["just_switched"].to(dtype=torch.long)
     env._yaw_fsm_episode_steps += 1
+    in_transition = gates["b_trans"]
+    if not hasattr(env, "_yaw_fsm_transition_duration_steps"):
+        env._yaw_fsm_transition_duration_steps = torch.zeros_like(state, dtype=torch.long)
+        env._yaw_fsm_transition_attempts = torch.zeros_like(state, dtype=torch.long)
+        env._yaw_fsm_transition_active = torch.zeros_like(in_transition)
+    entered = in_transition & (~env._yaw_fsm_transition_active | gates["just_switched"])
+    env._yaw_fsm_transition_attempts += entered.to(dtype=torch.long)
+    env._yaw_fsm_transition_duration_steps += in_transition.to(dtype=torch.long)
+    env._yaw_fsm_transition_active.copy_(in_transition)
+
+
+_TRANSITION_TELEMETRY_FIELDS = (
+    "support_ready", "lift_wheel_1_progress", "lift_wheel_2_progress",
+    "clearance_ready", "attitude_ready", "pose_ready", "torso_contact",
+)
+
+
+def _fsm_transition_telemetry(
+    env: ManagerBasedRLEnv,
+    gates: dict[str, torch.Tensor],
+    support_contacts: torch.Tensor,
+    lift_progress: torch.Tensor,
+    robot: RigidObject,
+    command,
+) -> None:
+    """Sample the active diagonal's transition predicates once per reward step."""
+    # CPU reward doubles can omit predicate wiring; production command configs
+    # provide all six sensor/body selections together.
+    torso_cfg = getattr(command.cfg, "torso_sensor_cfg", None)
+    if torso_cfg is None:
+        return
+    contact_threshold = command.cfg.contact_threshold
+    torso_contact = _yaw_wheel_contacts(env, torso_cfg, contact_threshold)[:, 0]
+    roll, pitch, _ = euler_xyz_from_quat(robot.data.root_quat_w)
+    attitude_ready = (roll.abs() < command.cfg.pose_angle_limit) & (
+        pitch.abs() < command.cfg.pose_angle_limit
+    )
+    support_ready = support_contacts.all(dim=1)
+    clearance_ready = (lift_progress >= command.cfg.clearance_fraction).all(dim=1)
+    values = (
+        support_ready, lift_progress[:, 0], lift_progress[:, 1],
+        clearance_ready, attitude_ready,
+        support_ready & clearance_ready & attitude_ready, torso_contact,
+    )
+    mask = gates["b_trans"]
+    for field, value in zip(_TRANSITION_TELEMETRY_FIELDS, values):
+        name = f"_yaw_fsm_transition_{field}_sum"
+        if not hasattr(env, name):
+            setattr(env, name, torch.zeros(env.num_envs, device=mask.device))
+        getattr(env, name).add_(value.to(dtype=torch.float32) * mask)
 
 
 def _fsm_record_positive_budget(
@@ -749,15 +830,16 @@ def fsm_gated_tracking(
         gates["support_diagonal"],
     )
 
-    lift_pos = _yaw_lift_progress(
-        env, lifted_asset_cfg, wheel_radius, target_clearance
-    ).mean(dim=1)
-    lift_neg = _yaw_lift_progress(
-        env, lifted_asset_cfg_mirror, wheel_radius, target_clearance
-    ).mean(dim=1)
-    lift_progress = torch.where(gates["diag_pos"], lift_pos, lift_neg)
+    lift_pos = _yaw_lift_progress(env, lifted_asset_cfg, wheel_radius, target_clearance)
+    lift_neg = _yaw_lift_progress(env, lifted_asset_cfg_mirror, wheel_radius, target_clearance)
+    selected_lift = torch.where(gates["diag_pos"].unsqueeze(1), lift_pos, lift_neg)
+    lift_progress = selected_lift.mean(dim=1)
 
     asset: RigidObject = env.scene[asset_cfg.name]
+    _fsm_transition_telemetry(
+        env, gates, support_contacts, selected_lift, asset,
+        env.command_manager.get_term(fsm_command_name),
+    )
     yaw_command = env.command_manager.get_command(command_name)[:, 0]
     yaw_error = torch.abs(yaw_command - asset.data.root_ang_vel_b[:, 2])
     yaw_tracking = torch.exp(-yaw_error.square() / std**2)
@@ -926,6 +1008,63 @@ def four_stand_stability(
     gates = fsm_gates(env, fsm_command_name)
     reward = gates["f_stability"] * height_score * attitude_score
     _fsm_record_positive_budget(env, gates, "four_stand_stability", reward)
+    return reward
+
+
+class ReturnToFourLanding(ManagerTermBase):
+    """Reward lowering progress and each regained contact once per return."""
+
+    def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.prev_progress = torch.zeros(env.num_envs, 2, device=env.device)
+        self.contact_seen = torch.zeros(env.num_envs, 2, dtype=torch.bool, device=env.device)
+        self.was_return = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    def reset(self, env_ids=None) -> None:
+        index = slice(None) if env_ids is None else env_ids
+        self.prev_progress[index] = 0.0
+        self.contact_seen[index] = False
+        self.was_return[index] = False
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        asset_cfg: SceneEntityCfg,
+        asset_cfg_mirror: SceneEntityCfg,
+        sensor_cfg: SceneEntityCfg,
+        sensor_cfg_mirror: SceneEntityCfg,
+        wheel_radius: float,
+        fsm_command_name: str,
+        contact_threshold: float = 1.0,
+    ) -> torch.Tensor:
+        gates = fsm_gates(env, fsm_command_name)
+        target_clearance = env.command_manager.get_term(fsm_command_name).cfg.target_clearance
+        progress_pos = _yaw_lift_progress(env, asset_cfg, wheel_radius, target_clearance)
+        progress_neg = _yaw_lift_progress(env, asset_cfg_mirror, wheel_radius, target_clearance)
+        contact_pos = _yaw_wheel_contacts(env, sensor_cfg, contact_threshold)
+        contact_neg = _yaw_wheel_contacts(env, sensor_cfg_mirror, contact_threshold)
+        progress = torch.where(gates["diag_pos"].unsqueeze(1), progress_pos, progress_neg)
+        contact = torch.where(gates["diag_pos"].unsqueeze(1), contact_pos, contact_neg)
+        in_return = gates["b_return"]
+        continuing = in_return & self.was_return & ~gates["just_switched"]
+        lowering = (self.prev_progress - progress).mean(dim=1) * continuing
+        # Contacts present at return entry were never lost and earn no bonus.
+        first_contacts = (contact & ~self.contact_seen & continuing.unsqueeze(1)).float().mean(dim=1)
+        reward = lowering + 2.0 * first_contacts
+        self.prev_progress.copy_(torch.where(in_return.unsqueeze(1), progress, torch.zeros_like(progress)))
+        self.contact_seen.copy_(torch.where(
+            in_return.unsqueeze(1), self.contact_seen | contact, torch.zeros_like(contact)
+        ))
+        self.was_return.copy_(in_return)
+        _fsm_record_positive_budget(env, gates, "return_to_four_landing", reward)
+        return reward
+
+
+def four_stand_ready_bonus(env: ManagerBasedRLEnv, fsm_command_name: str) -> torch.Tensor:
+    """Pay once when RETURN_TO_4 exits through four-wheel readiness."""
+    gates = fsm_gates(env, fsm_command_name)
+    reward = gates["b_return_complete"].to(dtype=torch.float32)
+    _fsm_record_positive_budget(env, gates, "four_stand_ready_bonus", reward)
     return reward
 
 

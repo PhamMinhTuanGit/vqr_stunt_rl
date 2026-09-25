@@ -340,6 +340,16 @@ def test_fsm_curriculum_requires_both_diagonals_before_phase_promotion(
         ),
         _yaw_fsm_switches=torch.tensor([1, 2], dtype=torch.long),
         _yaw_fsm_episode_steps=torch.tensor([3, 2], dtype=torch.long),
+        _yaw_fsm_transition_duration_steps=torch.tensor([2, 3], dtype=torch.long),
+        _yaw_fsm_transition_attempts=torch.tensor([1, 2], dtype=torch.long),
+        _yaw_fsm_transition_active=torch.tensor([True, False]),
+        _yaw_fsm_transition_support_ready_sum=torch.tensor([2.0, 1.0]),
+        _yaw_fsm_transition_lift_wheel_1_progress_sum=torch.tensor([1.5, 0.5]),
+        _yaw_fsm_transition_lift_wheel_2_progress_sum=torch.tensor([1.0, 1.0]),
+        _yaw_fsm_transition_clearance_ready_sum=torch.tensor([1.0, 0.0]),
+        _yaw_fsm_transition_attitude_ready_sum=torch.tensor([2.0, 2.0]),
+        _yaw_fsm_transition_pose_ready_sum=torch.tensor([1.0, 0.0]),
+        _yaw_fsm_transition_torso_contact_sum=torch.tensor([0.0, 1.0]),
     )
     params = dict(
         command_name="yaw_rate_cmd",
@@ -394,6 +404,17 @@ def test_fsm_curriculum_requires_both_diagonals_before_phase_promotion(
     assert state["state_fraction/1"].item() == pytest.approx(1.0 / 5.0)
     assert state["state_fraction/4"].item() == pytest.approx(1.0 / 5.0)
     assert state["switch_rate"].item() == pytest.approx(3.0 / 5.0)
+    assert state["transition/support_ready_rate"].item() == pytest.approx(3.0 / 5.0)
+    assert state["transition/lift_wheel_1_progress"].item() == pytest.approx(2.0 / 5.0)
+    assert state["transition/lift_wheel_2_progress"].item() == pytest.approx(2.0 / 5.0)
+    assert state["transition/clearance_ready_rate"].item() == pytest.approx(1.0 / 5.0)
+    assert state["transition/attitude_ready_rate"].item() == pytest.approx(4.0 / 5.0)
+    assert state["transition/pose_ready_rate"].item() == pytest.approx(1.0 / 5.0)
+    assert state["transition/torso_contact_rate"].item() == pytest.approx(1.0 / 5.0)
+    assert state["transition/duration_mean"].item() == pytest.approx(0.02 * 5.0 / 3.0)
+    assert env._yaw_fsm_transition_duration_steps.sum().item() == 0
+    assert env._yaw_fsm_transition_active.any().item() is False
+    assert env._yaw_fsm_transition_support_ready_sum.sum().item() == 0.0
     assert torch.equal(env._yaw_fsm_episode_steps, torch.zeros(2, dtype=torch.long))
 
 

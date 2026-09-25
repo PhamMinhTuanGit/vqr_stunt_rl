@@ -209,3 +209,22 @@ def fsm_transition_timeout(
         state == int(VQRFsmState.TRANSITION_NEG)
     )
     return in_transition & (state_time >= timeout_s)
+
+
+def fsm_return_timeout(
+    env: ManagerBasedRLEnv,
+    command_name: str = "yaw_rate_cmd",
+    timeout_s: float = 2.5,
+) -> torch.Tensor:
+    """Terminate an episode that cannot regain four-wheel stance in time."""
+    if timeout_s <= 0.0:
+        raise ValueError("timeout_s must be positive.")
+
+    command_term = env.command_manager.get_term(command_name)
+    if not hasattr(command_term, "fsm_state") or not hasattr(command_term, "state_time"):
+        raise TypeError(f"Command '{command_name}' does not expose FSM state/time buffers.")
+    state = torch.as_tensor(command_term.fsm_state, device=env.device)
+    state_time = torch.as_tensor(command_term.state_time, device=env.device)
+    if state.shape != (env.num_envs,) or state_time.shape != (env.num_envs,):
+        raise ValueError("FSM state and state_time must each have shape (num_envs,).")
+    return (state == int(VQRFsmState.RETURN_TO_4)) & (state_time >= timeout_s)

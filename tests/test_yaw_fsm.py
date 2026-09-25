@@ -61,13 +61,19 @@ def _load_fsm_tracking_reward():
         "yaw_com_inside_support_segment",
         "yaw_lift_clearance",
         "fsm_gated_tracking",
+        "four_stand_ready_bonus",
     }
     reward_tree = ast.parse(REWARDS_PATH.read_text(encoding="utf-8"))
     reward_nodes = [
         node
         for node in reward_tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in reward_names
+        if (isinstance(node, ast.FunctionDef) and node.name in reward_names)
+        or (isinstance(node, ast.ClassDef) and node.name == "ReturnToFourLanding")
     ]
+    class FakeManagerTermBase:
+        def __init__(self, cfg, env):
+            pass
+
     class FakeSceneEntityCfg(SimpleNamespace):
         def __init__(self, name):
             super().__init__(name=name)
@@ -78,7 +84,10 @@ def _load_fsm_tracking_reward():
             "SceneEntityCfg": FakeSceneEntityCfg,
             "ContactSensor": object,
             "RigidObject": object,
+            "ManagerTermBase": FakeManagerTermBase,
+            "RewTerm": object,
             "_fsm_step_telemetry": lambda *args: None,
+            "_fsm_transition_telemetry": lambda *args: None,
             "_fsm_masked_accumulate": lambda *args: None,
             "_fsm_masked_accumulate_pair": lambda *args: None,
             "_fsm_episode_or": lambda *args: None,
@@ -93,6 +102,68 @@ def _load_fsm_tracking_reward():
         torch.ones(env.num_envs),
     )
     return namespace, fsm_module.VQRFsmState
+
+
+def test_transition_telemetry_uses_active_support_lift_and_pose():
+    tree = ast.parse(REWARDS_PATH.read_text(encoding="utf-8"))
+    names = {"_fsm_step_telemetry", "_fsm_transition_telemetry"}
+    nodes = [
+        node for node in tree.body
+        if (isinstance(node, ast.FunctionDef) and node.name in names)
+        or (
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "_TRANSITION_TELEMETRY_FIELDS"
+        )
+    ]
+    namespace = {
+        "torch": torch,
+        "euler_xyz_from_quat": lambda q: (q[:, 0], q[:, 1], q[:, 2]),
+        "_yaw_wheel_contacts": lambda env, cfg, threshold: env.torso_contact,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), REWARDS_PATH, "exec"), namespace)
+
+    state = torch.tensor([1, 3, 1, 2])
+    gates = {
+        "fsm_state": state,
+        "b_trans": torch.tensor([True, True, True, False]),
+        "just_switched": torch.tensor([True, True, False, True]),
+    }
+    env = SimpleNamespace(
+        num_envs=4,
+        torso_contact=torch.tensor([[False], [True], [True], [True]]),
+    )
+    robot = SimpleNamespace(data=SimpleNamespace(root_quat_w=torch.tensor([
+        [0.1, 0.0, 0.0], [0.1, 0.0, 0.0], [0.4, 0.0, 0.0], [0.0, 0.0, 0.0],
+    ])))
+    command = SimpleNamespace(cfg=SimpleNamespace(
+        torso_sensor_cfg=SimpleNamespace(name="torso"),
+        contact_threshold=1.0,
+        pose_angle_limit=0.35,
+        clearance_fraction=0.8,
+    ))
+    namespace["_fsm_step_telemetry"](env, gates)
+    namespace["_fsm_transition_telemetry"](
+        env, gates,
+        torch.tensor([[True, True], [True, False], [True, True], [True, True]]),
+        torch.tensor([[0.9, 0.8], [0.9, 0.9], [0.2, 0.8], [1.0, 1.0]]),
+        robot, command,
+    )
+    assert env._yaw_fsm_transition_duration_steps.tolist() == [1, 1, 1, 0]
+    assert env._yaw_fsm_transition_attempts.tolist() == [1, 1, 1, 0]
+    expected = {
+        "support_ready": [1.0, 0.0, 1.0, 0.0],
+        "lift_wheel_1_progress": [0.9, 0.9, 0.2, 0.0],
+        "lift_wheel_2_progress": [0.8, 0.9, 0.8, 0.0],
+        "clearance_ready": [1.0, 1.0, 0.0, 0.0],
+        "attitude_ready": [1.0, 1.0, 0.0, 0.0],
+        "pose_ready": [1.0, 0.0, 0.0, 0.0],
+        "torso_contact": [0.0, 1.0, 1.0, 0.0],
+    }
+    for field, values in expected.items():
+        assert torch.allclose(
+            getattr(env, f"_yaw_fsm_transition_{field}_sum"), torch.tensor(values)
+        )
 
 
 def test_command_owns_yaw_entry_position_and_reward_has_no_private_anchor():
@@ -127,7 +198,8 @@ def test_command_owns_yaw_entry_position_and_reward_has_no_private_anchor():
     # while the command remains in YAW.
     command.positive_pose_ready.fill_(True)
     command.robot.data.root_pos_w[:, :2] = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
-    command._step_fsm()
+    for _ in range(5):
+        command._step_fsm()
     assert torch.equal(command.yaw_entry_pos, torch.tensor([[5.0, 6.0], [7.0, 8.0]]))
 
     command.robot.data.root_pos_w[:, :2] = torch.tensor([[9.0, 10.0], [11.0, 12.0]])
@@ -153,7 +225,8 @@ def test_vector_fsm_command_exit_and_unsafe_bypass_pose_loss_grace():
     yaw = torch.tensor([0.20])
 
     fsm.update(yaw, false, false, false, false)  # FOUR -> TRANSITION_POS
-    fsm.update(yaw, true, false, false, false)   # TRANSITION_POS -> YAW_POS
+    for _ in range(2):
+        fsm.update(yaw, true, false, false, false)  # TRANSITION_POS -> YAW_POS
     assert fsm.state.item() == fsm_module.VQRFsmState.YAW_POS
 
     # A zero command exits immediately, even when pose readiness is lost.
@@ -164,7 +237,8 @@ def test_vector_fsm_command_exit_and_unsafe_bypass_pose_loss_grace():
     # Safety has absolute priority and does not wait for any command dwell.
     fsm.reset()
     fsm.update(yaw, false, false, false, false)
-    fsm.update(yaw, true, false, false, false)
+    for _ in range(2):
+        fsm.update(yaw, true, false, false, false)
     fsm.update(yaw, false, false, false, true)
     assert fsm.state.item() == fsm_module.VQRFsmState.SAFE_RECOVERY
 
@@ -235,14 +309,41 @@ def test_vector_fsm_reset_restores_the_canonical_four_stand_state():
     fsm.fsm_state[:] = torch.tensor([1, 2, 4, 6])
     fsm.support_diagonal[:] = torch.tensor([1, 1, -1, -1])
     fsm.state_time[:] = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    fsm.just_returned_to_four[:] = True
     fsm._yaw_pose_invalid_time[:] = torch.tensor([0.02, 0.04, 0.06, 0.08])
+    fsm._yaw_pose_ready_time[:] = torch.tensor([0.02, 0.04, 0.06, 0.08])
 
     fsm.reset(torch.tensor([0, 2, 3]))
 
     assert torch.equal(fsm.fsm_state, torch.tensor([0, 2, 0, 0]))
     assert torch.equal(fsm.support_diagonal, torch.tensor([0, 1, 0, 0]))
     assert torch.equal(fsm.state_time, torch.tensor([0.0, 0.2, 0.0, 0.0]))
+    assert torch.equal(fsm.just_returned_to_four, torch.tensor([False, True, False, False]))
     assert torch.equal(fsm._yaw_pose_invalid_time, torch.tensor([0.0, 0.04, 0.0, 0.0]))
+    assert torch.equal(fsm._yaw_pose_ready_time, torch.tensor([0.0, 0.04, 0.0, 0.0]))
+
+
+def test_return_completion_pulse_requires_four_ready_for_both_signs():
+    module = _load_fsm_module()
+    for direction in (1, -1):
+        for fsm in (module.VQRYawFSM(yaw_pose_ready_dwell=0.0),
+                    module.YawFSMVectorized(1, yaw_pose_ready_dwell=0.0)):
+            def step(command, ready=False):
+                pos = direction == 1 and ready
+                neg = direction == -1 and ready
+                if isinstance(fsm, module.YawFSMVectorized):
+                    fsm.update(torch.tensor([command]), torch.tensor([pos]),
+                               torch.tensor([neg]), torch.tensor([ready]), torch.tensor([False]))
+                    return int(fsm.state.item()), bool(fsm.just_returned_to_four.item())
+                fsm.update(command, pos, neg, ready, False)
+                return int(fsm.state), fsm.just_returned_to_four
+
+            step(0.2 * direction)
+            step(0.2 * direction, ready=True)
+            assert step(0.0) == (module.VQRFsmState.RETURN_TO_4, False)
+            assert step(0.0) == (module.VQRFsmState.RETURN_TO_4, False)
+            assert step(0.0, ready=True) == (module.VQRFsmState.FOUR_STAND, True)
+            assert step(0.0) == (module.VQRFsmState.FOUR_STAND, False)
 
 
 def test_yaw_pose_loss_grace_reacquires_the_same_diagonal_after_continuous_loss():
@@ -259,7 +360,8 @@ def test_yaw_pose_loss_grace_reacquires_the_same_diagonal_after_continuous_loss(
         positive = true if direction == 1 else false
         negative = true if direction == -1 else false
         fsm.update(command, false, false, false, false)
-        fsm.update(command, positive, negative, false, false)
+        for _ in range(5):
+            fsm.update(command, positive, negative, false, false)
         assert fsm.state.item() == yaw_state
         assert fsm.support_diagonal.item() == direction
 
@@ -280,9 +382,14 @@ def test_yaw_pose_loss_grace_reacquires_the_same_diagonal_after_continuous_loss(
         assert fsm.support_diagonal.item() == direction
         assert fsm._yaw_pose_invalid_time.item() == 0.0
 
+        for step in range(4):
+            fsm.update(command, positive, negative, false, false)
+            assert fsm.state.item() == transition_state
+            assert torch.allclose(fsm._yaw_pose_ready_time, torch.tensor([0.02 * (step + 1)]))
         fsm.update(command, positive, negative, false, false)
         assert fsm.state.item() == yaw_state
         assert fsm.support_diagonal.item() == direction
+        assert fsm._yaw_pose_ready_time.item() == 0.0
 
 
 def test_yaw_pose_loss_priority_unsafe_then_command_exit():
@@ -296,7 +403,8 @@ def test_yaw_pose_loss_priority_unsafe_then_command_exit():
         positive = true if direction == 1 else false
         negative = true if direction == -1 else false
         fsm.update(command, false, false, false, false)
-        fsm.update(command, positive, negative, false, false)
+        for _ in range(5):
+            fsm.update(command, positive, negative, false, false)
         for _ in range(4):
             fsm.update(command, false, false, false, false)
         fsm.update(torch.tensor([exit_command]), false, false, false, false)
@@ -305,7 +413,8 @@ def test_yaw_pose_loss_priority_unsafe_then_command_exit():
 
         fsm.reset()
         fsm.update(command, false, false, false, false)
-        fsm.update(command, positive, negative, false, false)
+        for _ in range(5):
+            fsm.update(command, positive, negative, false, false)
         fsm.update(torch.tensor([exit_command]), false, false, false, true)
         assert fsm.state.item() == state.SAFE_RECOVERY
         assert fsm._yaw_pose_invalid_time.item() == 0.0
@@ -314,6 +423,77 @@ def test_yaw_pose_loss_priority_unsafe_then_command_exit():
 def test_yaw_pose_loss_grace_is_exposed_on_command_config():
     fsm_module = _load_fsm_module()
     assert fsm_module.YawFSMCommandCfg.yaw_pose_loss_grace == 0.10
+    assert fsm_module.YawFSMCommandCfg.yaw_pose_ready_dwell == 0.10
+
+
+def test_pose_ready_requires_five_continuous_steps_for_both_fsm_implementations_and_signs():
+    module = _load_fsm_module()
+    state = module.VQRFsmState
+    for vectorized in (False, True):
+        for direction, transition, yaw_state in (
+            (1, state.TRANSITION_POS, state.YAW_POS),
+            (-1, state.TRANSITION_NEG, state.YAW_NEG),
+        ):
+            fsm = (
+                module.YawFSMVectorized(num_envs=1, dt=0.02)
+                if vectorized else module.VQRYawFSM(dt=0.02)
+            )
+
+            def step(command, ready=False, unsafe=False):
+                pos = ready and direction == 1
+                neg = ready and direction == -1
+                if vectorized:
+                    return int(fsm.update(command, pos, neg, False, unsafe).item())
+                return int(fsm.update(command, pos, neg, False, unsafe))
+
+            def ready_time():
+                value = fsm._yaw_pose_ready_time
+                return float(value.item()) if vectorized else value
+
+            command = 0.2 * direction
+            assert step(command) == transition
+            for index in range(4):
+                assert step(command, ready=True) == transition
+                assert abs(ready_time() - 0.02 * (index + 1)) < 1.0e-6
+            assert step(command) == transition
+            assert ready_time() == 0.0
+            for _ in range(4):
+                assert step(command, ready=True) == transition
+            assert step(command, ready=True) == yaw_state
+            assert ready_time() == 0.0
+
+
+def test_pose_ready_dwell_yields_to_unsafe_and_command_exit_for_both_signs():
+    module = _load_fsm_module()
+    state = module.VQRFsmState
+    for vectorized in (False, True):
+        for direction in (1, -1):
+            for exit_command, unsafe, expected in (
+                (0.0, False, state.RETURN_TO_4),
+                (-0.2 * direction, False, state.RETURN_TO_4),
+                (0.0, True, state.SAFE_RECOVERY),
+            ):
+                fsm = (
+                    module.YawFSMVectorized(num_envs=1, dt=0.02)
+                    if vectorized else module.VQRYawFSM(dt=0.02)
+                )
+                command = 0.2 * direction
+                pos = direction == 1
+                neg = direction == -1
+                fsm.update(command, False, False, False, False)
+                for _ in range(4):
+                    fsm.update(command, pos, neg, False, False)
+                ready_time = fsm._yaw_pose_ready_time
+                if vectorized:
+                    ready_time = ready_time.item()
+                assert abs(ready_time - 0.08) < 1.0e-6
+                fsm.update(exit_command, pos, neg, False, unsafe)
+                actual_state = fsm.state.item() if vectorized else fsm.state
+                ready_time = fsm._yaw_pose_ready_time
+                if vectorized:
+                    ready_time = ready_time.item()
+                assert actual_state == expected
+                assert ready_time == 0.0
 
 
 def test_swing_contact_selection_uses_any_wheel_and_mirrors_exactly():
@@ -463,6 +643,7 @@ def test_fsm_pose_rewards_keep_dense_yaw_signal_without_support_contact():
         env, std=0.05, **geom_args, **fsm_args
     )
     expected_geom = torch.ones(n)
+    expected_geom[-1] = 0.0  # RETURN no longer pays diagonal geometry.
     assert torch.allclose(com, expected_geom)
     assert torch.allclose(inside, expected_geom)
 
@@ -488,3 +669,100 @@ def test_fsm_pose_rewards_keep_dense_yaw_signal_without_support_contact():
     assert torch.equal(legacy_com, torch.ones(n))
     assert torch.equal(legacy_inside, torch.ones(n))
     assert torch.equal(legacy_lift, 2.0 * lift_pos.mean(dim=1) - 1.0)
+
+
+def test_return_landing_and_completion_bonus_are_mirrored_one_time_events():
+    rewards, state = _load_fsm_tracking_reward()
+    command = SimpleNamespace(
+        fsm_state=torch.tensor([state.RETURN_TO_4, state.RETURN_TO_4]),
+        support_diagonal=torch.tensor([1, -1]),
+        state_time=torch.zeros(2),
+        just_switched=torch.ones(2, dtype=torch.bool),
+        just_returned_to_four=torch.zeros(2, dtype=torch.bool),
+        cfg=SimpleNamespace(target_clearance=0.05),
+    )
+    forces = torch.zeros(2, 4, 3)
+    sensor = SimpleNamespace(data=SimpleNamespace(net_forces_w=forces))
+    env = SimpleNamespace(
+        num_envs=2,
+        device="cpu",
+        common_step_counter=0,
+        scene=SimpleNamespace(sensors={"contact_forces": sensor}),
+        command_manager=SimpleNamespace(get_term=lambda _: command),
+        lift_progress={"pos": torch.ones(2, 2), "neg": torch.ones(2, 2)},
+    )
+    term = rewards["ReturnToFourLanding"](None, env)
+    args = {
+        "asset_cfg": SimpleNamespace(name="pos"),
+        "asset_cfg_mirror": SimpleNamespace(name="neg"),
+        "sensor_cfg": SimpleNamespace(name="contact_forces", body_ids=[1, 2]),
+        "sensor_cfg_mirror": SimpleNamespace(name="contact_forces", body_ids=[0, 3]),
+        "wheel_radius": 0.091,
+        "fsm_command_name": "yaw_rate_cmd",
+    }
+    assert torch.equal(term(env, **args), torch.zeros(2))
+
+    command.just_switched.fill_(False)
+    env.common_step_counter += 1
+    env.lift_progress["pos"][:] = 0.5
+    env.lift_progress["neg"][:] = 0.5
+    assert torch.allclose(term(env, **args), torch.full((2,), 0.5))
+
+    env.common_step_counter += 1
+    forces[0, 1, 2] = 2.0  # POS swing FR
+    forces[1, 0, 2] = 2.0  # NEG swing FL
+    assert torch.allclose(term(env, **args), torch.ones(2))
+    env.common_step_counter += 1
+    assert torch.equal(term(env, **args), torch.zeros(2))
+
+    env.common_step_counter += 1
+    forces[0, 2, 2] = 2.0  # POS swing HL
+    forces[1, 3, 2] = 2.0  # NEG swing HR
+    assert torch.allclose(term(env, **args), torch.ones(2))
+
+    command.fsm_state[:] = state.FOUR_STAND
+    command.support_diagonal.zero_()
+    command.just_switched.fill_(True)
+    command.just_returned_to_four.fill_(True)
+    env.common_step_counter += 1
+    assert torch.equal(term(env, **args), torch.zeros(2))
+    assert torch.equal(
+        rewards["four_stand_ready_bonus"](env, "yaw_rate_cmd"), torch.ones(2)
+    )
+    command.just_switched.fill_(False)
+    command.just_returned_to_four.fill_(False)
+    env.common_step_counter += 1
+    assert torch.equal(
+        rewards["four_stand_ready_bonus"](env, "yaw_rate_cmd"), torch.zeros(2)
+    )
+
+    # A wheel that was already in contact on return entry was not regained.
+    term.reset()
+    command.fsm_state[:] = state.RETURN_TO_4
+    command.support_diagonal[:] = torch.tensor([1, -1])
+    command.just_switched.fill_(True)
+    env.common_step_counter += 1
+    assert torch.equal(term(env, **args), torch.zeros(2))
+    command.just_switched.fill_(False)
+    env.common_step_counter += 1
+    assert torch.equal(term(env, **args), torch.zeros(2))
+
+
+def test_return_timeout_only_fires_in_return_after_2_5_seconds():
+    path = FSM_PATH.with_name("terminations.py")
+    function = next(
+        node for node in ast.parse(path.read_text(encoding="utf-8")).body
+        if isinstance(node, ast.FunctionDef) and node.name == "fsm_return_timeout"
+    )
+    namespace = {"torch": torch, "VQRFsmState": _load_fsm_module().VQRFsmState,
+                 "ManagerBasedRLEnv": object}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), path, "exec"), namespace)
+    command = SimpleNamespace(
+        fsm_state=torch.tensor([5, 5, 2, 0]),
+        state_time=torch.tensor([2.48, 2.50, 4.0, 4.0]),
+    )
+    env = SimpleNamespace(
+        num_envs=4, device="cpu",
+        command_manager=SimpleNamespace(get_term=lambda _: command),
+    )
+    assert torch.equal(namespace["fsm_return_timeout"](env), torch.tensor([False, True, False, False]))

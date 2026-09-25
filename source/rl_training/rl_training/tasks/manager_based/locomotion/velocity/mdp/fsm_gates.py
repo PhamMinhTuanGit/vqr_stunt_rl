@@ -61,8 +61,7 @@ def fsm_gates(env, command_name: str) -> dict[str, torch.Tensor]:
         ``f_four``, ``f_trans``, ``f_yaw``, ``f_return``, ``f_safe``:
             Float versions of the hard masks.
         ``f_geom``:
-            Float mask for geometry terms, which are defined in transition,
-            yaw, and return states.
+            Float mask for diagonal geometry terms during transition and yaw.
         ``f_stability``:
             Soft four-stand stability gate.  It fades out over the first
             second of a transition and fades in over the first second of a
@@ -70,6 +69,8 @@ def fsm_gates(env, command_name: str) -> dict[str, torch.Tensor]:
             deliberately excluded from every positive FSM reward gate.
         ``diag_pos``, ``diag_neg``:
             Support-diagonal selectors from ``support_diagonal``.
+        ``b_return_complete``:
+            One-step pulse when RETURN_TO_4 reaches four-wheel readiness.
         ``fsm_state``, ``support_diagonal``, ``state_time``, ``tau``,
         ``just_switched``:
             The live command buffers used by stateful reward terms.
@@ -95,6 +96,11 @@ def fsm_gates(env, command_name: str) -> dict[str, torch.Tensor]:
     support_diagonal = _required_tensor(command, "support_diagonal", device=device).to(dtype=torch.long)
     state_time = _required_tensor(command, "state_time", device=device).to(dtype=torch.float32)
     just_switched = _required_tensor(command, "just_switched", device=device).to(dtype=torch.bool)
+    return_complete = torch.as_tensor(
+        getattr(command, "just_returned_to_four", torch.zeros_like(just_switched)),
+        device=device,
+        dtype=torch.bool,
+    )
 
     if state.shape != support_diagonal.shape or state.shape != state_time.shape:
         raise ValueError(
@@ -108,6 +114,8 @@ def fsm_gates(env, command_name: str) -> dict[str, torch.Tensor]:
             "FSM buffer 'just_switched' must share shape with fsm_state: "
             f"{tuple(just_switched.shape)} vs {tuple(state.shape)}"
         )
+    if return_complete.shape != state.shape:
+        raise ValueError("FSM buffer 'just_returned_to_four' must share shape with fsm_state.")
     expected_num_envs = getattr(env, "num_envs", state.shape[0])
     if state.shape != (int(expected_num_envs),):
         raise ValueError(
@@ -134,7 +142,7 @@ def fsm_gates(env, command_name: str) -> dict[str, torch.Tensor]:
 
     diag_pos = support_diagonal == 1
     diag_neg = support_diagonal == -1
-    f_geom = (b_trans | b_yaw | b_return).to(dtype=torch.float32)
+    f_geom = (b_trans | b_yaw).to(dtype=torch.float32)
 
     gates = {
         "b_four": b_four,
@@ -151,6 +159,7 @@ def fsm_gates(env, command_name: str) -> dict[str, torch.Tensor]:
         "f_stability": f_stability,
         "diag_pos": diag_pos,
         "diag_neg": diag_neg,
+        "b_return_complete": return_complete & b_four & just_switched,
         "fsm_state": state,
         "support_diagonal": support_diagonal,
         "state_time": state_time,

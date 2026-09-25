@@ -788,6 +788,10 @@ def yaw_fsm_task_levels(
     # Lifetime diagnostic aggregates are deliberately separate from the
     # promotion windows above.  Clearing an evaluation window must not erase
     # what TensorBoard reports about FSM occupancy and recovery behavior.
+    transition_fields = (
+        "support_ready", "lift_wheel_1_progress", "lift_wheel_2_progress",
+        "clearance_ready", "attitude_ready", "pose_ready", "torso_contact",
+    )
     telemetry_defaults = {
         "_yaw_fsm_telemetry_state_totals": torch.zeros(7, dtype=torch.long, device=env.device),
         "_yaw_fsm_telemetry_steps": 0,
@@ -795,7 +799,13 @@ def yaw_fsm_task_levels(
         "_yaw_fsm_telemetry_positive_budget": torch.zeros(7, dtype=torch.float32, device=env.device),
         "_yaw_fsm_telemetry_positive_budget_pos": 0.0,
         "_yaw_fsm_telemetry_positive_budget_neg": 0.0,
+        "_yaw_fsm_telemetry_transition_steps": 0,
+        "_yaw_fsm_telemetry_transition_attempts": 0,
     }
+    telemetry_defaults.update({
+        f"_yaw_fsm_telemetry_transition_{field}_sum": 0.0
+        for field in transition_fields
+    })
     for suffix in ("pos", "neg"):
         telemetry_defaults.update({
             f"_yaw_fsm_telemetry_{suffix}_transition_attempts": 0,
@@ -953,6 +963,20 @@ def yaw_fsm_task_levels(
             env._yaw_fsm_telemetry_switches += int(
                 env._yaw_fsm_switches[completed_env_ids].sum().item()
             )
+        if hasattr(env, "_yaw_fsm_transition_duration_steps"):
+            env._yaw_fsm_telemetry_transition_steps += int(
+                env._yaw_fsm_transition_duration_steps[completed_env_ids].sum().item()
+            )
+            env._yaw_fsm_telemetry_transition_attempts += int(
+                env._yaw_fsm_transition_attempts[completed_env_ids].sum().item()
+            )
+        for field in transition_fields:
+            episode_name = f"_yaw_fsm_transition_{field}_sum"
+            if hasattr(env, episode_name):
+                lifetime_name = f"_yaw_fsm_telemetry_transition_{field}_sum"
+                setattr(env, lifetime_name, getattr(env, lifetime_name) + float(
+                    getattr(env, episode_name)[completed_env_ids].sum().item()
+                ))
         if hasattr(env, "_yaw_fsm_positive_budget"):
             env._yaw_fsm_telemetry_positive_budget += env._yaw_fsm_positive_budget[
                 completed_env_ids
@@ -1007,6 +1031,14 @@ def yaw_fsm_task_levels(
         env._yaw_fsm_state_steps[selected_env_ids] = 0
         env._yaw_fsm_switches[selected_env_ids] = 0
         env._yaw_fsm_episode_steps[selected_env_ids] = 0
+    if hasattr(env, "_yaw_fsm_transition_duration_steps"):
+        env._yaw_fsm_transition_duration_steps[selected_env_ids] = 0
+        env._yaw_fsm_transition_attempts[selected_env_ids] = 0
+        env._yaw_fsm_transition_active[selected_env_ids] = False
+    for field in transition_fields:
+        episode_name = f"_yaw_fsm_transition_{field}_sum"
+        if hasattr(env, episode_name):
+            getattr(env, episode_name)[selected_env_ids] = 0.0
     if hasattr(env, "_yaw_fsm_positive_budget"):
         env._yaw_fsm_positive_budget[selected_env_ids] = 0.0
         env._yaw_fsm_positive_budget_pos[selected_env_ids] = 0.0
@@ -1219,6 +1251,18 @@ def yaw_fsm_task_levels(
     )
     telemetry["budget/neg"] = scalar(
         env._yaw_fsm_telemetry_positive_budget_neg / telemetry_steps
+    )
+    transition_steps = max(env._yaw_fsm_telemetry_transition_steps, 1)
+    for field in transition_fields:
+        suffix = "_rate" if field in (
+            "support_ready", "clearance_ready", "attitude_ready", "pose_ready", "torso_contact"
+        ) else ""
+        telemetry[f"transition/{field}{suffix}"] = scalar(
+            getattr(env, f"_yaw_fsm_telemetry_transition_{field}_sum") / transition_steps
+        )
+    telemetry["transition/duration_mean"] = scalar(
+        env.step_dt * env._yaw_fsm_telemetry_transition_steps
+        / max(env._yaw_fsm_telemetry_transition_attempts, 1)
     )
     for suffix in ("pos", "neg"):
         prefix = f"_yaw_fsm_telemetry_{suffix}"

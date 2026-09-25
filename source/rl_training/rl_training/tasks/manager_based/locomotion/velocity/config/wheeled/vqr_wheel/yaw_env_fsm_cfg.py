@@ -501,6 +501,32 @@ class VQRWheelFSMRewardsCfg:
             "asset_cfg": SceneEntityCfg("robot"),
         },
     )
+    return_to_four_landing = RewTerm(
+        func=mdp.ReturnToFourLanding,
+        weight=20.0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=LIFTED_WHEEL_NAMES, preserve_order=True
+            ),
+            "asset_cfg_mirror": SceneEntityCfg(
+                "robot", body_names=LIFTED_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=LIFTED_WHEEL_NAMES, preserve_order=True
+            ),
+            "sensor_cfg_mirror": SceneEntityCfg(
+                "contact_forces", body_names=LIFTED_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "wheel_radius": WHEEL_RADIUS,
+            "fsm_command_name": "yaw_rate_cmd",
+            "contact_threshold": 1.0,
+        },
+    )
+    four_stand_ready_bonus = RewTerm(
+        func=mdp.four_stand_ready_bonus,
+        weight=20.0,
+        params={"fsm_command_name": "yaw_rate_cmd"},
+    )
 
     # ------------------------------ Group 3: phase/curriculum terms ------------------------------
     fsm_gated_tracking = RewTerm(
@@ -668,6 +694,10 @@ class VQRWheelFSMTerminationsCfg(VQRWheelYawTerminationsCfg):
     fsm_transition_timeout = DoneTerm(
         func=mdp.fsm_transition_timeout,
         params={"command_name": "yaw_rate_cmd", "timeout_s": 3.0},
+    )
+    fsm_return_timeout = DoneTerm(
+        func=mdp.fsm_return_timeout,
+        params={"command_name": "yaw_rate_cmd", "timeout_s": 2.5},
     )
 
     swing_contact_timeout = DoneTerm(
