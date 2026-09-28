@@ -9,7 +9,7 @@ import torch
 __all__ = [
     "staged_complete", "staged_failure_cost", "staged_four_contact",
     "staged_four_dwell_bonus", "staged_milestone_bonus", "StagedPromotion",
-    "staged_yaw_task_levels",
+    "staged_promotion_reset", "staged_yaw_task_levels",
 ]
 
 
@@ -18,25 +18,36 @@ def staged_complete(env, command_name: str = "yaw_rate_cmd") -> torch.Tensor:
 
 
 def staged_failure_cost(env) -> torch.Tensor:
-    failed = _staged_failure_mask(env.termination_manager)
+    failed = _staged_failure_mask(env)
     return failed.float() / env.step_dt
 
 
-def _staged_failure_mask(done) -> torch.Tensor:
-    """Count a safety failure even if completion fires on the same simulator step."""
+def _staged_failure_mask(env) -> torch.Tensor:
+    """One failure for safety or an incomplete maneuver timeout."""
+    done = env.termination_manager
+    phase = env.command_manager.get_term("yaw_rate_cmd").episode_phase
+    complete = done.get_term("staged_complete")
     names = getattr(done, "active_terms", None)
     if names is None:
-        return done.terminated & ~done.get_term("staged_complete")
-    failed = torch.zeros_like(done.terminated)
-    for name in names:
-        if name not in ("staged_complete", "time_out"):
-            failed |= done.get_term(name)
-    return failed
+        safety = done.terminated & ~complete
+    else:
+        safety = torch.zeros_like(done.terminated)
+        for name in names:
+            if name not in ("staged_complete", "staged_promotion_reset", "time_out"):
+                safety |= done.get_term(name)
+    incomplete_timeout = done.get_term("time_out") & (phase > 0) & ~complete
+    return safety | incomplete_timeout
+
+
+def staged_promotion_reset(env) -> torch.Tensor:
+    """End all old-stage episodes before the promoted global settings apply."""
+    pending = bool(getattr(env, "_staged_yaw_promotion_reset_pending", False))
+    return torch.full((env.num_envs,), pending, device=env.device, dtype=torch.bool)
 
 
 def staged_four_contact(env, command_name: str = "yaw_rate_cmd") -> torch.Tensor:
     command = env.command_manager.get_term(command_name)
-    return ((command.fsm_state == 0) & command.four_stand_ready).float()
+    return ((command.fsm_state == 0) & command.four_stand_ready).float() * command.four_reward_gate
 
 
 def staged_four_dwell_bonus(env, command_name: str = "yaw_rate_cmd") -> torch.Tensor:
@@ -45,8 +56,8 @@ def staged_four_dwell_bonus(env, command_name: str = "yaw_rate_cmd") -> torch.Te
 
 def staged_milestone_bonus(env, command_name: str = "yaw_rate_cmd") -> torch.Tensor:
     valid = env.command_manager.get_term(command_name).staged_complete
-    valid = valid & ~_staged_failure_mask(env.termination_manager)
-    valid = valid & ~env.termination_manager.get_term("time_out")
+    valid = valid & ~_staged_failure_mask(env)
+    valid = valid & ~env.termination_manager.get_term("staged_promotion_reset")
     return valid.float() / env.step_dt
 
 
@@ -198,6 +209,16 @@ def staged_yaw_task_levels(
            else torch.as_tensor(env_ids, device=env.device, dtype=torch.long))
     completed = ids[env.episode_length_buf[ids] > 0]
     command = env.command_manager.get_term(command_name)
+    pending_reset = bool(getattr(env, "_staged_yaw_promotion_reset_pending", False))
+    if pending_reset:
+        # The promotion termination makes the next _reset_idx contain every
+        # environment. Its episodes were deliberately cut short, so they do
+        # not enter the new stage's evaluation window.
+        all_ids = torch.arange(env.num_envs, device=env.device)
+        if ids.numel() != env.num_envs or not torch.equal(torch.sort(ids).values, all_ids):
+            raise RuntimeError("Staged promotion reset must include all environments.")
+        completed = completed[:0]
+        env._staged_yaw_promotion_reset_pending = False
     if completed.numel():
         # Command computation follows termination/reward computation in Isaac
         # Lab. Refresh the live predicates before certifying a terminal frame.
@@ -209,8 +230,7 @@ def staged_yaw_task_levels(
             command, "four_stand_ready", torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
         )
         done = env.termination_manager
-        timeout = done.get_term("time_out")
-        failed = _staged_failure_mask(done)
+        failed = _staged_failure_mask(env)
         cycle = command.cycle
         episode_phase = getattr(command, "episode_phase", None)
         episode_clearance_index = getattr(command, "episode_clearance_index", None)
@@ -222,7 +242,7 @@ def staged_yaw_task_levels(
             eligible &= episode_clearance_index[completed] == state.clearance_index
         if state.phase == 3 and episode_yaw_index is not None:
             eligible &= episode_yaw_index[completed] == state.yaw_index
-        clean = ~(failed[completed] | timeout[completed] | current_unsafe[completed])
+        clean = ~(failed[completed] | current_unsafe[completed])
         hold_ok = (
             cycle.four_hold_success[completed] & current_four_ready[completed]
             & ~failed[completed] & ~current_unsafe[completed]
@@ -252,8 +272,16 @@ def staged_yaw_task_levels(
                 row[field] += int((value & direction_mask).sum().item())
             for field in ("command_sum", "error_sum", "yaw_samples", "drift_sum", "drift_samples"):
                 row[field] += getattr(cycle, field)[completed][direction_mask].sum().item()
-        state.evaluate(clearance_levels, yaw_rate_levels, tracking_ratio_thresholds,
-                       hold_window, directional_window, required_windows)
+        promoted = state.evaluate(clearance_levels, yaw_rate_levels, tracking_ratio_thresholds,
+                                  hold_window, directional_window, required_windows)
+        if promoted:
+            env._staged_yaw_promotion_reset_pending = True
+
+    if getattr(env, "_staged_yaw_promotion_reset_pending", False):
+        # Curriculum runs inside _reset_idx after Isaac Lab has selected the
+        # current reset IDs. Keep every global reward/DR parameter at the old
+        # level until the queued all-environment reset is processed next step.
+        return {"promotion_reset_pending": torch.tensor(1.0, device=env.device)}
 
     phase = state.phase
     clearance = float(clearance_levels[state.clearance_index] if phase <= 2 else clearance_levels[-1])
@@ -307,6 +335,7 @@ def staged_yaw_task_levels(
         return torch.tensor(float(value), device=env.device)
 
     result = {
+        "promotion_reset_pending": scalar(0.0),
         "phase": scalar(phase), "clearance_index": scalar(state.clearance_index),
         "yaw_index": scalar(state.yaw_index), "target_clearance": scalar(clearance),
         "yaw_limit": scalar(yaw_limit), "online_dr_scale": scalar(dr_scale),

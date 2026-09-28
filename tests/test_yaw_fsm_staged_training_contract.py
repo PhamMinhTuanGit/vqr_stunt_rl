@@ -63,6 +63,20 @@ def test_config_inherits_actor_rewards_and_nominal_rough_pose():
     assert "observations:" not in source
 
 
+def test_promotion_reset_is_a_staged_only_truncation():
+    staged = CONFIG / "yaw_env_fsm_staged_cfg.py"
+    terminations = _class(staged, "VQRWheelStagedTerminationsCfg")
+    terms = {item.targets[0].id: item.value for item in terminations.body
+             if isinstance(item, ast.Assign) and isinstance(item.value, ast.Call)}
+    assert set(terms) == {"staged_complete", "staged_promotion_reset"}
+    promotion = terms["staged_promotion_reset"]
+    arguments = {keyword.arg: keyword.value for keyword in promotion.keywords}
+    assert ast.unparse(arguments["func"]) == "mdp.staged_promotion_reset"
+    assert ast.literal_eval(arguments["time_out"]) is True
+    original = _class(CONFIG / "yaw_env_fsm_cfg.py", "VQRWheelFSMTerminationsCfg")
+    assert "staged_promotion_reset" not in ast.unparse(original)
+
+
 def test_training_has_distinct_startup_and_checkpoint_state():
     tree = ast.parse(TRAIN.read_text())
     names = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}

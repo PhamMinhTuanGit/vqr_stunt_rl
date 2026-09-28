@@ -76,6 +76,7 @@ class VQRWheelStagedTerminationsCfg(VQRWheelFSMTerminationsCfg):
     staged_complete = DoneTerm(
         func=mdp.staged_complete, params={"command_name": "yaw_rate_cmd"},
     )
+    staged_promotion_reset = DoneTerm(func=mdp.staged_promotion_reset, time_out=True)
 
 
 @configclass

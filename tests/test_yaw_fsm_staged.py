@@ -6,6 +6,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -232,4 +233,221 @@ def test_safety_failure_overrides_simultaneous_completion():
             "time_out": torch.tensor([False, False]),
         }[name],
     )
-    assert module._staged_failure_mask(done).tolist() == [False, True]
+    env = SimpleNamespace(
+        termination_manager=done,
+        command_manager=SimpleNamespace(get_term=lambda _: SimpleNamespace(episode_phase=torch.tensor([1, 1]))),
+    )
+    assert module._staged_failure_mask(env).tolist() == [False, True]
+
+
+def test_staged_four_contact_has_bounded_request_grace_and_idle_reward():
+    module = _load("staged_yaw_curriculum")
+    fsm_module = _load("fsm")
+    fsm = fsm_module.YawFSMVectorized(1, dt=.02, four_stand_ready_dwell=.20,
+                                      four_reward_grace_s=.40)
+    command = SimpleNamespace(
+        fsm_state=fsm.fsm_state, four_stand_ready=torch.tensor([True]),
+        four_reward_gate=fsm.four_reward_gate,
+    )
+    env = SimpleNamespace(command_manager=SimpleNamespace(get_term=lambda _: command))
+    false = torch.tensor([False])
+    yaw = torch.tensor([.15])
+
+    fsm.update(torch.zeros(1), false, false, command.four_stand_ready, false)
+    assert module.staged_four_contact(env).item() == 1.0
+    for step in range(30):
+        # Each ready pulse is too short to complete the FOUR dwell. The
+        # request stays latched, so readiness flicker cannot rearm grace.
+        ready = torch.tensor([step % 2 == 0])
+        command.four_stand_ready = ready
+        fsm.update(yaw, false, false, ready, false)
+        if step >= 20 and ready.item():
+            assert module.staged_four_contact(env).item() == 0.0
+    assert fsm.fsm_state.item() == int(fsm_module.VQRFsmState.FOUR_STAND)
+    command.four_stand_ready = torch.tensor([True])
+    fsm.update(torch.zeros(1), false, false, command.four_stand_ready, false)
+    assert module.staged_four_contact(env).item() == 1.0
+
+
+def test_timeout_failure_is_phase_aware_and_one_shot_with_safety():
+    module = _load("staged_yaw_curriculum")
+    phase = torch.tensor([0, 1, 2, 3, 3])
+    terms = {
+        "staged_complete": torch.tensor([False, False, False, False, False]),
+        "staged_promotion_reset": torch.zeros(5, dtype=torch.bool),
+        "torso_contact": torch.tensor([False, False, False, False, True]),
+        "time_out": torch.ones(5, dtype=torch.bool),
+    }
+    done = SimpleNamespace(
+        active_terms=list(terms), terminated=terms["torso_contact"],
+        get_term=lambda name: terms[name],
+    )
+    env = SimpleNamespace(
+        step_dt=.02, termination_manager=done,
+        command_manager=SimpleNamespace(get_term=lambda _: SimpleNamespace(episode_phase=phase)),
+    )
+    assert module._staged_failure_mask(env).tolist() == [False, True, True, True, True]
+    assert module.staged_failure_cost(env).tolist() == [0.0, 50.0, 50.0, 50.0, 50.0]
+    # A valid completion at the episode limit is not an incomplete timeout.
+    terms["staged_complete"][3] = True
+    assert module._staged_failure_mask(env).tolist() == [False, True, True, False, True]
+
+
+@pytest.mark.parametrize("phase", [0, 1, 2, 3])
+def test_timeout_accounting_keeps_attempt_and_rejects_incomplete_maneuver(phase):
+    module = _load("staged_yaw_curriculum")
+    fsm = _load("fsm")
+    cycle = fsm.StagedCycleTracker(1, "cpu", .02, .20)
+    cycle.episode_steps[:] = 10
+    cycle.four_ready_steps[:] = 10
+    cycle.four_ready_time[:] = .20
+    cycle.entered_transition[:] = True
+    cycle.entered_yaw[:] = True
+    cycle.landed_four[:] = True
+    cycle.full_cycle_complete[:] = True
+    command = SimpleNamespace(
+        schedule=SimpleNamespace(sign=torch.tensor([1])), cycle=cycle,
+        episode_phase=torch.tensor([phase]), cfg=SimpleNamespace(),
+        unsafe=torch.tensor([False]), four_stand_ready=torch.tensor([True]),
+    )
+    terms = {
+        "staged_complete": torch.tensor([False]),
+        "staged_promotion_reset": torch.tensor([False]),
+        "time_out": torch.tensor([True]),
+    }
+    done = SimpleNamespace(
+        active_terms=list(terms), terminated=torch.tensor([False]),
+        get_term=lambda name: terms[name],
+    )
+    event_cfgs = {name: SimpleNamespace(params={}) for name in (
+        "randomize_apply_external_force_torque", "randomize_actuator_gains", "randomize_push_robot",
+    )}
+    env = SimpleNamespace(
+        num_envs=1, device="cpu", step_dt=.02, episode_length_buf=torch.tensor([10]),
+        command_manager=SimpleNamespace(get_term=lambda _: command), termination_manager=done,
+        reward_manager=SimpleNamespace(active_terms=[]),
+        event_manager=SimpleNamespace(
+            get_term_cfg=lambda name: event_cfgs[name],
+            set_term_cfg=lambda name, value: event_cfgs.__setitem__(name, value),
+        ),
+        _staged_yaw_promotion=module.StagedPromotion(phase=phase),
+    )
+    module.staged_yaw_task_levels(env, [0], "yaw_rate_cmd", (.02, .03, .05),
+                                  (.15, .25), (.30, 1.0), (.30, .30))
+    row = env._staged_yaw_promotion.window["pos"]
+    assert row["attempts"] == 1
+    assert row["four_hold"] == (1 if phase == 0 else 0)
+    if phase:
+        assert row[("entry", "yaw", "yaw", "cycle")[phase]] == 0
+
+
+@pytest.mark.parametrize("phase", [0, 2, 3])
+def test_promotion_resets_all_episodes_before_global_reward_change(phase):
+    module = _load("staged_yaw_curriculum")
+    clearance_levels = (.02, .03, .05)
+    yaw_levels = (.15, .25)
+    dr_levels = (.30, 1.0)
+    tracking = (.30, .30)
+    stage = module.StagedPromotion(phase=phase)
+    stage.consecutive_passes = 2
+    stage.record("pos", four_hold=1, entry=1, yaw=1, support=1, pose=1, cycle=1,
+                 command_sum=1.0, error_sum=.1, drift_sum=.02, drift_samples=1)
+    target_before = .05 if phase == 3 else .02
+    cfg = SimpleNamespace(
+        staged_phase=phase, staged_clearance_index=0, staged_yaw_index=0,
+        yaw_rate_limit=.15, yaw_rate_range=(-.15, .15), target_clearance=target_before,
+    )
+    cycle = SimpleNamespace(
+        four_hold_success=torch.ones(2, dtype=torch.bool),
+        entered_transition=torch.ones(2, dtype=torch.bool),
+        entered_yaw=torch.ones(2, dtype=torch.bool),
+        landed_four=torch.ones(2, dtype=torch.bool),
+        full_cycle_complete=torch.ones(2, dtype=torch.bool),
+        invalid=torch.zeros(2, dtype=torch.bool),
+        support_ready_seen=torch.ones(2, dtype=torch.bool),
+        pose_ready_seen=torch.ones(2, dtype=torch.bool),
+        command_sum=torch.ones(2), error_sum=torch.full((2,), .1),
+        yaw_samples=torch.ones(2, dtype=torch.long),
+        drift_sum=torch.full((2,), .02), drift_samples=torch.ones(2, dtype=torch.long),
+    )
+    command = SimpleNamespace(
+        cfg=cfg, cycle=cycle, schedule=SimpleNamespace(sign=torch.tensor([1, -1])),
+        episode_phase=torch.full((2,), phase),
+        episode_clearance_index=torch.zeros(2, dtype=torch.long),
+        episode_yaw_index=torch.zeros(2, dtype=torch.long),
+        episode_yaw_limit=torch.full((2,), .15),
+        episode_target_clearance=torch.full((2,), target_before),
+        unsafe=torch.zeros(2, dtype=torch.bool),
+        four_stand_ready=torch.ones(2, dtype=torch.bool),
+    )
+    terms = {
+        "staged_complete": torch.tensor([False, phase > 0]),
+        "staged_promotion_reset": torch.zeros(2, dtype=torch.bool),
+        "time_out": torch.tensor([False, phase == 0]),
+    }
+    done = SimpleNamespace(
+        active_terms=list(terms), terminated=terms["staged_complete"],
+        get_term=lambda name: terms[name],
+    )
+    reward_cfg = SimpleNamespace(weight=2.0, params={"target_clearance": target_before})
+    rewards = SimpleNamespace(
+        active_terms=["fsm_gated_tracking"], get_term_cfg=lambda _: reward_cfg,
+        set_term_cfg=lambda name, value: None,
+    )
+    event_cfgs = {name: SimpleNamespace(params={}) for name in (
+        "randomize_apply_external_force_torque", "randomize_actuator_gains", "randomize_push_robot",
+    )}
+    event_cfgs["randomize_apply_external_force_torque"].params["force_range"] = (-3.0, 3.0) if phase == 3 else (0.0, 0.0)
+    events = SimpleNamespace(
+        get_term_cfg=lambda name: event_cfgs[name],
+        set_term_cfg=lambda name, value: event_cfgs.__setitem__(name, value),
+    )
+    env = SimpleNamespace(
+        num_envs=2, device="cpu", step_dt=.02,
+        episode_length_buf=torch.tensor([10, 10]),
+        _staged_yaw_promotion=stage,
+        command_manager=SimpleNamespace(get_term=lambda _: command),
+        termination_manager=done, reward_manager=rewards, event_manager=events,
+    )
+    args = (env, [1], "yaw_rate_cmd", clearance_levels, yaw_levels, dr_levels, tracking)
+    module.staged_yaw_task_levels(*args, hold_window=2, directional_window=1, required_windows=3)
+    assert env._staged_yaw_promotion_reset_pending
+    assert (stage.phase, stage.clearance_index, stage.yaw_index) == (
+        (1, 0, 0) if phase == 0 else (2, 1, 0) if phase == 2 else (3, 0, 1)
+    )
+    assert cfg.target_clearance == target_before
+    assert reward_cfg.params["target_clearance"] == target_before
+    assert cfg.yaw_rate_limit == .15
+    assert event_cfgs["randomize_apply_external_force_torque"].params["force_range"] == (
+        (-3.0, 3.0) if phase == 3 else (0.0, 0.0)
+    )
+    reset_mask = module.staged_promotion_reset(env)
+    assert reset_mask.tolist() == [True, True]
+    assert not module._staged_failure_mask(env).any()
+
+    # Isaac Lab's next step selects every ID from the promotion termination,
+    # then applies curriculum before command_manager.reset(all_ids).
+    terms["staged_promotion_reset"] = reset_mask
+    terms["staged_complete"] = torch.zeros(2, dtype=torch.bool)
+    terms["time_out"] = torch.zeros(2, dtype=torch.bool)
+    done.terminated = torch.zeros(2, dtype=torch.bool)
+    assert not module._staged_failure_mask(env).any()
+    all_ids = reset_mask.nonzero().flatten()
+    module.staged_yaw_task_levels(env, all_ids, "yaw_rate_cmd", clearance_levels,
+                                  yaw_levels, dr_levels, tracking,
+                                  hold_window=2, directional_window=1, required_windows=3)
+    assert not env._staged_yaw_promotion_reset_pending
+    assert stage.window["pos"]["attempts"] == stage.window["neg"]["attempts"] == 0
+    command.episode_phase[all_ids] = cfg.staged_phase
+    command.episode_clearance_index[all_ids] = cfg.staged_clearance_index
+    command.episode_yaw_index[all_ids] = cfg.staged_yaw_index
+    command.episode_yaw_limit[all_ids] = cfg.yaw_rate_limit
+    command.episode_target_clearance[all_ids] = cfg.target_clearance
+    assert command.episode_phase.unique().tolist() == [cfg.staged_phase]
+    assert torch.all(command.episode_target_clearance == reward_cfg.params["target_clearance"])
+    assert torch.all(command.episode_yaw_limit == cfg.yaw_rate_limit)
+    assert cfg.target_clearance == (.03 if phase == 2 else target_before)
+    assert cfg.yaw_rate_limit == (.25 if phase == 3 else .15)
+    assert event_cfgs["randomize_apply_external_force_torque"].params["force_range"] == (
+        (-10.0, 10.0) if phase == 3 else (-0.0, 0.0)
+    )
