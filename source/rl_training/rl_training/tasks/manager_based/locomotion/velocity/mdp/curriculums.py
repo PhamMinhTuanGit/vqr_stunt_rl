@@ -1190,7 +1190,7 @@ def yaw_fsm_task_levels(
     # Changes to phase rewards are linearly ramped, avoiding a discontinuous
     # value-target change when B/C opens.  `common_step_counter` advances once
     # per vectorized environment step, independent of how many envs reset.
-    phase_weights = ((8.0, 2.0, 0.0, 0.0), (8.0, 2.0, -0.5, 0.0), (8.0, 2.0, -2.0, -2.0))[phase]
+    phase_weights = ((8.0, 1.0, 0.0, 0.0), (8.0, 1.0, -0.5, 0.0), (8.0, 1.0, -2.0, -60.0))[phase]
     phase_terms = (
         yaw_reward_name,
         transition_reward_name,

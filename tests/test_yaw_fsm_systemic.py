@@ -40,7 +40,7 @@ def _reward_scene():
         env_origins = torch.zeros(2, 3)
 
     env = SimpleNamespace(
-        num_envs=2, device="cpu", common_step_counter=0,
+        num_envs=2, device="cpu", step_dt=.02, common_step_counter=0,
         scene=Scene(robot=SimpleNamespace(data=SimpleNamespace(
             root_pos_w=torch.tensor([[0., 0., .49], [0., 0., .49]]),
             root_quat_w=torch.zeros(2, 4), root_ang_vel_b=torch.zeros(2, 3),
@@ -63,7 +63,6 @@ def _pose_rewards(rewards, env):
         2 * rewards["yaw_balance"](env, std=.25, **fsm),
         3 * rewards["yaw_com_support"](env, std=.08, **geom, **fsm),
         2 * rewards["yaw_com_inside_support_segment"](env, std=.05, **geom, **fsm),
-        3 * rewards["yaw_transition_support_load"](env, target_force_n=80, **support, **fsm),
         3 * rewards["yaw_lift_clearance"](env, **lift,
             support_sensor_cfg=support["sensor_cfg"], support_sensor_cfg_mirror=support["sensor_cfg_mirror"]),
         8 * rewards["fsm_gated_tracking"](env, command_name="yaw_rate_cmd", **fsm,
@@ -76,7 +75,7 @@ def _pose_rewards(rewards, env):
 
 
 @pytest.mark.parametrize("clearance", [0., .5, .79, 1.])
-def test_stalled_transition_has_no_positive_pose_income_and_handoff_does_not_drop(clearance):
+def test_stalled_transition_has_no_pose_income_and_handoff_does_not_drop(clearance):
     rewards, state, env, command = _reward_scene()
     for progress in env.lift_progress.values():
         progress.fill_(clearance)
@@ -84,7 +83,7 @@ def test_stalled_transition_has_no_positive_pose_income_and_handoff_does_not_dro
         env.common_step_counter += 1
         command.state_time.fill_(elapsed)
         transition = _pose_rewards(rewards, env)
-        assert (transition <= 0).all()
+        assert torch.equal(transition, torch.zeros_like(transition))
         assert torch.allclose(transition[:, 0], transition[:, 1])
     # Identical physical pose, changed FSM gate: no acquisition reward cliff.
     command.fsm_state[:] = torch.tensor([state.YAW_POS, state.YAW_NEG])
@@ -100,7 +99,9 @@ def test_lift_progress_cannot_be_refarmed_after_lowering_or_yaw_chatter():
     args = dict(asset_cfg=SimpleNamespace(name="pos"), asset_cfg_mirror=SimpleNamespace(name="neg"),
                 wheel_radius=.091, target_clearance=.05, fsm_command_name="yaw_rate_cmd",
                 support_sensor_cfg=SimpleNamespace(name="contact_forces", body_ids=[0, 3]),
-                support_sensor_cfg_mirror=SimpleNamespace(name="contact_forces", body_ids=[1, 2]))
+                support_sensor_cfg_mirror=SimpleNamespace(name="contact_forces", body_ids=[1, 2]),
+                com_asset_cfg=SimpleNamespace(name="robot"),
+                com_asset_cfg_mirror=SimpleNamespace(name="robot"))
 
     def step(clearance, states):
         env.common_step_counter += 1
@@ -111,17 +112,61 @@ def test_lift_progress_cannot_be_refarmed_after_lowering_or_yaw_chatter():
 
     trans = [state.TRANSITION_POS, state.TRANSITION_NEG]
     yaw = [state.YAW_POS, state.YAW_NEG]
+    assert torch.equal(step(0., trans), torch.zeros(2))
     assert (step(.5, trans) > 0).all()
     for _ in range(20):
         assert (step(.5, trans) <= 0).all()
     assert (step(.2, trans) <= 0).all()
-    assert (step(.5, trans) <= 0).all()
+    assert torch.equal(step(.5, trans), torch.zeros(2))
     assert torch.equal(step(.8, yaw), torch.zeros(2))
-    assert (step(.8, trans) <= 0).all()
+    assert torch.equal(step(.8, trans), torch.zeros(2))
     assert (step(1., trans) > 0).all()
     progress_reward.reset(torch.tensor([0]))
     result = step(.5, trans)
-    assert result[0] > 0 and result[1] <= 0
+    assert result[0] == 0 and result[1] == 0
+    result = step(.75, trans)
+    assert result[0] > 0 and result[1] == 0
+
+
+def test_zero_selected_support_blocks_lift_and_com_acquisition_for_both_signs():
+    rewards, _, env, _ = _reward_scene()
+    term = rewards["TransitionProgress"](None, env)
+    args = dict(asset_cfg=SimpleNamespace(name="pos"), asset_cfg_mirror=SimpleNamespace(name="neg"),
+                wheel_radius=.091, target_clearance=.05, fsm_command_name="yaw_rate_cmd",
+                support_sensor_cfg=SimpleNamespace(name="contact_forces", body_ids=[0, 3]),
+                support_sensor_cfg_mirror=SimpleNamespace(name="contact_forces", body_ids=[1, 2]),
+                com_asset_cfg=SimpleNamespace(name="robot"),
+                com_asset_cfg_mirror=SimpleNamespace(name="robot"))
+    forces = env.scene.sensors["contact_forces"].data.net_forces_w
+    forces.zero_()
+    forces[0, [1, 2], 2] = 80.0  # Load the opposite diagonal only.
+    forces[1, [0, 3], 2] = 80.0
+    distance = torch.full((2,), .32)
+    projection = torch.full((2,), -1.0)
+    rewards["_yaw_support_geometry"] = lambda env, cfg: (distance, projection, torch.ones(2))
+
+    assert torch.equal(term(env, **args), torch.zeros(2))
+    for progress in env.lift_progress.values():
+        progress.fill_(1.0)
+    distance.zero_()
+    projection.fill_(.5)
+    env.common_step_counter += 1
+    assert torch.equal(term(env, **args), torch.zeros(2))
+
+    # Restoring the selected support can pay only the remaining new maximum.
+    forces.zero_()
+    forces[0, [0, 3], 2] = 80.0
+    forces[1, [1, 2], 2] = 80.0
+    env.common_step_counter += 1
+    credit = term(env, **args) * env.step_dt
+    assert torch.allclose(credit, torch.full((2,), 14.0))
+    forces.zero_()
+    env.common_step_counter += 1
+    assert torch.equal(term(env, **args), torch.zeros(2))
+    forces[0, [0, 3], 2] = 80.0
+    forces[1, [1, 2], 2] = 80.0
+    env.common_step_counter += 1
+    assert torch.equal(term(env, **args), torch.zeros(2))
 
 
 def test_return_progress_and_stability_keep_their_original_values():
@@ -130,7 +175,9 @@ def test_return_progress_and_stability_keep_their_original_values():
     args = dict(asset_cfg=SimpleNamespace(name="pos"), asset_cfg_mirror=SimpleNamespace(name="neg"),
                 wheel_radius=.091, target_clearance=.05, fsm_command_name="yaw_rate_cmd",
                 support_sensor_cfg=SimpleNamespace(name="contact_forces", body_ids=[0, 3]),
-                support_sensor_cfg_mirror=SimpleNamespace(name="contact_forces", body_ids=[1, 2]))
+                support_sensor_cfg_mirror=SimpleNamespace(name="contact_forces", body_ids=[1, 2]),
+                com_asset_cfg=SimpleNamespace(name="robot"),
+                com_asset_cfg_mirror=SimpleNamespace(name="robot"))
     command.fsm_state.fill_(state.RETURN_TO_4)
     for progress in env.lift_progress.values():
         progress.fill_(1.)
@@ -150,9 +197,42 @@ def test_return_progress_and_stability_keep_their_original_values():
         env, target_height=.49, fsm_command_name="yaw_rate_cmd"), torch.ones(2))
 
 
+def test_failure_cost_is_one_episode_scale_event_and_waiting_beats_early_failure():
+    rewards, _, env, _ = _reward_scene()
+    _load_nodes(REWARDS_PATH, {"fsm_failure_cost"}, rewards)
+    env.termination_manager = SimpleNamespace(terminated=torch.tensor([True, False]))
+    pulse = rewards["fsm_failure_cost"](env)
+    assert torch.equal(pulse * env.step_dt, torch.tensor([1.0, 0.0]))
+
+    # Even at the former -19/s from tracking, lift and support load, the
+    # episode-scale cost makes trying for another second better than failing
+    # immediately. The current transition pose terms no longer pay this cost.
+    gamma = .99
+    steps = int(1.0 / env.step_dt)
+    early_failure = -60.0
+    continued_attempt = sum(-19.0 * env.step_dt * gamma**step for step in range(steps))
+    continued_attempt -= 60.0 * gamma**steps
+    assert continued_attempt > early_failure
+
+
+def test_safe_recovery_entry_cost_is_one_pulse():
+    rewards, state, env, command = _reward_scene()
+    _load_nodes(REWARDS_PATH, {"safe_recovery_entry"}, rewards)
+    command.fsm_state.fill_(state.SAFE_RECOVERY)
+    command.just_switched.fill_(True)
+    env.common_step_counter += 1
+    assert torch.equal(
+        rewards["safe_recovery_entry"](env, "yaw_rate_cmd") * env.step_dt,
+        torch.ones(2),
+    )
+    command.just_switched.fill_(False)
+    env.common_step_counter += 1
+    assert torch.equal(rewards["safe_recovery_entry"](env, "yaw_rate_cmd"), torch.zeros(2))
+
+
 def test_watchdog_survives_chatter_pauses_in_yaw_and_resets_only_at_maneuver_end():
     module = _load_fsm_module()
-    fsm = module.YawFSMVectorized(2)
+    fsm = module.YawFSMVectorized(2, four_stand_ready_dwell=0.0)
     namespace = {"torch": torch, "ManagerBasedRLEnv": object, "VQRFsmState": module.VQRFsmState}
     _load_nodes(FSM_PATH.with_name("terminations.py"), {"fsm_transition_timeout"}, namespace)
     env = SimpleNamespace(num_envs=2, device="cpu", command_manager=SimpleNamespace(get_term=lambda _: fsm))

@@ -63,10 +63,12 @@ def test_fsm_balance_is_gated_and_reward_counts_are_isolated():
     assert len(fsm) == 26
     assert "transition_low_base_height" in fsm
     assert "support_contact" not in fsm
-    assert "transition_support_load" in fsm
+    assert "transition_support_load" not in fsm
+    assert "fsm_failure" in fsm
     assert "return_to_four_landing" in fsm
     assert "four_stand_ready_bonus" in fsm
-    assert ast.literal_eval(_keyword(fsm["transition_support_load"], "weight")) == 3.0
+    assert ast.literal_eval(_keyword(fsm["fsm_failure"], "weight")) == -60.0
+    assert ast.literal_eval(_keyword(fsm["transition_progress"], "weight")) == 1.0
 
     fsm_balance_params = ast.literal_eval(_keyword(fsm["balance"], "params"))
     baseline_balance_params = ast.literal_eval(_keyword(baseline["balance"], "params"))
@@ -147,7 +149,7 @@ def test_fsm_startup_contract_checks_reward_and_command_runtime_objects():
     required = {
         "fsm_gated_tracking",
         "transition_progress",
-        "transition_support_load",
+        "fsm_failure",
         "transition_low_base_height",
         "return_to_four_landing",
         "four_stand_ready_bonus",

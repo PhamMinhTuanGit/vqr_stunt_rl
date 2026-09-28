@@ -611,11 +611,9 @@ def test_fsm_checkpoint_restores_phase_c_timing_and_reapplies_config(
         ] == pytest.approx(0.20)
 
     assert resumed_env.reward_manager.get_term_cfg("fsm_gated_tracking").weight == pytest.approx(8.0)
-    assert resumed_env.reward_manager.get_term_cfg("transition_progress").weight == pytest.approx(2.0)
+    assert resumed_env.reward_manager.get_term_cfg("transition_progress").weight == pytest.approx(2.0 - 1.0 / 6.0)
     assert resumed_env.reward_manager.get_term_cfg("spin_center_drift").weight == pytest.approx(-0.75)
-    assert resumed_env.reward_manager.get_term_cfg("safe_recovery_entry").weight == pytest.approx(
-        -1.0 / 3.0
-    )
+    assert resumed_env.reward_manager.get_term_cfg("safe_recovery_entry").weight == pytest.approx(-10.0)
     tracking_params = resumed_env.reward_manager.get_term_cfg("fsm_gated_tracking").params
     assert tracking_params["clearance_gate_floor"] == 0.0
     assert tracking_params["clearance_gate_floor_decay_s"] == 0.0

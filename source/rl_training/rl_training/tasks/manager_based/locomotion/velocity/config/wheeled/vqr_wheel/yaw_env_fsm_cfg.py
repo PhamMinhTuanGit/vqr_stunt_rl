@@ -44,7 +44,7 @@ LEG_JOINT_NAMES = [
 WHEEL_RADIUS = 0.091
 TARGET_BASE_HEIGHT = 0.49
 MIN_BASE_HEIGHT = 0.35
-TRANSITION_HEIGHT_WARNING = 0.43
+TRANSITION_HEIGHT_SAFE = 0.50
 SUPPORT_SPAN_MIN = 0.50
 SUPPORT_SPAN_MAX = 0.70
 TARGET_LIFT_CLEARANCE = 0.20
@@ -282,11 +282,10 @@ class VQRWheelRewardsCfg:
 
 @configclass
 class VQRWheelFSMRewardsCfg:
-    """The 26-term reward contract for ``Flat-VQR-Wheel-Yaw-FSM``.
+    """The reward contract for ``Flat-VQR-Wheel-Yaw-FSM``.
 
-    Safety/regularization penalties retain their baseline weights. Positive
-    pose terms become nonpositive deficits in TRANSITION; YAW and RETURN
-    retain their rewards. POS/NEG select the command's ``support_diagonal``.
+    Acquisition improvement is paid once per diagonal and episode. YAW and
+    RETURN retain their pose rewards; failure has one episode-scale cost.
     """
 
     # ------------------------------ Group 1: always-on baseline ------------------------------
@@ -367,11 +366,11 @@ class VQRWheelFSMRewardsCfg:
         },
     )
     transition_low_base_height = RewTerm(
-        func=mdp.yaw_transition_low_base_height,
-        weight=-4.0,
+        func=mdp.TransitionHeightProgress,
+        weight=4.0,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "warning_height": TRANSITION_HEIGHT_WARNING,
+            "safe_height": TRANSITION_HEIGHT_SAFE,
             "minimum_height": MIN_BASE_HEIGHT,
             "fsm_command_name": "yaw_rate_cmd",
         },
@@ -383,7 +382,7 @@ class VQRWheelFSMRewardsCfg:
             "asset_cfg": SceneEntityCfg("robot"),
             "minimum_height": MIN_BASE_HEIGHT,
             "height_margin": 0.10,
-            "warning_height": TRANSITION_HEIGHT_WARNING,
+            "warning_height": TRANSITION_HEIGHT_SAFE,
             "fsm_command_name": "yaw_rate_cmd",
         },
     )
@@ -431,20 +430,6 @@ class VQRWheelFSMRewardsCfg:
             "maximum_span": SUPPORT_SPAN_MAX,
             "std": 0.05,
             "fsm_command_name": "yaw_rate_cmd",
-        },
-    )
-    transition_support_load = RewTerm(
-        func=mdp.yaw_transition_support_load,
-        weight=3.0,
-        params={
-            "sensor_cfg": SceneEntityCfg(
-                "contact_forces", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
-            ),
-            "sensor_cfg_mirror": SceneEntityCfg(
-                "contact_forces", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
-            ),
-            "fsm_command_name": "yaw_rate_cmd",
-            "target_force_n": SUPPORT_LOAD_TARGET_N,
         },
     )
     lift_clearance = RewTerm(
@@ -592,7 +577,7 @@ class VQRWheelFSMRewardsCfg:
     )
     transition_progress = RewTerm(
         func=mdp.TransitionProgress,
-        weight=2.0,
+        weight=1.0,
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot", body_names=LIFTED_WHEEL_NAMES, preserve_order=True
@@ -612,7 +597,17 @@ class VQRWheelFSMRewardsCfg:
             ),
             "support_force_target_n": SUPPORT_LOAD_TARGET_N,
             "transition_ungated_fraction": TRANSITION_LIFT_UNGATED_FRACTION,
+            "com_asset_cfg": SceneEntityCfg(
+                "robot", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+            "com_asset_cfg_mirror": SceneEntityCfg(
+                "robot", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
         },
+    )
+    fsm_failure = RewTerm(
+        func=mdp.fsm_failure_cost,
+        weight=-60.0,
     )
     spin_center_drift = RewTerm(
         func=mdp.spin_center_drift,
@@ -624,7 +619,7 @@ class VQRWheelFSMRewardsCfg:
     )
     safe_recovery_entry = RewTerm(
         func=mdp.safe_recovery_entry,
-        weight=0.0,  # Termination semantics in phases A/B; -2.0 in phase C.
+        weight=0.0,  # Terminal cost in phases A/B; entry cost in phase C.
         params={"fsm_command_name": "yaw_rate_cmd"},
     )
 
@@ -973,6 +968,7 @@ class VQRWheelFSMCommandsCfg(CommandsCfg):
         yaw_enter=0.10,
         yaw_exit=0.05,
         yaw_min_dwell=0.20,
+        four_stand_ready_dwell=0.20,
         recovery_dwell=0.50,
         support_sensor_cfg=SceneEntityCfg(
             "contact_forces", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True

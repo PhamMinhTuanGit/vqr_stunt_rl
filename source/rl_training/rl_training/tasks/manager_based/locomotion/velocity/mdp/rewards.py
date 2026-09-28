@@ -191,22 +191,6 @@ def _yaw_support_load_quality(
     return 0.8 * per_wheel.amin(dim=1) + 0.2 * per_wheel.mean(dim=1)
 
 
-def yaw_transition_support_load(
-    env: ManagerBasedRLEnv,
-    sensor_cfg: SceneEntityCfg,
-    sensor_cfg_mirror: SceneEntityCfg,
-    fsm_command_name: str,
-    target_force_n: float,
-) -> torch.Tensor:
-    """Penalize missing support load in TRANSITION; a held pose earns no income."""
-    gates = fsm_gates(env, fsm_command_name)
-    pos = _yaw_support_load_quality(env, sensor_cfg, target_force_n)
-    neg = _yaw_support_load_quality(env, sensor_cfg_mirror, target_force_n)
-    reward = (torch.where(gates["diag_pos"], pos, neg) - 1.0) * gates["f_trans"]
-    _fsm_record_positive_budget(env, gates, "transition_support_load", reward)
-    return reward
-
-
 def _yaw_support_shape(contacts: torch.Tensor) -> torch.Tensor:
     """Give nearly all support credit only when both selected wheels contact."""
     c1, c2 = contacts.to(dtype=torch.float32).unbind(dim=1)
@@ -263,7 +247,7 @@ def yaw_com_support(
     mirror_distance, _, _ = _yaw_support_geometry(env, asset_cfg_mirror)
     mirror_score = 1.0 / (1.0 + mirror_distance / std)
     gates = fsm_gates(env, fsm_command_name)
-    reward = torch.where(gates["diag_pos"], score, mirror_score) * gates["f_geom"] - gates["f_trans"]
+    reward = torch.where(gates["diag_pos"], score, mirror_score) * gates["f_yaw"]
     _fsm_record_positive_budget(env, gates, "com_support", reward)
     return reward
 
@@ -319,20 +303,55 @@ def yaw_low_base_height_l1(
     return torch.relu(minimum_height - base_height) / error_scale
 
 
-def yaw_transition_low_base_height(
-    env: ManagerBasedRLEnv,
-    warning_height: float,
-    minimum_height: float,
-    fsm_command_name: str,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """Soft collapse warning in TRANSITION, before the hard height boundary."""
-    if warning_height <= minimum_height:
-        raise ValueError("warning_height must exceed minimum_height.")
-    asset: Articulation = env.scene[asset_cfg.name]
-    base_height = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
-    proximity = ((warning_height - base_height) / (warning_height - minimum_height)).clamp(0.0, 1.0)
-    return proximity.square() * fsm_gates(env, fsm_command_name)["f_trans"]
+class TransitionHeightProgress(ManagerTermBase):
+    """Pay changes in a bounded safety margin only during TRANSITION."""
+
+    def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.prev_potential = torch.zeros(env.num_envs, device=env.device)
+        self.was_transition = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+        self.loss_budget = torch.zeros(env.num_envs, device=env.device)
+
+    def reset(self, env_ids=None) -> None:
+        if env_ids is None:
+            self.prev_potential.zero_()
+            self.was_transition.zero_()
+            self.loss_budget.zero_()
+        else:
+            self.prev_potential[env_ids] = 0.0
+            self.was_transition[env_ids] = False
+            self.loss_budget[env_ids] = 0.0
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        safe_height: float,
+        minimum_height: float,
+        fsm_command_name: str,
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ) -> torch.Tensor:
+        if safe_height <= minimum_height:
+            raise ValueError("safe_height must exceed minimum_height.")
+        asset: Articulation = env.scene[asset_cfg.name]
+        base_height = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+        margin = ((base_height - minimum_height) / (safe_height - minimum_height)).clamp(0.0, 1.0)
+        # Concave progress gives an earlier signal and a steeper loss near the
+        # unsafe boundary, while staying bounded in [0, 1].
+        potential = 1.5 * margin - 0.5 * margin.square()
+        transition = fsm_gates(env, fsm_command_name)["b_trans"]
+        continuing = transition & self.was_transition
+        # RewardManager multiplies by step_dt; cancel it so the episode-scale
+        # height cost is the potential change, with no time-at-height deficit.
+        delta = torch.where(continuing, potential - self.prev_potential, torch.zeros_like(potential))
+        loss = torch.relu(-delta)
+        recovery = torch.minimum(torch.relu(delta), self.loss_budget + loss)
+        self.loss_budget += loss - recovery
+        # Recovery only refunds height lost during TRANSITION in this episode.
+        # Falling in YAW then re-entering TRANSITION cannot create income.
+        reward = (recovery - loss) / env.step_dt
+        self.prev_potential.copy_(potential)
+        self.was_transition.copy_(transition)
+        return reward
 
 
 def yaw_downward_low_base_velocity_l2(
@@ -355,7 +374,8 @@ def yaw_downward_low_base_velocity_l2(
     if fsm_command_name is not None:
         if warning_height is None or warning_height <= minimum_height:
             raise ValueError("warning_height must exceed minimum_height for FSM gating.")
-        warning_gate = ((warning_height - base_height) / (warning_height - minimum_height)).clamp(0.0, 1.0)
+        proximity = ((warning_height - base_height) / (warning_height - minimum_height)).clamp(0.0, 1.0)
+        warning_gate = proximity.square() * (3.0 - 2.0 * proximity)
         low_gate = torch.maximum(low_gate, warning_gate * fsm_gates(env, fsm_command_name)["f_trans"])
     downward_speed = torch.relu(-asset.data.root_lin_vel_w[:, 2])
     return low_gate * downward_speed.square()
@@ -442,8 +462,8 @@ def yaw_lift_clearance(
     Each selected wheel contributes independently. The baseline score is in
     ``[-1, 1]``: both wheels on the ground score ``-1``, lifting either wheel
     improves the score, and both wheels must reach the target to score ``1``.
-    In FSM TRANSITION, support load shapes the score before subtracting its
-    maximum, leaving a nonpositive deficit. Raw metrics and YAW are unchanged.
+    TRANSITION acquisition credit is paid once by TransitionProgress. Raw
+    metrics and YAW keep their original signed score.
     """
     progress = _yaw_lift_progress(env, asset_cfg, wheel_radius, target_clearance)
 
@@ -481,14 +501,7 @@ def yaw_lift_clearance(
     env._yaw_lift_min_progress_sum += min_progress
     env._yaw_lift_min_progress_samples += 1
     selected_score = torch.where(gates["diag_pos"], score, mirror_score)
-    support_pos = _yaw_support_load_quality(env, support_sensor_cfg, support_force_target_n)
-    support_neg = _yaw_support_load_quality(env, support_sensor_cfg_mirror, support_force_target_n)
-    support_quality = torch.where(gates["diag_pos"], support_pos, support_neg)
-    lift_gate = transition_ungated_fraction + (1.0 - transition_ungated_fraction) * support_quality
-    # Preserve the no-lift gradient before centering the transition score.
-    # Only positive lift credit is reduced when support is weak.
-    transition_score = torch.clamp(selected_score, max=0.0) + torch.relu(selected_score) * lift_gate
-    reward = (transition_score - 1.0) * gates["f_trans"] + selected_score * gates["f_yaw"]
+    reward = selected_score * gates["f_yaw"]
     _fsm_record_positive_budget(env, gates, "lift_clearance", reward)
     return reward
 
@@ -520,7 +533,7 @@ def yaw_com_inside_support_segment(
     ) * mirror_segment_length
     mirror_score = torch.exp(-mirror_outside_distance.square() / std**2)
     gates = fsm_gates(env, fsm_command_name)
-    reward = torch.where(gates["diag_pos"], score, mirror_score) * gates["f_geom"] - gates["f_trans"]
+    reward = torch.where(gates["diag_pos"], score, mirror_score) * gates["f_yaw"]
     _fsm_record_positive_budget(env, gates, "com_inside_segment", reward)
     return reward
 
@@ -544,7 +557,7 @@ def yaw_balance(
     if fsm_command_name is None:
         return score
     gates = fsm_gates(env, fsm_command_name)
-    reward = score * (1.0 - gates["f_safe"]) - gates["f_trans"]
+    reward = score * (1.0 - gates["f_safe"] - gates["f_trans"])
     _fsm_record_positive_budget(env, gates, "balance", reward)
     return reward
 
@@ -1073,13 +1086,11 @@ def fsm_gated_tracking(
     else:
         floor = clearance_gate_floor
     clearance_weight = floor + (1.0 - floor) * lift_progress
-    state_gate = gates["f_trans"] + gates["f_yaw"]
+    state_gate = gates["f_yaw"]
     tracking = support_gate * clearance_weight * yaw_tracking * state_gate
     # Contact alone gives no bonus while the swing pair is still on the ground.
     support_bonus = 0.25 * support_shape * lift_progress * state_gate
-    # Center TRANSITION at its maximum: holding pose/tracking is never
-    # positive income. YAW retains the original tracking and support bonus.
-    reward = tracking + support_bonus - 1.25 * gates["f_trans"]
+    reward = tracking + support_bonus
     _fsm_record_positive_budget(env, gates, "fsm_gated_tracking", reward)
     return reward
 
@@ -1106,11 +1117,10 @@ def four_stand_stability(
     height_score = torch.exp(-(base_height - target_height).square() / height_std**2)
     attitude_score = torch.exp(-(roll.square() + pitch.square()) / attitude_std**2)
     gates = fsm_gates(env, fsm_command_name)
-    # Transition retains a decaying attitude deficit, without tracking the
-    # standing height. Height tracking remains active in FOUR_STAND/RETURN.
+    # Height tracking remains active in FOUR_STAND/RETURN. Transition
+    # acquisition is paid only for new progress by TransitionProgress.
     standing_gate = gates["f_four"] + gates["f_return"] * gates["tau"]
-    transition_gate = gates["f_trans"] * (1.0 - gates["tau"])
-    reward = (standing_gate * height_score + transition_gate) * attitude_score - transition_gate
+    reward = standing_gate * height_score * attitude_score
     _fsm_record_positive_budget(env, gates, "four_stand_stability", reward)
     return reward
 
@@ -1173,20 +1183,24 @@ def four_stand_ready_bonus(env: ManagerBasedRLEnv, fsm_command_name: str) -> tor
 
 
 class TransitionProgress(ManagerTermBase):
-    """Bounded new lift credit in TRANSITION; potential-based shaping in RETURN."""
+    """Pay bounded acquisition improvements once per episode and diagonal."""
 
     def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
         self.prev_phi = torch.zeros(env.num_envs, device=env.device)
-        self.best_transition_progress = torch.zeros(env.num_envs, device=env.device)
+        # Columns are lift, support load, CoM line proximity, and segment fit.
+        self.best_quality = torch.zeros(env.num_envs, 2, 4, device=env.device)
+        self.seen_diagonal = torch.zeros(env.num_envs, 2, device=env.device, dtype=torch.bool)
 
     def reset(self, env_ids=None) -> None:
         if env_ids is None:
             self.prev_phi.zero_()
-            self.best_transition_progress.zero_()
+            self.best_quality.zero_()
+            self.seen_diagonal.zero_()
         else:
             self.prev_phi[env_ids] = 0.0
-            self.best_transition_progress[env_ids] = 0.0
+            self.best_quality[env_ids] = 0.0
+            self.seen_diagonal[env_ids] = False
 
     def __call__(
         self,
@@ -1201,6 +1215,14 @@ class TransitionProgress(ManagerTermBase):
         support_sensor_cfg_mirror: SceneEntityCfg | None = None,
         support_force_target_n: float = 80.0,
         transition_ungated_fraction: float = 0.25,
+        com_asset_cfg: SceneEntityCfg | None = None,
+        com_asset_cfg_mirror: SceneEntityCfg | None = None,
+        com_std: float = 0.08,
+        segment_std: float = 0.05,
+        lift_credit: float = 6.0,
+        support_credit: float = 3.0,
+        com_credit: float = 3.0,
+        segment_credit: float = 2.0,
     ) -> torch.Tensor:
         if not 0.0 < gamma <= 1.0:
             raise ValueError("gamma must be in (0, 1].")
@@ -1208,6 +1230,10 @@ class TransitionProgress(ManagerTermBase):
             raise ValueError("Both support sensor configs are required for transition progress.")
         if not 0.0 < transition_ungated_fraction < 1.0:
             raise ValueError("transition_ungated_fraction must be in (0, 1).")
+        if com_std <= 0.0 or segment_std <= 0.0:
+            raise ValueError("CoM and segment standard deviations must be positive.")
+        if min(lift_credit, support_credit, com_credit, segment_credit) < 0.0:
+            raise ValueError("Acquisition credits must be non-negative.")
 
         gates = fsm_gates(env, fsm_command_name)
         progress_pos = _yaw_lift_progress(
@@ -1224,24 +1250,51 @@ class TransitionProgress(ManagerTermBase):
         reward = gamma * phi - self.prev_phi
         self.prev_phi.copy_(phi)
         reward = torch.where(gates["just_switched"], torch.zeros_like(reward), reward)
-        # Credit a new lift maximum only once across TRANSITION/YAW chatter.
-        # YAW/RETURN keep their previous reward behavior.
+        # Seed from the first observed transition pose. Update best values in
+        # YAW too, so leaving and re-entering TRANSITION cannot replay credit.
         active = gates["b_trans"] | gates["b_yaw"]
-        self.best_transition_progress.masked_fill_(~active, 0.0)
-        improvement = torch.relu(progress - self.best_transition_progress)
-        transition_reward = improvement - (1.0 - gamma) * progress
         support_pos = _yaw_support_load_quality(env, support_sensor_cfg, support_force_target_n)
         support_neg = _yaw_support_load_quality(env, support_sensor_cfg_mirror, support_force_target_n)
         support_quality = torch.where(gates["diag_pos"], support_pos, support_neg)
         lift_gate = transition_ungated_fraction + (1.0 - transition_ungated_fraction) * support_quality
-        transition_reward = torch.relu(transition_reward) * lift_gate + torch.clamp(transition_reward, max=0.0)
-        self.best_transition_progress.copy_(torch.where(
-            active, torch.maximum(self.best_transition_progress, progress),
-            self.best_transition_progress,
-        ))
-        reward = transition_reward * gates["f_trans"] + reward * gates["f_return"]
+        if com_asset_cfg is None or com_asset_cfg_mirror is None:
+            raise ValueError("Both support body configs are required for acquisition credit.")
+        pos_distance, pos_projection, pos_length = _yaw_support_geometry(env, com_asset_cfg)
+        neg_distance, neg_projection, neg_length = _yaw_support_geometry(env, com_asset_cfg_mirror)
+        distance = torch.where(gates["diag_pos"], pos_distance, neg_distance)
+        projection = torch.where(gates["diag_pos"], pos_projection, neg_projection)
+        length = torch.where(gates["diag_pos"], pos_length, neg_length)
+        outside = (torch.relu(-projection) + torch.relu(projection - 1.0)) * length
+        # Credit only joint progress with the selected support pair loaded.
+        # Each component remains in [0, 1] and its episode maximum is paid once.
+        quality = torch.stack((
+            progress * lift_gate * support_quality,
+            support_quality,
+            support_quality / (1.0 + distance / com_std),
+            support_quality * torch.exp(-outside.square() / segment_std**2),
+        ), dim=1)
+        rows = torch.arange(env.num_envs, device=progress.device)
+        diagonal = (~gates["diag_pos"]).long()
+        previous = self.best_quality[rows, diagonal]
+        first = active & ~self.seen_diagonal[rows, diagonal]
+        improvement = torch.relu(quality - previous)
+        improvement = torch.where(first.unsqueeze(1), torch.zeros_like(improvement), improvement)
+        credits = quality.new_tensor((lift_credit, support_credit, com_credit, segment_credit))
+        transition_reward = (improvement * credits).sum(dim=1)
+        self.best_quality[rows, diagonal] = torch.where(
+            active.unsqueeze(1), torch.maximum(previous, quality), previous
+        )
+        self.seen_diagonal[rows, diagonal] |= active
+        # RewardManager multiplies every term by step_dt. Event credit and
+        # failure cost are episode-scale quantities, independent of that dt.
+        reward = transition_reward * gates["f_trans"] / env.step_dt + reward * gates["f_return"]
         _fsm_record_positive_budget(env, gates, "transition_progress", reward)
         return reward
+
+
+def fsm_failure_cost(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """One cost for each failed episode, even if several unsafe masks fire."""
+    return env.termination_manager.terminated.to(dtype=torch.float32) / env.step_dt
 
 
 def spin_center_drift(
@@ -1288,7 +1341,7 @@ def safe_recovery_entry(
 ) -> torch.Tensor:
     """Return one event pulse on entry to SAFE_RECOVERY."""
     gates = fsm_gates(env, fsm_command_name)
-    return (gates["b_safe"] & gates["just_switched"]).to(dtype=torch.float32)
+    return (gates["b_safe"] & gates["just_switched"]).to(dtype=torch.float32) / env.step_dt
 
 
 def _yaw_command_penalty_scale(

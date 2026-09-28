@@ -58,7 +58,6 @@ def _load_fsm_tracking_reward():
         "_yaw_wheel_contacts",
         "_yaw_support_load_quality",
         "_yaw_support_shape",
-        "yaw_transition_support_load",
         "yaw_com_support",
         "yaw_com_inside_support_segment",
         "yaw_lift_clearance",
@@ -170,7 +169,7 @@ def test_transition_telemetry_uses_active_support_lift_and_pose():
 
 def test_command_owns_yaw_entry_position_and_reward_has_no_private_anchor():
     fsm_module = _load_fsm_module()
-    vector_fsm = fsm_module.YawFSMVectorized(num_envs=2)
+    vector_fsm = fsm_module.YawFSMVectorized(num_envs=2, four_stand_ready_dwell=0.0)
 
     # Build only the command state consumed by _step_fsm; no Isaac simulator is
     # needed to validate the buffer ownership and transition timing.
@@ -220,7 +219,8 @@ def test_command_owns_yaw_entry_position_and_reward_has_no_private_anchor():
 def test_vector_fsm_command_exit_and_unsafe_bypass_pose_loss_grace():
     fsm_module = _load_fsm_module()
     fsm = fsm_module.YawFSMVectorized(
-        num_envs=1, dt=0.05, yaw_min_dwell=0.20, recovery_dwell=0.50
+        num_envs=1, dt=0.05, yaw_min_dwell=0.20, recovery_dwell=0.50,
+        four_stand_ready_dwell=0.0,
     )
     true = torch.tensor([True])
     false = torch.tensor([False])
@@ -266,10 +266,14 @@ def test_recovery_needs_continuous_safe_four_stand_and_sign_flip_visits_four():
 
     # A reversed command is considered only on the frame after RETURN lands
     # in FOUR_STAND; it cannot take a direct sign-flip edge.
-    fsm.update(torch.tensor([0.2]), false, false, false, false)
+    fsm.update(torch.tensor([0.2]), false, false, true, false)
+    assert fsm.state.item() == fsm_module.VQRFsmState.FOUR_STAND
+    fsm.update(torch.tensor([0.2]), false, false, true, false)
     fsm.update(torch.tensor([0.2]), true, false, false, false)
     fsm.update(torch.tensor([0.0]), false, false, false, false)
     assert fsm.state.item() == fsm_module.VQRFsmState.RETURN_TO_4
+    fsm.update(torch.tensor([-0.2]), false, false, true, false)
+    assert fsm.state.item() == fsm_module.VQRFsmState.FOUR_STAND
     fsm.update(torch.tensor([-0.2]), false, false, true, false)
     assert fsm.state.item() == fsm_module.VQRFsmState.FOUR_STAND
     fsm.update(torch.tensor([-0.2]), false, false, true, false)
@@ -329,8 +333,8 @@ def test_vector_fsm_reset_restores_the_canonical_four_stand_state():
 def test_return_completion_pulse_requires_four_ready_for_both_signs():
     module = _load_fsm_module()
     for direction in (1, -1):
-        for fsm in (module.VQRYawFSM(yaw_pose_ready_dwell=0.0),
-                    module.YawFSMVectorized(1, yaw_pose_ready_dwell=0.0)):
+        for fsm in (module.VQRYawFSM(yaw_pose_ready_dwell=0.0, four_stand_ready_dwell=0.0),
+                    module.YawFSMVectorized(1, yaw_pose_ready_dwell=0.0, four_stand_ready_dwell=0.0)):
             def step(command, ready=False):
                 pos = direction == 1 and ready
                 neg = direction == -1 and ready
@@ -358,7 +362,8 @@ def test_yaw_pose_loss_grace_reacquires_the_same_diagonal_after_continuous_loss(
         (1, state.YAW_POS, state.TRANSITION_POS),
         (-1, state.YAW_NEG, state.TRANSITION_NEG),
     ):
-        fsm = fsm_module.YawFSMVectorized(num_envs=1, dt=0.02, yaw_pose_loss_grace=0.10)
+        fsm = fsm_module.YawFSMVectorized(num_envs=1, dt=0.02, yaw_pose_loss_grace=0.10,
+                                           four_stand_ready_dwell=0.0)
         command = torch.tensor([0.2 * direction])
         positive = true if direction == 1 else false
         negative = true if direction == -1 else false
@@ -401,7 +406,8 @@ def test_yaw_pose_loss_priority_unsafe_then_command_exit():
     false = torch.tensor([False])
     true = torch.tensor([True])
     for direction, exit_command in ((1, 0.0), (-1, 0.2)):
-        fsm = fsm_module.YawFSMVectorized(num_envs=1, dt=0.02, yaw_pose_loss_grace=0.10)
+        fsm = fsm_module.YawFSMVectorized(num_envs=1, dt=0.02, yaw_pose_loss_grace=0.10,
+                                           four_stand_ready_dwell=0.0)
         command = torch.tensor([0.2 * direction])
         positive = true if direction == 1 else false
         negative = true if direction == -1 else false
@@ -427,6 +433,41 @@ def test_yaw_pose_loss_grace_is_exposed_on_command_config():
     fsm_module = _load_fsm_module()
     assert fsm_module.YawFSMCommandCfg.yaw_pose_loss_grace == 0.10
     assert fsm_module.YawFSMCommandCfg.yaw_pose_ready_dwell == 0.10
+    assert fsm_module.YawFSMCommandCfg.four_stand_ready_dwell == 0.20
+
+
+def test_four_entry_requires_continuous_readiness_after_reset_return_and_recovery():
+    module = _load_fsm_module()
+    state = module.VQRFsmState
+    for vectorized in (False, True):
+        for direction, transition in ((1, state.TRANSITION_POS), (-1, state.TRANSITION_NEG)):
+            fsm = (module.YawFSMVectorized(1, dt=0.02) if vectorized
+                   else module.VQRYawFSM(dt=0.02))
+
+            def step(command, four_ready=False, unsafe=False):
+                if vectorized:
+                    return int(fsm.update(command, False, False, four_ready, unsafe).item())
+                return int(fsm.update(command, False, False, four_ready, unsafe))
+
+            command = 0.2 * direction
+
+            def require_dwell():
+                for _ in range(9):
+                    assert step(command, four_ready=True) == state.FOUR_STAND
+                assert step(command) == state.FOUR_STAND  # One missed sample resets the timer.
+                for _ in range(9):
+                    assert step(command, four_ready=True) == state.FOUR_STAND
+                assert step(command, four_ready=True) == transition
+
+            require_dwell()
+            assert step(0.0) == state.RETURN_TO_4
+            assert step(command, four_ready=True) == state.FOUR_STAND
+            require_dwell()
+            assert step(command, unsafe=True) == state.SAFE_RECOVERY
+            for _ in range(24):
+                assert step(command, four_ready=True) == state.SAFE_RECOVERY
+            assert step(command, four_ready=True) == state.FOUR_STAND
+            require_dwell()
 
 
 def test_pose_ready_requires_five_continuous_steps_for_both_fsm_implementations_and_signs():
@@ -438,8 +479,8 @@ def test_pose_ready_requires_five_continuous_steps_for_both_fsm_implementations_
             (-1, state.TRANSITION_NEG, state.YAW_NEG),
         ):
             fsm = (
-                module.YawFSMVectorized(num_envs=1, dt=0.02)
-                if vectorized else module.VQRYawFSM(dt=0.02)
+                module.YawFSMVectorized(num_envs=1, dt=0.02, four_stand_ready_dwell=0.0)
+                if vectorized else module.VQRYawFSM(dt=0.02, four_stand_ready_dwell=0.0)
             )
 
             def step(command, ready=False, unsafe=False):
@@ -477,8 +518,8 @@ def test_pose_ready_dwell_yields_to_unsafe_and_command_exit_for_both_signs():
                 (0.0, True, state.SAFE_RECOVERY),
             ):
                 fsm = (
-                    module.YawFSMVectorized(num_envs=1, dt=0.02)
-                    if vectorized else module.VQRYawFSM(dt=0.02)
+                    module.YawFSMVectorized(num_envs=1, dt=0.02, four_stand_ready_dwell=0.0)
+                    if vectorized else module.VQRYawFSM(dt=0.02, four_stand_ready_dwell=0.0)
                 )
                 command = 0.2 * direction
                 pos = direction == 1
@@ -599,8 +640,8 @@ def test_fsm_tracking_support_bonus_requires_lift_and_is_independent_of_yaw_erro
         std=0.30,
     )
     expected = torch.tensor([
-        -1.25, -1.0, 0.0125, 0.25, 0.0, 0.0,
-        0.0, -1.25, 1.25, 0.0, 0.0125, 0.0,
+        0.0, 0.0, 0.0125, 0.25, 0.0, 0.0,
+        0.0, 0.0, 1.25, 0.0, 0.0125, 0.0,
     ])
     assert torch.allclose(observed, expected, atol=1e-6)
     # With lift=1 and tracking either blocked or negligible, the +2 maximum
@@ -679,7 +720,7 @@ def test_fsm_pose_rewards_keep_dense_yaw_signal_without_support_contact():
     assert torch.equal(legacy_lift, 2.0 * lift_pos.mean(dim=1) - 1.0)
 
 
-def test_transition_support_load_uses_normal_force_and_mirrors_diagonals():
+def test_acquisition_support_quality_uses_normal_force_and_mirrors_diagonals():
     rewards, state = _load_fsm_tracking_reward()
     states = torch.tensor([
         state.TRANSITION_POS, state.TRANSITION_NEG,
@@ -704,17 +745,17 @@ def test_transition_support_load_uses_normal_force_and_mirrors_diagonals():
         scene=SimpleNamespace(sensors={"contact_forces": sensor}),
         command_manager=SimpleNamespace(get_term=lambda _: command),
     )
-    reward = rewards["yaw_transition_support_load"](
-        env,
-        sensor_cfg=SimpleNamespace(name="contact_forces", body_ids=[0, 3]),
-        sensor_cfg_mirror=SimpleNamespace(name="contact_forces", body_ids=[1, 2]),
-        fsm_command_name="yaw_rate_cmd",
-        target_force_n=80.0,
+    pos = rewards["_yaw_support_load_quality"](
+        env, SimpleNamespace(name="contact_forces", body_ids=[0, 3]), 80.0
     )
-    assert torch.allclose(reward, torch.tensor([-0.45, -0.45, 0.0, 0.0, -0.90]))
+    neg = rewards["_yaw_support_load_quality"](
+        env, SimpleNamespace(name="contact_forces", body_ids=[1, 2]), 80.0
+    )
+    selected = torch.where(command.support_diagonal > 0, pos, neg)
+    assert torch.allclose(selected, torch.tensor([.55, .55, 1.0, 1.0, .10]))
 
 
-def test_transition_lift_deficit_improves_with_support_without_positive_income():
+def test_transition_lift_has_no_per_step_deficit():
     rewards, state = _load_fsm_tracking_reward()
     command = SimpleNamespace(
         fsm_state=torch.tensor([
@@ -751,7 +792,7 @@ def test_transition_lift_deficit_improves_with_support_without_positive_income()
         support_force_target_n=80.0,
         transition_ungated_fraction=0.35,
     )
-    assert torch.allclose(reward, torch.tensor([-0.65, -0.65, 0.0, 0.0, -0.2925, 1.0, -2.0]))
+    assert torch.allclose(reward, torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
     assert torch.equal(env._yaw_lift_min_progress_sum, torch.tensor([1., 1., 1., 1., 1., 1., 0.]))
 
 

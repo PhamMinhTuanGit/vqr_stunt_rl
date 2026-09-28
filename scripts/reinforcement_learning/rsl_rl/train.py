@@ -342,7 +342,7 @@ def _verify_yaw_fsm_contract(env, env_cfg) -> None:
     required_reward_terms = {
         "fsm_gated_tracking",
         "transition_progress",
-        "transition_support_load",
+        "fsm_failure",
         "transition_low_base_height",
         "return_to_four_landing",
         "four_stand_ready_bonus",
