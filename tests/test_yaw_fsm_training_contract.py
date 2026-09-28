@@ -60,7 +60,8 @@ def test_fsm_balance_is_gated_and_reward_counts_are_isolated():
     fsm = _reward_assignments(FSM_CONFIG, "VQRWheelFSMRewardsCfg")
 
     assert len(baseline) == 18
-    assert len(fsm) == 25
+    assert len(fsm) == 26
+    assert "transition_low_base_height" in fsm
     assert "support_contact" not in fsm
     assert "transition_support_load" in fsm
     assert "return_to_four_landing" in fsm
@@ -133,6 +134,7 @@ def test_fsm_startup_contract_checks_reward_and_command_runtime_objects():
         "fsm_state",
         "support_diagonal",
         "state_time",
+        "transition_time",
         "just_switched",
         "just_returned_to_four",
         "positive_pose_ready",
@@ -146,6 +148,7 @@ def test_fsm_startup_contract_checks_reward_and_command_runtime_objects():
         "fsm_gated_tracking",
         "transition_progress",
         "transition_support_load",
+        "transition_low_base_height",
         "return_to_four_landing",
         "four_stand_ready_bonus",
         "spin_center_drift",
@@ -165,5 +168,5 @@ def test_fsm_startup_contract_checks_reward_and_command_runtime_objects():
     namespace["_verify_yaw_fsm_contract"](env, SimpleNamespace())
 
     reward_manager.active_terms = active_terms[:-1]
-    with pytest.raises(RuntimeError, match="expected 25 terms"):
+    with pytest.raises(RuntimeError, match="expected 26 terms"):
         namespace["_verify_yaw_fsm_contract"](env, SimpleNamespace())

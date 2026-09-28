@@ -343,6 +343,7 @@ def _verify_yaw_fsm_contract(env, env_cfg) -> None:
         "fsm_gated_tracking",
         "transition_progress",
         "transition_support_load",
+        "transition_low_base_height",
         "return_to_four_landing",
         "four_stand_ready_bonus",
         "spin_center_drift",
@@ -359,6 +360,7 @@ def _verify_yaw_fsm_contract(env, env_cfg) -> None:
         "fsm_state",
         "support_diagonal",
         "state_time",
+        "transition_time",
         "just_switched",
         "just_returned_to_four",
         "positive_pose_ready",
@@ -374,9 +376,9 @@ def _verify_yaw_fsm_contract(env, env_cfg) -> None:
     print(f"[INFO] Flat-VQR-Wheel-Yaw-FSM env config source: {inspect.getfile(type(env_cfg))}")
     print(f"[INFO] Flat-VQR-Wheel-Yaw-FSM reward terms ({len(term_names)}): {term_names}")
     print(f"[INFO] Flat-VQR-Wheel-Yaw-FSM fsm_gated_tracking weight: {tracking_weight}")
-    if len(term_names) != 25 or missing_reward_terms or tracking_weight != 8.0:
+    if len(term_names) != 26 or missing_reward_terms or tracking_weight != 8.0:
         raise RuntimeError(
-            "Unexpected Flat-VQR-Wheel-Yaw-FSM reward config: expected 25 terms, "
+            "Unexpected Flat-VQR-Wheel-Yaw-FSM reward config: expected 26 terms, "
             "fsm_gated_tracking weight 8.0, and all required FSM reward terms; "
             f"missing={missing_reward_terms}."
         )

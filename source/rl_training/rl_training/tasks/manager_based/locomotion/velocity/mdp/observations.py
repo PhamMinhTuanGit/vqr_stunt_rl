@@ -266,6 +266,22 @@ def yaw_fsm_unsafe(
     buffer from the preceding command update.  Both paths nevertheless use
     exactly the same thresholds and contact interpretation.
     """
+    torso, height, tilt = yaw_fsm_unsafe_components(
+        env, robot_name, torso_sensor_cfg, minimum_base_height,
+        unsafe_angle_limit, contact_threshold,
+    )
+    return torso | height | tilt
+
+
+def yaw_fsm_unsafe_components(
+    env: ManagerBasedEnv,
+    robot_name: str,
+    torso_sensor_cfg: SceneEntityCfg,
+    minimum_base_height: float,
+    unsafe_angle_limit: float,
+    contact_threshold: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return separate torso-contact, low-height, and tilt failure masks."""
     if minimum_base_height < 0.0:
         raise ValueError("minimum_base_height must be non-negative.")
     if unsafe_angle_limit < 0.0:
@@ -282,10 +298,9 @@ def yaw_fsm_unsafe(
     roll, pitch, _ = euler_xyz_from_quat(robot.data.root_quat_w)
     base_height = robot.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
     return (
-        torso_contact[:, 0]
-        | (base_height < minimum_base_height)
-        | (torch.abs(roll) > unsafe_angle_limit)
-        | (torch.abs(pitch) > unsafe_angle_limit)
+        torso_contact[:, 0],
+        base_height < minimum_base_height,
+        (torch.abs(roll) > unsafe_angle_limit) | (torch.abs(pitch) > unsafe_angle_limit),
     )
 
 

@@ -48,17 +48,6 @@ def motor_effort_penalty_l2(env: ManagerBasedRLEnv, std:float, command_name: str
 
 #Phần phạt dáng đứng:
 
-
-
-
-
-
-
-
-
-
-
-
 def update_gait_level_from_terrain_mean(terrain_level_mean: float | torch.Tensor) -> float:
     """Update global gait_level from mean terrain level.
 
@@ -209,11 +198,11 @@ def yaw_transition_support_load(
     fsm_command_name: str,
     target_force_n: float,
 ) -> torch.Tensor:
-    """Reward load on the selected support diagonal during TRANSITION only."""
+    """Penalize missing support load in TRANSITION; a held pose earns no income."""
     gates = fsm_gates(env, fsm_command_name)
     pos = _yaw_support_load_quality(env, sensor_cfg, target_force_n)
     neg = _yaw_support_load_quality(env, sensor_cfg_mirror, target_force_n)
-    reward = torch.where(gates["diag_pos"], pos, neg) * gates["f_trans"]
+    reward = (torch.where(gates["diag_pos"], pos, neg) - 1.0) * gates["f_trans"]
     _fsm_record_positive_budget(env, gates, "transition_support_load", reward)
     return reward
 
@@ -274,7 +263,7 @@ def yaw_com_support(
     mirror_distance, _, _ = _yaw_support_geometry(env, asset_cfg_mirror)
     mirror_score = 1.0 / (1.0 + mirror_distance / std)
     gates = fsm_gates(env, fsm_command_name)
-    reward = torch.where(gates["diag_pos"], score, mirror_score) * gates["f_geom"]
+    reward = torch.where(gates["diag_pos"], score, mirror_score) * gates["f_geom"] - gates["f_trans"]
     _fsm_record_positive_budget(env, gates, "com_support", reward)
     return reward
 
@@ -330,13 +319,31 @@ def yaw_low_base_height_l1(
     return torch.relu(minimum_height - base_height) / error_scale
 
 
+def yaw_transition_low_base_height(
+    env: ManagerBasedRLEnv,
+    warning_height: float,
+    minimum_height: float,
+    fsm_command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Soft collapse warning in TRANSITION, before the hard height boundary."""
+    if warning_height <= minimum_height:
+        raise ValueError("warning_height must exceed minimum_height.")
+    asset: Articulation = env.scene[asset_cfg.name]
+    base_height = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    proximity = ((warning_height - base_height) / (warning_height - minimum_height)).clamp(0.0, 1.0)
+    return proximity.square() * fsm_gates(env, fsm_command_name)["f_trans"]
+
+
 def yaw_downward_low_base_velocity_l2(
     env: ManagerBasedRLEnv,
     minimum_height: float,
     height_margin: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    warning_height: float | None = None,
+    fsm_command_name: str | None = None,
 ) -> torch.Tensor:
-    """Penalize downward base velocity only inside the low-height region."""
+    """Penalize falling early in TRANSITION; retain the original unsafe-region gate elsewhere."""
     if height_margin <= 0.0:
         raise ValueError("height_margin must be positive.")
     asset: Articulation = env.scene[asset_cfg.name]
@@ -345,6 +352,11 @@ def yaw_downward_low_base_velocity_l2(
         torch.relu(minimum_height - base_height) / height_margin,
         max=1.0,
     )
+    if fsm_command_name is not None:
+        if warning_height is None or warning_height <= minimum_height:
+            raise ValueError("warning_height must exceed minimum_height for FSM gating.")
+        warning_gate = ((warning_height - base_height) / (warning_height - minimum_height)).clamp(0.0, 1.0)
+        low_gate = torch.maximum(low_gate, warning_gate * fsm_gates(env, fsm_command_name)["f_trans"])
     downward_speed = torch.relu(-asset.data.root_lin_vel_w[:, 2])
     return low_gate * downward_speed.square()
 
@@ -423,15 +435,15 @@ def yaw_lift_clearance(
     support_sensor_cfg: SceneEntityCfg | None = None,
     support_sensor_cfg_mirror: SceneEntityCfg | None = None,
     support_force_target_n: float = 80.0,
-    transition_ungated_fraction: float = 0.35,
+    transition_ungated_fraction: float = 0.25,
 ) -> torch.Tensor:
     """Shape lifted-wheel clearance with partial credit and a four-wheel penalty.
 
-    Each selected wheel contributes independently. The returned score is in
+    Each selected wheel contributes independently. The baseline score is in
     ``[-1, 1]``: both wheels on the ground score ``-1``, lifting either wheel
     improves the score, and both wheels must reach the target to score ``1``.
-    In FSM TRANSITION, positive credit is partly gated by support load;
-    the raw clearance metric and YAW reward are unchanged.
+    In FSM TRANSITION, support load shapes the score before subtracting its
+    maximum, leaving a nonpositive deficit. Raw metrics and YAW are unchanged.
     """
     progress = _yaw_lift_progress(env, asset_cfg, wheel_radius, target_clearance)
 
@@ -473,10 +485,10 @@ def yaw_lift_clearance(
     support_neg = _yaw_support_load_quality(env, support_sensor_cfg_mirror, support_force_target_n)
     support_quality = torch.where(gates["diag_pos"], support_pos, support_neg)
     lift_gate = transition_ungated_fraction + (1.0 - transition_ungated_fraction) * support_quality
-    # Keep the no-lift penalty intact.  Only positive lift credit is reduced
-    # when support is weak, so dropping a wheel cannot erase that penalty.
+    # Preserve the no-lift gradient before centering the transition score.
+    # Only positive lift credit is reduced when support is weak.
     transition_score = torch.clamp(selected_score, max=0.0) + torch.relu(selected_score) * lift_gate
-    reward = transition_score * gates["f_trans"] + selected_score * gates["f_yaw"]
+    reward = (transition_score - 1.0) * gates["f_trans"] + selected_score * gates["f_yaw"]
     _fsm_record_positive_budget(env, gates, "lift_clearance", reward)
     return reward
 
@@ -508,7 +520,7 @@ def yaw_com_inside_support_segment(
     ) * mirror_segment_length
     mirror_score = torch.exp(-mirror_outside_distance.square() / std**2)
     gates = fsm_gates(env, fsm_command_name)
-    reward = torch.where(gates["diag_pos"], score, mirror_score) * gates["f_geom"]
+    reward = torch.where(gates["diag_pos"], score, mirror_score) * gates["f_geom"] - gates["f_trans"]
     _fsm_record_positive_budget(env, gates, "com_inside_segment", reward)
     return reward
 
@@ -532,7 +544,7 @@ def yaw_balance(
     if fsm_command_name is None:
         return score
     gates = fsm_gates(env, fsm_command_name)
-    reward = score * (1.0 - gates["f_safe"])
+    reward = score * (1.0 - gates["f_safe"]) - gates["f_trans"]
     _fsm_record_positive_budget(env, gates, "balance", reward)
     return reward
 
@@ -700,11 +712,57 @@ def _fsm_masked_accumulate_pair(
     getattr(env, samples_name).add_(mask.to(dtype=torch.long))
 
 
-def _fsm_episode_or(env: ManagerBasedRLEnv, name: str, mask: torch.Tensor) -> None:
-    """Remember whether an FSM event occurred in the current episode."""
-    if not hasattr(env, name):
-        setattr(env, name, torch.zeros_like(mask, dtype=torch.bool))
-    getattr(env, name).logical_or_(mask.to(dtype=torch.bool))
+def _fsm_attempt_telemetry(
+    env, gates, lift_progress, support_gate,
+    lift_progress_threshold: float = 0.80, support_threshold: float = 0.85,
+) -> None:
+    """Count maneuvers, not YAW survivors or repeated reacquisition visits.
+
+    Rewards run after termination computation and before command advancement.
+    Finalize a live attempt on its terminal reward step, or when its FSM enters
+    RETURN/SAFE. A timeout/fall cannot retain a provisional YAW success.
+    """
+    if not hasattr(env, "_yaw_fsm_attempt_diagonal"):
+        env._yaw_fsm_attempt_diagonal = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+        env._yaw_fsm_attempt_yaw_samples = torch.zeros_like(env._yaw_fsm_attempt_diagonal)
+        env._yaw_fsm_attempt_lift_sum = torch.zeros_like(lift_progress)
+        env._yaw_fsm_attempt_support_sum = torch.zeros_like(support_gate)
+        for suffix in ("pos", "neg"):
+            for field in ("transition_attempted", "transition_succeeded", "pose_succeeded",
+                          "lift_failed", "support_failed"):
+                setattr(env, f"_yaw_fsm_{suffix}_{field}", torch.zeros_like(env._yaw_fsm_attempt_diagonal))
+    active = gates["b_trans"] | gates["b_yaw"]
+    diagonal = env._yaw_fsm_attempt_diagonal
+    entering = active & (diagonal == 0)
+    diagonal.copy_(torch.where(entering, gates["support_diagonal"], diagonal))
+    for suffix, sign in (("pos", 1), ("neg", -1)):
+        getattr(env, f"_yaw_fsm_{suffix}_transition_attempted").add_((entering & (diagonal == sign)).long())
+
+    yaw = gates["b_yaw"]
+    env._yaw_fsm_attempt_yaw_samples += yaw.long()
+    env._yaw_fsm_attempt_lift_sum += lift_progress * yaw
+    env._yaw_fsm_attempt_support_sum += support_gate * yaw
+    finishing = (diagonal != 0) & (~active | env.reset_buf)
+    samples = env._yaw_fsm_attempt_yaw_samples
+    lift_ok = (samples > 0) & (
+        env._yaw_fsm_attempt_lift_sum / samples.clamp_min(1) >= lift_progress_threshold
+    )
+    support_ok = (samples > 0) & (
+        env._yaw_fsm_attempt_support_sum / samples.clamp_min(1) >= support_threshold
+    )
+    reached = (samples > 0) & ~env.reset_terminated & ~gates["b_safe"]
+    for suffix, sign in (("pos", 1), ("neg", -1)):
+        ended = finishing & (diagonal == sign)
+        for field, outcome in (
+            ("transition_succeeded", reached),
+            ("pose_succeeded", reached & lift_ok & support_ok),
+            ("lift_failed", ~lift_ok), ("support_failed", ~support_ok),
+        ):
+            getattr(env, f"_yaw_fsm_{suffix}_{field}").add_((ended & outcome).long())
+    diagonal.masked_fill_(finishing, 0)
+    env._yaw_fsm_attempt_yaw_samples.masked_fill_(finishing, 0)
+    env._yaw_fsm_attempt_lift_sum.masked_fill_(finishing, 0.0)
+    env._yaw_fsm_attempt_support_sum.masked_fill_(finishing, 0.0)
 
 
 def _fsm_step_telemetry(env: ManagerBasedRLEnv, gates: dict[str, torch.Tensor]) -> None:
@@ -824,6 +882,8 @@ def fsm_gated_tracking(
     clearance_gate_floor_decay_s: float = 0.0,
     edge_command_fraction: float = 0.80,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    lift_progress_threshold: float = 0.80,
+    support_threshold: float = 0.85,
 ) -> torch.Tensor:
     """Track signed yaw commands during TRANSITION and YAW states.
 
@@ -975,21 +1035,9 @@ def fsm_gated_tracking(
             f"_yaw_fsm_{suffix}_swing_contact_samples",
         )
 
-    # Phase B is an attempted transition that reaches its corresponding YAW
-    # state before reset.  Store booleans rather than a step count so a long
-    # transition cannot distort the episode success rate.
-    _fsm_episode_or(
-        env,
-        "_yaw_fsm_pos_transition_attempted",
-        gates["b_trans"] & gates["diag_pos"],
+    _fsm_attempt_telemetry(
+        env, gates, lift_progress, support_gate, lift_progress_threshold, support_threshold
     )
-    _fsm_episode_or(
-        env,
-        "_yaw_fsm_neg_transition_attempted",
-        gates["b_trans"] & gates["diag_neg"],
-    )
-    _fsm_episode_or(env, "_yaw_fsm_pos_transition_succeeded", yaw_pos_mask)
-    _fsm_episode_or(env, "_yaw_fsm_neg_transition_succeeded", yaw_neg_mask)
     env._yaw_support_score_current = support_gate
     env._yaw_gate_open_current = support_gate
     env._yaw_command_abs_current = torch.abs(yaw_command)
@@ -1029,7 +1077,9 @@ def fsm_gated_tracking(
     tracking = support_gate * clearance_weight * yaw_tracking * state_gate
     # Contact alone gives no bonus while the swing pair is still on the ground.
     support_bonus = 0.25 * support_shape * lift_progress * state_gate
-    reward = tracking + support_bonus
+    # Center TRANSITION at its maximum: holding pose/tracking is never
+    # positive income. YAW retains the original tracking and support bonus.
+    reward = tracking + support_bonus - 1.25 * gates["f_trans"]
     _fsm_record_positive_budget(env, gates, "fsm_gated_tracking", reward)
     return reward
 
@@ -1056,7 +1106,11 @@ def four_stand_stability(
     height_score = torch.exp(-(base_height - target_height).square() / height_std**2)
     attitude_score = torch.exp(-(roll.square() + pitch.square()) / attitude_std**2)
     gates = fsm_gates(env, fsm_command_name)
-    reward = gates["f_stability"] * height_score * attitude_score
+    # Transition retains a decaying attitude deficit, without tracking the
+    # standing height. Height tracking remains active in FOUR_STAND/RETURN.
+    standing_gate = gates["f_four"] + gates["f_return"] * gates["tau"]
+    transition_gate = gates["f_trans"] * (1.0 - gates["tau"])
+    reward = (standing_gate * height_score + transition_gate) * attitude_score - transition_gate
     _fsm_record_positive_budget(env, gates, "four_stand_stability", reward)
     return reward
 
@@ -1119,17 +1173,20 @@ def four_stand_ready_bonus(env: ManagerBasedRLEnv, fsm_command_name: str) -> tor
 
 
 class TransitionProgress(ManagerTermBase):
-    """Potential-based lift/handoff shaping for TRANSITION and RETURN."""
+    """Bounded new lift credit in TRANSITION; potential-based shaping in RETURN."""
 
     def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
         self.prev_phi = torch.zeros(env.num_envs, device=env.device)
+        self.best_transition_progress = torch.zeros(env.num_envs, device=env.device)
 
     def reset(self, env_ids=None) -> None:
         if env_ids is None:
             self.prev_phi.zero_()
+            self.best_transition_progress.zero_()
         else:
             self.prev_phi[env_ids] = 0.0
+            self.best_transition_progress[env_ids] = 0.0
 
     def __call__(
         self,
@@ -1140,9 +1197,17 @@ class TransitionProgress(ManagerTermBase):
         target_clearance: float,
         fsm_command_name: str,
         gamma: float = 0.99,
+        support_sensor_cfg: SceneEntityCfg | None = None,
+        support_sensor_cfg_mirror: SceneEntityCfg | None = None,
+        support_force_target_n: float = 80.0,
+        transition_ungated_fraction: float = 0.25,
     ) -> torch.Tensor:
         if not 0.0 < gamma <= 1.0:
             raise ValueError("gamma must be in (0, 1].")
+        if support_sensor_cfg is None or support_sensor_cfg_mirror is None:
+            raise ValueError("Both support sensor configs are required for transition progress.")
+        if not 0.0 < transition_ungated_fraction < 1.0:
+            raise ValueError("transition_ungated_fraction must be in (0, 1).")
 
         gates = fsm_gates(env, fsm_command_name)
         progress_pos = _yaw_lift_progress(
@@ -1159,7 +1224,22 @@ class TransitionProgress(ManagerTermBase):
         reward = gamma * phi - self.prev_phi
         self.prev_phi.copy_(phi)
         reward = torch.where(gates["just_switched"], torch.zeros_like(reward), reward)
-        reward = reward * (gates["f_trans"] + gates["f_return"])
+        # Credit a new lift maximum only once across TRANSITION/YAW chatter.
+        # YAW/RETURN keep their previous reward behavior.
+        active = gates["b_trans"] | gates["b_yaw"]
+        self.best_transition_progress.masked_fill_(~active, 0.0)
+        improvement = torch.relu(progress - self.best_transition_progress)
+        transition_reward = improvement - (1.0 - gamma) * progress
+        support_pos = _yaw_support_load_quality(env, support_sensor_cfg, support_force_target_n)
+        support_neg = _yaw_support_load_quality(env, support_sensor_cfg_mirror, support_force_target_n)
+        support_quality = torch.where(gates["diag_pos"], support_pos, support_neg)
+        lift_gate = transition_ungated_fraction + (1.0 - transition_ungated_fraction) * support_quality
+        transition_reward = torch.relu(transition_reward) * lift_gate + torch.clamp(transition_reward, max=0.0)
+        self.best_transition_progress.copy_(torch.where(
+            active, torch.maximum(self.best_transition_progress, progress),
+            self.best_transition_progress,
+        ))
+        reward = transition_reward * gates["f_trans"] + reward * gates["f_return"]
         _fsm_record_positive_budget(env, gates, "transition_progress", reward)
         return reward
 

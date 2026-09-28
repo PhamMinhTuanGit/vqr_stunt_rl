@@ -316,7 +316,17 @@ def test_fsm_curriculum_requires_both_diagonals_before_phase_promotion(
         command_manager=SimpleNamespace(get_term=lambda _: command),
         reward_manager=rewards,
         event_manager=events,
-        # Both branches entered YAW, but only POS achieved lift/support.
+        # Both branches attempted once, but only POS completed with lift/support.
+        _yaw_fsm_pos_transition_attempted=torch.tensor([1, 0]),
+        _yaw_fsm_neg_transition_attempted=torch.tensor([0, 1]),
+        _yaw_fsm_pos_transition_succeeded=torch.tensor([1, 0]),
+        _yaw_fsm_neg_transition_succeeded=torch.tensor([0, 1]),
+        _yaw_fsm_pos_pose_succeeded=torch.tensor([1, 0]),
+        _yaw_fsm_neg_pose_succeeded=torch.tensor([0, 0]),
+        _yaw_fsm_pos_lift_failed=torch.tensor([0, 0]),
+        _yaw_fsm_neg_lift_failed=torch.tensor([0, 1]),
+        _yaw_fsm_pos_support_failed=torch.tensor([0, 0]),
+        _yaw_fsm_neg_support_failed=torch.tensor([0, 1]),
         _yaw_fsm_pos_yaw_samples=torch.tensor([1, 0]),
         _yaw_fsm_neg_yaw_samples=torch.tensor([0, 1]),
         _yaw_fsm_pos_lift_sum=torch.tensor([1.0, 0.0]),

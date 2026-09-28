@@ -92,7 +92,7 @@ def _load_fsm_tracking_reward():
             "_fsm_transition_telemetry": lambda *args: None,
             "_fsm_masked_accumulate": lambda *args: None,
             "_fsm_masked_accumulate_pair": lambda *args: None,
-            "_fsm_episode_or": lambda *args: None,
+            "_fsm_attempt_telemetry": lambda *args: None,
             "_fsm_record_positive_budget": lambda *args: None,
         }
     )
@@ -303,6 +303,7 @@ def test_scalar_and_vector_fsm_are_equivalent_for_batched_trajectories():
             ]
         )
         assert torch.equal(observed.cpu(), expected)
+        assert torch.allclose(vector.transition_time, torch.tensor([item.transition_time for item in scalar]))
 
 
 def test_vector_fsm_reset_restores_the_canonical_four_stand_state():
@@ -598,13 +599,13 @@ def test_fsm_tracking_support_bonus_requires_lift_and_is_independent_of_yaw_erro
         std=0.30,
     )
     expected = torch.tensor([
-        0.0, 0.25, 0.0125, 0.25, 0.0, 0.0,
-        0.0, 0.0, 1.25, 0.0, 0.0125, 0.0,
+        -1.25, -1.0, 0.0125, 0.25, 0.0, 0.0,
+        0.0, -1.25, 1.25, 0.0, 0.0125, 0.0,
     ])
     assert torch.allclose(observed, expected, atol=1e-6)
     # With lift=1 and tracking either blocked or negligible, the +2 maximum
     # support bonus maps 0/1/2 support contacts to 0/0.05/1 respectively.
-    assert torch.allclose(observed[[9, 2, 1]] * 4.0, torch.tensor([0.0, 0.05, 1.0]))
+    assert torch.allclose(observed[[9, 2, 3]] * 4.0, torch.tensor([0.0, 0.05, 1.0]))
     assert torch.allclose(observed[[11, 10, 3]] * 4.0, torch.tensor([0.0, 0.05, 1.0]))
     assert env._yaw_fsm_pos_support_loss_max_steps[[2, 9]].tolist() == [1, 1]
     assert env._yaw_fsm_neg_support_loss_max_steps[[10, 11]].tolist() == [1, 1]
@@ -648,7 +649,7 @@ def test_fsm_pose_rewards_keep_dense_yaw_signal_without_support_contact():
         env, std=0.05, **geom_args, **fsm_args
     )
     expected_geom = torch.ones(n)
-    expected_geom[-1] = 0.0  # RETURN no longer pays diagonal geometry.
+    expected_geom[-2:] = 0.0  # Perfect TRANSITION has no income; RETURN has no geometry.
     assert torch.allclose(com, expected_geom)
     assert torch.allclose(inside, expected_geom)
 
@@ -662,7 +663,7 @@ def test_fsm_pose_rewards_keep_dense_yaw_signal_without_support_contact():
         support_sensor_cfg_mirror=SimpleNamespace(name="contact_forces", body_ids=[1, 2]),
         **fsm_args,
     )
-    expected_lift = torch.tensor([1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 0.0])
+    expected_lift = torch.tensor([1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 0.0, 0.0])
     assert torch.allclose(lift, expected_lift)
 
     # The legacy branch does not inspect FSM contact and retains exact values.
@@ -710,10 +711,10 @@ def test_transition_support_load_uses_normal_force_and_mirrors_diagonals():
         fsm_command_name="yaw_rate_cmd",
         target_force_n=80.0,
     )
-    assert torch.allclose(reward, torch.tensor([0.55, 0.55, 0.0, 0.0, 0.10]))
+    assert torch.allclose(reward, torch.tensor([-0.45, -0.45, 0.0, 0.0, -0.90]))
 
 
-def test_transition_lift_keeps_exploration_credit_but_full_credit_needs_support():
+def test_transition_lift_deficit_improves_with_support_without_positive_income():
     rewards, state = _load_fsm_tracking_reward()
     command = SimpleNamespace(
         fsm_state=torch.tensor([
@@ -750,7 +751,7 @@ def test_transition_lift_keeps_exploration_credit_but_full_credit_needs_support(
         support_force_target_n=80.0,
         transition_ungated_fraction=0.35,
     )
-    assert torch.allclose(reward, torch.tensor([0.35, 0.35, 1.0, 1.0, 0.7075, 1.0, -1.0]))
+    assert torch.allclose(reward, torch.tensor([-0.65, -0.65, 0.0, 0.0, -0.2925, 1.0, -2.0]))
     assert torch.equal(env._yaw_lift_min_progress_sum, torch.tensor([1., 1., 1., 1., 1., 1., 0.]))
 
 

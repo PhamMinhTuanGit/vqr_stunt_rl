@@ -692,15 +692,16 @@ def yaw_fsm_task_levels(
 ) -> dict[str, torch.Tensor]:
     """Three-phase FSM curriculum with independent POS/NEG gates.
 
-    Phase A certifies lift at every clearance target, phase B certifies that
-    each diagonal reaches ``YAW_*`` within the watchdog's three-second
-    transition, and phase C climbs the yaw/DR ladder.  A phase can advance
+    Phase A certifies lift per attempted maneuver, phase B certifies that
+    each diagonal reaches ``YAW_*`` without a terminal attempt failure, and
+    phase C climbs the yaw/DR ladder. A phase can advance
     only when *both* diagonals pass the same evaluation window.  In
     particular, this intentionally never averages POS and NEG scores.
 
     The FSM rewards own the directional per-episode buffers.  They coexist
     with the ``_yaw_*`` buffers used by :func:`yaw_task_levels`, preserving the
-    original task and its checkpoint-export contract.
+    original task and its checkpoint-export contract. The legacy ``episodes``
+    counters/parameter names count individual maneuver attempts in this FSM.
     """
     del balance_reward_name, torso_contact_termination_name, minimum_base_height, balance_threshold
     del yaw_threshold, edge_tracking_ratio_thresholds
@@ -850,29 +851,23 @@ def yaw_fsm_task_levels(
     if len(completed_env_ids):
         for suffix in ("pos", "neg"):
             yaw_samples = episode_buffer(f"_yaw_fsm_{suffix}_yaw_samples", torch.long)
-            has_yaw = yaw_samples > 0
-            attempted = episode_buffer(f"_yaw_fsm_{suffix}_transition_attempted", torch.bool)
-            transitioned = episode_buffer(f"_yaw_fsm_{suffix}_transition_succeeded", torch.bool)
+            attempted = episode_buffer(f"_yaw_fsm_{suffix}_transition_attempted", torch.long)
+            transitioned = episode_buffer(f"_yaw_fsm_{suffix}_transition_succeeded", torch.long)
             lift_sum = episode_buffer(f"_yaw_fsm_{suffix}_lift_sum", torch.float32)
             support_sum = episode_buffer(f"_yaw_fsm_{suffix}_support_sum", torch.float32)
-            lift_score = lift_sum / yaw_samples.clamp_min(1)
-            support_score = support_sum / yaw_samples.clamp_min(1)
 
-            # A and C evaluate completed episodes that genuinely spent time
-            # in their direction's YAW state.  B instead evaluates transition
-            # attempts, so a branch cannot inflate its score by never trying.
-            evaluated = attempted if phase == 1 else has_yaw
-            success = (
-                transitioned
-                if phase == 1
-                else (lift_score >= lift_progress_threshold) & (support_score >= support_threshold)
+            # Every maneuver stays in the denominator, including attempts
+            # with no YAW samples and terminal reacquisition failures.
+            evaluated = attempted
+            success = transitioned if phase == 1 else episode_buffer(
+                f"_yaw_fsm_{suffix}_pose_succeeded", torch.long
             )
             env_name = f"_yaw_fsm_task_curriculum_{suffix}"
             setattr(env, f"{env_name}_episodes", getattr(env, f"{env_name}_episodes") + int(evaluated.sum().item()))
             setattr(
                 env,
                 f"{env_name}_successes",
-                getattr(env, f"{env_name}_successes") + int((success & evaluated).sum().item()),
+                getattr(env, f"{env_name}_successes") + int(success.sum().item()),
             )
             setattr(env, f"{env_name}_lift_sum", getattr(env, f"{env_name}_lift_sum") + float(lift_sum.sum().item()))
             setattr(env, f"{env_name}_lift_samples", getattr(env, f"{env_name}_lift_samples") + int(yaw_samples.sum().item()))
@@ -891,13 +886,13 @@ def yaw_fsm_task_levels(
                     env,
                     f"{env_name}_lift_failures",
                     getattr(env, f"{env_name}_lift_failures")
-                    + int(((lift_score < lift_progress_threshold) & evaluated).sum().item()),
+                    + int(episode_buffer(f"_yaw_fsm_{suffix}_lift_failed", torch.long).sum().item()),
                 )
                 setattr(
                     env,
                     f"{env_name}_support_failures",
                     getattr(env, f"{env_name}_support_failures")
-                    + int(((support_score < support_threshold) & evaluated).sum().item()),
+                    + int(episode_buffer(f"_yaw_fsm_{suffix}_support_failed", torch.long).sum().item()),
                 )
             setattr(
                 env,
@@ -990,10 +985,10 @@ def yaw_fsm_task_levels(
         for suffix in ("pos", "neg"):
             prefix = f"_yaw_fsm_telemetry_{suffix}"
             setattr(env, f"{prefix}_transition_attempts", getattr(env, f"{prefix}_transition_attempts") + int(
-                episode_buffer(f"_yaw_fsm_{suffix}_transition_attempted", torch.bool).sum().item()
+                episode_buffer(f"_yaw_fsm_{suffix}_transition_attempted", torch.long).sum().item()
             ))
             setattr(env, f"{prefix}_transition_successes", getattr(env, f"{prefix}_transition_successes") + int(
-                episode_buffer(f"_yaw_fsm_{suffix}_transition_succeeded", torch.bool).sum().item()
+                episode_buffer(f"_yaw_fsm_{suffix}_transition_succeeded", torch.long).sum().item()
             ))
             setattr(env, f"{prefix}_yaw_error_sum", getattr(env, f"{prefix}_yaw_error_sum") + float(
                 episode_buffer(f"_yaw_fsm_{suffix}_yaw_abs_error_sum", torch.float32).sum().item()
@@ -1078,9 +1073,16 @@ def yaw_fsm_task_levels(
         for name in (
             f"_yaw_fsm_{suffix}_transition_attempted",
             f"_yaw_fsm_{suffix}_transition_succeeded",
+            f"_yaw_fsm_{suffix}_pose_succeeded",
+            f"_yaw_fsm_{suffix}_lift_failed",
+            f"_yaw_fsm_{suffix}_support_failed",
         ):
             if hasattr(env, name):
-                getattr(env, name)[selected_env_ids] = False
+                getattr(env, name)[selected_env_ids] = 0
+    for name in ("_yaw_fsm_attempt_diagonal", "_yaw_fsm_attempt_yaw_samples",
+                 "_yaw_fsm_attempt_lift_sum", "_yaw_fsm_attempt_support_sum"):
+        if hasattr(env, name):
+            getattr(env, name)[selected_env_ids] = 0
 
     env._yaw_fsm_task_curriculum_phase_advanced = 0.0
     env._yaw_fsm_task_curriculum_yaw_limit_advanced = 0.0
@@ -1119,7 +1121,8 @@ def yaw_fsm_task_levels(
         else:
             yaw_stage = env._yaw_task_curriculum_yaw_stage
             window_passed = (
-                min(tracking.values()) >= tracking_ratio_thresholds[yaw_stage]
+                min(scores.values()) >= required_success_rate
+                and min(tracking.values()) >= tracking_ratio_thresholds[yaw_stage]
                 and max(drift.values()) <= drift_thresholds[yaw_stage]
             )
             required_steps = min_yaw_stage_steps
@@ -1207,6 +1210,8 @@ def yaw_fsm_task_levels(
             setattr(env, start_name, float(reward_cfg.weight))
         reward_cfg.weight = float(getattr(env, start_name) + ramp * (target_weight - getattr(env, start_name)))
         if reward_name == yaw_reward_name:
+            reward_cfg.params["lift_progress_threshold"] = lift_progress_threshold
+            reward_cfg.params["support_threshold"] = support_threshold
             reward_cfg.params["clearance_gate_floor"] = 0.25 if phase == 1 else 0.0
             reward_cfg.params["clearance_gate_floor_decay_s"] = 3.0 if phase == 1 else 0.0
         env.reward_manager.set_term_cfg(reward_name, reward_cfg)

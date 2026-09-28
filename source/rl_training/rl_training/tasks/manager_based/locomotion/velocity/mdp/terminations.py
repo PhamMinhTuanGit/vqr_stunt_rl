@@ -14,7 +14,7 @@ from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
 from .fsm import VQRFsmState
-from .observations import yaw_fsm_unsafe
+from .observations import yaw_fsm_unsafe_components
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -88,10 +88,11 @@ class FSMUnsafeWithGrace(ManagerTermBase):
         grace_period_s: float,
         minimum_base_height: float,
         unsafe_angle_limit: float,
+        failure_kind: str = "all",
     ) -> torch.Tensor:
         if grace_period_s < 0.0:
             raise ValueError("grace_period_s must be non-negative.")
-        unsafe = yaw_fsm_unsafe(
+        torso, height, tilt = yaw_fsm_unsafe_components(
             env,
             robot_name=robot_name,
             torso_sensor_cfg=torso_sensor_cfg,
@@ -99,6 +100,10 @@ class FSMUnsafeWithGrace(ManagerTermBase):
             unsafe_angle_limit=unsafe_angle_limit,
             contact_threshold=threshold,
         )
+        failures = {"all": torso | height | tilt, "height": height, "tilt": tilt}
+        if failure_kind not in failures:
+            raise ValueError("failure_kind must be 'all', 'height', or 'tilt'.")
+        unsafe = failures[failure_kind]
         phase_value = getattr(env, "_yaw_fsm_task_curriculum_phase", 0)
         phase = int(phase_value.item()) if torch.is_tensor(phase_value) else int(phase_value)
         grace_finished = self._elapsed_s + 1.0e-6 >= grace_period_s
@@ -174,11 +179,11 @@ def fsm_transition_timeout(
     command_name: str = "yaw_rate_cmd",
     timeout_s: float = 3.0,
 ) -> torch.Tensor:
-    """Terminate environments stuck in either FSM transition state.
+    """Terminate after the cumulative TRANSITION budget for one maneuver.
 
-    ``state_time`` is owned by the command term and is reset with the FSM, so
+    ``transition_time`` is owned by the command term and is reset with the FSM, so
     this term remains independent of randomized episode lengths and command
-    resampling.  All non-transition states return ``False``.
+    resampling.  YAW pauses the budget; a later TRANSITION resumes it.
     """
     if timeout_s < 0.0:
         raise ValueError("timeout_s must be non-negative.")
@@ -186,7 +191,7 @@ def fsm_transition_timeout(
     command_term = env.command_manager.get_term(command_name)
     missing = [
         name
-        for name in ("fsm_state", "state_time")
+        for name in ("fsm_state", "transition_time")
         if not hasattr(command_term, name)
     ]
     if missing:
@@ -197,18 +202,18 @@ def fsm_transition_timeout(
 
     device = getattr(env, "device", None)
     state = torch.as_tensor(getattr(command_term, "fsm_state"), device=device)
-    state_time = torch.as_tensor(getattr(command_term, "state_time"), device=device)
+    transition_time = torch.as_tensor(getattr(command_term, "transition_time"), device=device)
     expected_shape = (env.num_envs,)
-    if state.shape != expected_shape or state_time.shape != expected_shape:
+    if state.shape != expected_shape or transition_time.shape != expected_shape:
         raise ValueError(
-            "FSM state and state_time must each have shape "
-            f"{expected_shape}; got {tuple(state.shape)} and {tuple(state_time.shape)}"
+            "FSM state and transition_time must each have shape "
+            f"{expected_shape}; got {tuple(state.shape)} and {tuple(transition_time.shape)}"
         )
 
     in_transition = (state == int(VQRFsmState.TRANSITION_POS)) | (
         state == int(VQRFsmState.TRANSITION_NEG)
     )
-    return in_transition & (state_time >= timeout_s)
+    return in_transition & (transition_time >= timeout_s)
 
 
 def fsm_return_timeout(

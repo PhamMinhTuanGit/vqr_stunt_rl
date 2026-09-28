@@ -99,6 +99,7 @@ class VQRYawFSM:
         self.recovery_dwell = recovery_dwell
         self.state = VQRFsmState.FOUR_STAND
         self.state_time = 0.0
+        self.transition_time = 0.0
         self.just_returned_to_four = False
         self._recovery_safe_time = 0.0
         self._yaw_pose_invalid_time = 0.0
@@ -183,6 +184,12 @@ class VQRYawFSM:
             self._yaw_pose_invalid_time = 0.0
         if self.state not in (VQRFsmState.TRANSITION_POS, VQRFsmState.TRANSITION_NEG):
             self._yaw_pose_ready_time = 0.0
+        active_states = (VQRFsmState.TRANSITION_POS, VQRFsmState.TRANSITION_NEG,
+                         VQRFsmState.YAW_POS, VQRFsmState.YAW_NEG)
+        if self.state not in active_states:
+            self.transition_time = 0.0
+        elif previous in (VQRFsmState.TRANSITION_POS, VQRFsmState.TRANSITION_NEG):
+            self.transition_time += self.dt
         self.state_time = 0.0 if self.state != previous else self.state_time + self.dt
         return self.state
 
@@ -260,6 +267,7 @@ class YawFSMVectorized:
         self.state_time = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
         )
+        self.transition_time = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.just_switched = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
@@ -320,6 +328,7 @@ class YawFSMVectorized:
         self.fsm_state[index] = int(VQRFsmState.FOUR_STAND)
         self.support_diagonal[index] = 0
         self.state_time[index] = 0.0
+        self.transition_time[index] = 0.0
         self.just_switched[index] = False
         self.just_returned_to_four[index] = False
         self._recovery_safe_time[index] = 0.0
@@ -498,6 +507,13 @@ class YawFSMVectorized:
             diagonal,
         )
 
+        # Budget acquisition time across same-maneuver reacquisition. Healthy
+        # YAW pauses the clock; RETURN/SAFE/FOUR end the maneuver.
+        self.transition_time.copy_(torch.where(
+            still_in_transition | still_in_yaw,
+            self.transition_time + (transition_pos | transition_neg).float() * self.dt,
+            torch.zeros_like(self.transition_time),
+        ))
         self.fsm_state.copy_(next_state)
         self.support_diagonal.copy_(diagonal)
         self.just_switched.copy_(switched)
@@ -552,6 +568,7 @@ class YawFSMCommand(YawRateCommand):
         self.unsafe = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.support_diagonal = self._fsm.support_diagonal
         self.state_time = self._fsm.state_time
+        self.transition_time = self._fsm.transition_time
         self.just_switched = self._fsm.just_switched
         self.just_returned_to_four = self._fsm.just_returned_to_four
         # This anchor belongs to the command, rather than the FSM helper or a

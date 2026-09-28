@@ -44,6 +44,7 @@ LEG_JOINT_NAMES = [
 WHEEL_RADIUS = 0.091
 TARGET_BASE_HEIGHT = 0.49
 MIN_BASE_HEIGHT = 0.35
+TRANSITION_HEIGHT_WARNING = 0.43
 SUPPORT_SPAN_MIN = 0.50
 SUPPORT_SPAN_MAX = 0.70
 TARGET_LIFT_CLEARANCE = 0.20
@@ -58,7 +59,7 @@ YAW_EDGE_TRACKING_RATIO_THRESHOLDS = (0.20, 0.25, 0.30, 0.35, 0.40, 0.45)
 FSM_DRIFT_THRESHOLDS = (0.08, 0.08, 0.08, 0.08, 0.08, 0.08)
 YAW_REF = 1.00
 SUPPORT_LOAD_TARGET_N = 80.0
-TRANSITION_LIFT_UNGATED_FRACTION = 0.35
+TRANSITION_LIFT_UNGATED_FRACTION = 0.25
 
 # Reward-rebalance baseline is stage-dependent. On resume at yaw_limit=0.25,
 # a null-yaw policy can start near mean reward 300 because yaw tracking is easy;
@@ -281,11 +282,11 @@ class VQRWheelRewardsCfg:
 
 @configclass
 class VQRWheelFSMRewardsCfg:
-    """The 25-term reward contract for ``Flat-VQR-Wheel-Yaw-FSM``.
+    """The 26-term reward contract for ``Flat-VQR-Wheel-Yaw-FSM``.
 
-    The first ten terms are the unchanged baseline safety/regularization
-    terms.  POS/NEG phase rewards select their diagonal through the command's
-    ``support_diagonal`` buffer rather than duplicating terms.
+    Safety/regularization penalties retain their baseline weights. Positive
+    pose terms become nonpositive deficits in TRANSITION; YAW and RETURN
+    retain their rewards. POS/NEG select the command's ``support_diagonal``.
     """
 
     # ------------------------------ Group 1: always-on baseline ------------------------------
@@ -365,6 +366,16 @@ class VQRWheelFSMRewardsCfg:
             "error_scale": 0.10,
         },
     )
+    transition_low_base_height = RewTerm(
+        func=mdp.yaw_transition_low_base_height,
+        weight=-4.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "warning_height": TRANSITION_HEIGHT_WARNING,
+            "minimum_height": MIN_BASE_HEIGHT,
+            "fsm_command_name": "yaw_rate_cmd",
+        },
+    )
     downward_low_base_velocity = RewTerm(
         func=mdp.yaw_downward_low_base_velocity_l2,
         weight=-8.0,
@@ -372,6 +383,8 @@ class VQRWheelFSMRewardsCfg:
             "asset_cfg": SceneEntityCfg("robot"),
             "minimum_height": MIN_BASE_HEIGHT,
             "height_margin": 0.10,
+            "warning_height": TRANSITION_HEIGHT_WARNING,
+            "fsm_command_name": "yaw_rate_cmd",
         },
     )
 
@@ -591,6 +604,14 @@ class VQRWheelFSMRewardsCfg:
             "target_clearance": LIFT_CLEARANCE_LEVELS[0],
             "fsm_command_name": "yaw_rate_cmd",
             "gamma": 0.99,
+            "support_sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=SUPPORT_WHEEL_NAMES, preserve_order=True
+            ),
+            "support_sensor_cfg_mirror": SceneEntityCfg(
+                "contact_forces", body_names=SUPPORT_WHEEL_NAMES_MIRROR, preserve_order=True
+            ),
+            "support_force_target_n": SUPPORT_LOAD_TARGET_N,
+            "transition_ungated_fraction": TRANSITION_LIFT_UNGATED_FRACTION,
         },
     )
     spin_center_drift = RewTerm(
@@ -696,7 +717,7 @@ class VQRWheelYawTerminationsCfg(TerminationsCfg):
 
 @configclass
 class VQRWheelFSMTerminationsCfg(VQRWheelYawTerminationsCfg):
-    """Phase-aware unsafe handling plus FSM watchdogs."""
+    """Phase-aware unsafe handling with separate height and tilt failure logs."""
 
     torso_contact = DoneTerm(
         func=mdp.FSMUnsafeWithGrace,
@@ -709,6 +730,35 @@ class VQRWheelFSMTerminationsCfg(VQRWheelYawTerminationsCfg):
             "grace_period_s": 0.15,
             "minimum_base_height": MIN_BASE_HEIGHT,
             "unsafe_angle_limit": 0.80,
+        },
+    )
+
+    base_height_failure = DoneTerm(
+        func=mdp.FSMUnsafeWithGrace,
+        params={
+            "robot_name": "robot",
+            "torso_sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=["TORSO"], preserve_order=True
+            ),
+            "threshold": 1.0,
+            "grace_period_s": 0.15,
+            "minimum_base_height": MIN_BASE_HEIGHT,
+            "unsafe_angle_limit": 0.80,
+            "failure_kind": "height",
+        },
+    )
+    tilt_failure = DoneTerm(
+        func=mdp.FSMUnsafeWithGrace,
+        params={
+            "robot_name": "robot",
+            "torso_sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=["TORSO"], preserve_order=True
+            ),
+            "threshold": 1.0,
+            "grace_period_s": 0.15,
+            "minimum_base_height": MIN_BASE_HEIGHT,
+            "unsafe_angle_limit": 0.80,
+            "failure_kind": "tilt",
         },
     )
 
@@ -803,7 +853,7 @@ class VQRWheelRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         # calibration offset observed on real hardware, up to ~0.1 rad)
         self.observations.policy.joint_pos.noise = NoiseModelWithAdditiveBiasCfg(
             noise_cfg=Unoise(n_min=-0.02, n_max=0.02),
-            bias_noise_cfg=Unoise(n_min=-0.1, n_max=0.1),
+            bias_noise_cfg=Unoise(n_min=-0.1, n_max=0.1, operation="abs"),
             sample_bias_per_component=True,
         )
 
