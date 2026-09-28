@@ -144,6 +144,8 @@ def test_fsm_startup_contract_checks_reward_and_command_runtime_objects():
         "four_stand_ready",
         "unsafe",
         "yaw_entry_pos",
+        "four_reward_gate",
+        "fsm_diagnostics",
     ):
         setattr(command, name, object())
     required = {

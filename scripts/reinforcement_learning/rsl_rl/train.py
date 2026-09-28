@@ -111,7 +111,8 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import rl_training.tasks  # noqa: F401
-from rl_training.tasks.manager_based.locomotion.velocity.mdp.fsm import YawFSMCommand
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.fsm import YawFSMCommand, StagedYawCommand
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.staged_yaw_curriculum import StagedPromotion
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -137,6 +138,68 @@ _YAW_FSM_CURRICULUM_PERSISTENT_FIELDS = (
     "_yaw_fsm_task_curriculum_ramp_start_spin_center_drift",
     "_yaw_fsm_task_curriculum_ramp_start_safe_recovery_entry",
 )
+
+_STAGED_YAW_CHECKPOINT_KEY = "yaw_fsm_staged_curriculum"
+
+
+def _export_staged_yaw_state(task_env) -> dict:
+    params = task_env.cfg.curriculum.task_levels.params
+    promotion = getattr(task_env, "_staged_yaw_promotion", StagedPromotion())
+    return {
+        "version": 1,
+        "clearance_levels": list(params["clearance_levels"]),
+        "yaw_rate_levels": list(params["yaw_rate_levels"]),
+        "dr_scale_levels": list(params["dr_scale_levels"]),
+        "tracking_ratio_thresholds": list(params["tracking_ratio_thresholds"]),
+        "hold_window": params["hold_window"],
+        "directional_window": params["directional_window"],
+        "required_windows": params["required_windows"],
+        "promotion": promotion.export(),
+    }
+
+
+def _restore_staged_yaw_state(task_env, checkpoint_infos) -> bool:
+    if not isinstance(checkpoint_infos, dict):
+        return False
+    payload = checkpoint_infos.get(_STAGED_YAW_CHECKPOINT_KEY)
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return False
+    term_cfg = task_env.cfg.curriculum.task_levels
+    params = term_cfg.params
+    for name in ("clearance_levels", "yaw_rate_levels", "dr_scale_levels", "tracking_ratio_thresholds"):
+        if payload.get(name) != list(params[name]):
+            print(f"[WARN] Saved staged yaw {name} differs from active config; ignoring saved state.")
+            return False
+    for name in ("hold_window", "directional_window", "required_windows"):
+        if payload.get(name) != params[name]:
+            print(f"[WARN] Saved staged yaw {name} differs from active config; ignoring saved state.")
+            return False
+    try:
+        promotion = StagedPromotion.restore(payload["promotion"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not (0 <= promotion.phase <= 3
+            and 0 <= promotion.clearance_index < len(params["clearance_levels"])
+            and 0 <= promotion.yaw_index < len(params["yaw_rate_levels"])):
+        return False
+    task_env._staged_yaw_promotion = promotion
+    term_cfg.func(task_env, [], **params)
+    command = task_env.command_manager.get_term(params["command_name"])
+    command.reset(torch.arange(task_env.num_envs, device=task_env.device))
+    return True
+
+
+def _install_staged_yaw_checkpointing(runner: OnPolicyRunner, task_env) -> None:
+    original_save = runner.save
+
+    def save_with_staged_yaw(path: str, infos: dict | None = None) -> None:
+        checkpoint_infos = dict(infos) if isinstance(infos, dict) else {}
+        if infos is not None and not isinstance(infos, dict):
+            checkpoint_infos["runner_infos"] = infos
+        checkpoint_infos[_STAGED_YAW_CHECKPOINT_KEY] = _export_staged_yaw_state(task_env)
+        original_save(path, checkpoint_infos)
+
+    runner.save = save_with_staged_yaw
 
 
 def _export_yaw_curriculum_state(task_env) -> dict:
@@ -368,6 +431,8 @@ def _verify_yaw_fsm_contract(env, env_cfg) -> None:
         "four_stand_ready",
         "unsafe",
         "yaw_entry_pos",
+        "four_reward_gate",
+        "fsm_diagnostics",
     )
     missing_command_buffers = [
         name for name in required_command_buffers if not hasattr(command, name)
@@ -387,6 +452,36 @@ def _verify_yaw_fsm_contract(env, env_cfg) -> None:
             "Unexpected Flat-VQR-Wheel-Yaw-FSM command contract: expected YawFSMCommand "
             f"with all public FSM buffers; missing={missing_command_buffers}."
         )
+
+
+def _verify_staged_yaw_contract(env, env_cfg) -> None:
+    """Reject a stale staged task before creating the PPO runner."""
+    task_env = env.unwrapped
+    terms = set(task_env.reward_manager.active_terms)
+    required = {
+        "four_stand_stability", "staged_four_contact", "staged_four_dwell_bonus",
+        "staged_milestone_bonus",
+        "transition_progress", "fsm_gated_tracking", "return_to_four_landing",
+        "four_stand_ready_bonus", "spin_center_drift", "fsm_failure",
+    }
+    command = task_env.command_manager.get_term("yaw_rate_cmd")
+    missing = sorted(required - terms)
+    if missing or not isinstance(command, StagedYawCommand):
+        raise RuntimeError(
+            f"Unexpected staged yaw runtime contract: missing rewards={missing}, "
+            f"command={type(command).__name__}."
+        )
+    if command.command.shape != (task_env.num_envs, 1):
+        raise RuntimeError("Staged yaw command must have shape (num_envs, 1).")
+    if "staged_complete" not in task_env.termination_manager.active_terms:
+        raise RuntimeError("Staged yaw completion termination is missing.")
+    actor_terms = set(task_env.observation_manager.active_terms["policy"])
+    if not {"yaw_rate_cmd", "fsm_state"}.issubset(actor_terms):
+        raise RuntimeError("Staged yaw actor must receive yaw command and FSM state.")
+    if actor_terms & {"fsm_ready_flags", "support_wheel_alignment", "com_support_coordinate"}:
+        raise RuntimeError("Staged yaw actor contains simulator-only readiness or support terms.")
+    print(f"[INFO] Flat-VQR-Wheel-Yaw-FSM-Staged config source: {inspect.getfile(type(env_cfg))}")
+    print(f"[INFO] Flat-VQR-Wheel-Yaw-FSM-Staged rewards ({len(terms)}): {sorted(terms)}")
 
 
 def _install_critic_warmup(runner: OnPolicyRunner, num_iterations: int) -> None:
@@ -472,10 +567,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     yaw_task_env = env.unwrapped if task_name == "Flat-VQR-Wheel-Yaw" else None
     yaw_fsm_task_env = env.unwrapped if task_name == "Flat-VQR-Wheel-Yaw-FSM" else None
+    staged_yaw_task_env = env.unwrapped if task_name == "Flat-VQR-Wheel-Yaw-FSM-Staged" else None
     if task_name == "Flat-VQR-Wheel-Yaw":
         _verify_yaw_reward_config(env, env_cfg)
     elif task_name == "Flat-VQR-Wheel-Yaw-FSM":
         _verify_yaw_fsm_contract(env, env_cfg)
+    elif task_name == "Flat-VQR-Wheel-Yaw-FSM-Staged":
+        _verify_staged_yaw_contract(env, env_cfg)
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -540,6 +638,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "starting FSM curriculum from Phase A."
             )
         _install_yaw_fsm_curriculum_checkpointing(runner, yaw_fsm_task_env)
+
+    if staged_yaw_task_env is not None:
+        restored = _restore_staged_yaw_state(staged_yaw_task_env, checkpoint_infos)
+        if restored:
+            stage = staged_yaw_task_env._staged_yaw_promotion
+            print(
+                "[INFO] Restored staged yaw curriculum: "
+                f"phase={stage.phase}, clearance_index={stage.clearance_index}, "
+                f"yaw_index={stage.yaw_index}, passes={stage.consecutive_passes}."
+            )
+        elif agent_cfg.resume:
+            print("[WARN] Checkpoint has no compatible staged yaw curriculum state; starting at Phase 0.")
+        _install_staged_yaw_checkpointing(runner, staged_yaw_task_env)
 
     critic_warmup_iterations = args_cli.critic_warmup_iterations
     if critic_warmup_iterations is None:

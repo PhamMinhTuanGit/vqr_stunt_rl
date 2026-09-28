@@ -29,6 +29,7 @@ def _reward_scene():
         fsm_state=torch.tensor([state.TRANSITION_POS, state.TRANSITION_NEG]),
         support_diagonal=torch.tensor([1, -1]), state_time=torch.zeros(2),
         just_switched=torch.ones(2, dtype=torch.bool),
+        four_reward_gate=torch.ones(2),
         cfg=SimpleNamespace(yaw_rate_range=(-0.25, 0.25)),
     )
     forces = torch.zeros(2, 4, 3)
@@ -72,6 +73,122 @@ def _pose_rewards(rewards, env):
         3 * rewards["four_stand_stability"](env, target_height=.49, **fsm),
         .49 * rewards["yaw_base_height_tracking"](env, target_height=.49, error_scale=.1, **fsm),
     ])
+
+
+def test_four_reward_grace_is_bounded_across_readiness_flicker_and_neutral_rearms():
+    rewards, state, env, command = _reward_scene()
+    fsm = _load_fsm_module().YawFSMVectorized(num_envs=2, dt=.02)
+    command.fsm_state = fsm.fsm_state
+    command.state_time = fsm.state_time
+    command.just_switched = fsm.just_switched
+    command.four_reward_gate = fsm.four_reward_gate
+    false = torch.zeros(2, dtype=torch.bool)
+    yaw = torch.full((2,), .2)
+
+    def four_rewards():
+        env.common_step_counter += 1
+        return (
+            rewards["four_stand_stability"](env, target_height=.49, fsm_command_name="yaw_rate_cmd"),
+            rewards["yaw_balance"](env, std=.25, fsm_command_name="yaw_rate_cmd"),
+        )
+
+    for step in range(25):
+        # Each true pulse is shorter than the required continuous 0.2 s dwell.
+        ready = torch.full((2,), step % 2 == 0)
+        fsm.update(yaw, false, false, ready, false)
+        stability, balance = four_rewards()
+        expected = torch.ones(2) if step < 20 else torch.zeros(2)
+        assert torch.equal(stability, expected)
+        assert torch.equal(balance, expected)
+        assert torch.equal(fsm.fsm_state, torch.full((2,), state.FOUR_STAND))
+
+    # Hysteresis retains the request and cannot renew its grace.
+    fsm.update(torch.full((2,), .08), false, false, false, false)
+    stability, balance = four_rewards()
+    assert torch.equal(stability, torch.zeros(2))
+    assert torch.equal(balance, torch.zeros(2))
+    assert fsm.maneuver_requested.all()
+
+    fsm.update(torch.zeros(2), false, false, false, false)
+    stability, balance = four_rewards()
+    assert torch.equal(stability, torch.ones(2))
+    assert torch.equal(balance, torch.ones(2))
+    assert not fsm.maneuver_requested.any()
+
+
+def test_four_reward_remains_full_during_continuous_ready_dwell():
+    rewards, state, env, command = _reward_scene()
+    fsm = _load_fsm_module().YawFSMVectorized(num_envs=2, dt=.02)
+    command.fsm_state = fsm.fsm_state
+    command.state_time = fsm.state_time
+    command.just_switched = fsm.just_switched
+    command.four_reward_gate = fsm.four_reward_gate
+    false = torch.zeros(2, dtype=torch.bool)
+    true = ~false
+    for _ in range(9):
+        fsm.update(torch.tensor([.2, -.2]), false, false, true, false)
+        env.common_step_counter += 1
+        assert torch.equal(fsm.fsm_state, torch.full((2,), state.FOUR_STAND))
+        assert torch.equal(rewards["four_stand_stability"](
+            env, target_height=.49, fsm_command_name="yaw_rate_cmd"), torch.ones(2))
+        assert torch.equal(rewards["yaw_balance"](
+            env, std=.25, fsm_command_name="yaw_rate_cmd"), torch.ones(2))
+    fsm.update(torch.tensor([.2, -.2]), false, false, true, false)
+    assert fsm.fsm_state.tolist() == [state.TRANSITION_POS, state.TRANSITION_NEG]
+    assert fsm.dwell_completion_count.tolist() == [1, 1]
+    assert fsm.four_to_transition_count.tolist() == [1, 1]
+
+
+def test_four_gate_does_not_change_transition_yaw_or_return_rewards():
+    rewards, state, env, command = _reward_scene()
+    command.state_time.fill_(.5)
+    for fsm_state in (state.TRANSITION_POS, state.YAW_POS, state.RETURN_TO_4):
+        command.fsm_state.fill_(fsm_state)
+        outputs = []
+        for gate in (1.0, 0.0):
+            command.four_reward_gate.fill_(gate)
+            env.common_step_counter += 1
+            outputs.append((
+                rewards["four_stand_stability"](
+                    env, target_height=.49, fsm_command_name="yaw_rate_cmd"),
+                rewards["yaw_balance"](env, std=.25, fsm_command_name="yaw_rate_cmd"),
+            ))
+        for full, gated in zip(*outputs):
+            assert torch.equal(full, gated)
+
+
+def test_curriculum_reports_entry_rates_and_terminal_transition_exit(monkeypatch):
+    curriculum = _load_curriculums_module(monkeypatch)
+    env = _fsm_checkpoint_env(curriculum, 10_000)
+    params = _fsm_curriculum_params()
+    fsm = _load_fsm_module().YawFSMVectorized(
+        num_envs=3, dt=.02, four_stand_ready_dwell=.04, yaw_pose_ready_dwell=0.0,
+    )
+    env.command_manager.get_term("yaw_rate_cmd").fsm_diagnostics = fsm
+    false = torch.zeros(3, dtype=torch.bool)
+    for _ in range(2):
+        fsm.update(torch.full((3,), .2), false, false,
+                   torch.tensor([True, False, True]), false)
+    fsm.update(torch.full((3,), .2), torch.tensor([True, False, False]),
+               false, false, false)
+    assert fsm.fsm_state.tolist() == [2, 0, 1]
+    env.episode_length_buf.fill_(100)
+    termination_masks = {
+        "torso_contact": false, "base_height_failure": false, "tilt_failure": false,
+        "fsm_transition_timeout": torch.tensor([False, False, True]),
+        "time_out": torch.tensor([False, True, True]),
+    }
+    env.termination_manager = SimpleNamespace(get_term=termination_masks.__getitem__)
+
+    result = curriculum.yaw_fsm_task_levels(env, torch.arange(3), **params)
+    assert result["entry/yaw_request_rate"] == pytest.approx(1.0)
+    assert result["entry/four_ready_rate"] == pytest.approx(4 / 7)
+    assert result["entry/dwell_completion_rate"] == pytest.approx(2 / 3)
+    assert result["entry/yaw_request_count"] == 3
+    assert result["entry/four_to_transition_count"] == 2
+    assert result["exit/yaw"] == 1
+    assert result["exit/transition_timeout"] == 1
+    assert sum(result[f"exit/{reason}"] for reason in fsm.transition_exit_reasons) == 2
 
 
 @pytest.mark.parametrize("clearance", [0., .5, .79, 1.])

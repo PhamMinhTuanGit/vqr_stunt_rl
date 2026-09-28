@@ -557,7 +557,10 @@ def yaw_balance(
     if fsm_command_name is None:
         return score
     gates = fsm_gates(env, fsm_command_name)
-    reward = score * (1.0 - gates["f_safe"] - gates["f_trans"])
+    four_gate = env.command_manager.get_term(fsm_command_name).four_reward_gate
+    reward = score * (
+        1.0 - gates["f_safe"] - gates["f_trans"] - gates["f_four"] * (1.0 - four_gate)
+    )
     _fsm_record_positive_budget(env, gates, "balance", reward)
     return reward
 
@@ -1119,7 +1122,8 @@ def four_stand_stability(
     gates = fsm_gates(env, fsm_command_name)
     # Height tracking remains active in FOUR_STAND/RETURN. Transition
     # acquisition is paid only for new progress by TransitionProgress.
-    standing_gate = gates["f_four"] + gates["f_return"] * gates["tau"]
+    four_gate = env.command_manager.get_term(fsm_command_name).four_reward_gate
+    standing_gate = gates["f_four"] * four_gate + gates["f_return"] * gates["tau"]
     reward = standing_gate * height_score * attitude_score
     _fsm_record_positive_budget(env, gates, "four_stand_stability", reward)
     return reward

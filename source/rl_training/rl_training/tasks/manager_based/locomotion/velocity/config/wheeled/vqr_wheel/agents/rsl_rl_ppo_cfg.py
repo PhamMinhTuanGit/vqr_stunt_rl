@@ -97,3 +97,12 @@ class VQRWheelYawFlatFSMPPORunnerCfg(VQRWheelYawFlatPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
         self.experiment_name = "vqr_wheel_yaw_flat_fsm"
+
+
+@configclass
+class VQRWheelYawFlatFSMStagedPPORunnerCfg(VQRWheelYawFlatFSMPPORunnerCfg):
+    """Separate checkpoint directory for the staged single-cycle task."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "vqr_wheel_yaw_flat_fsm_staged"

@@ -105,6 +105,42 @@ def _load_fsm_tracking_reward():
     return namespace, fsm_module.VQRFsmState
 
 
+def test_transition_exits_have_exact_exclusive_reasons():
+    module = _load_fsm_module()
+    fsm = module.YawFSMVectorized(
+        num_envs=7, dt=.02, four_stand_ready_dwell=0.0, yaw_pose_ready_dwell=0.0,
+    )
+    false = torch.zeros(7, dtype=torch.bool)
+    fsm.update(torch.full((7,), .2), false, false, false, false)
+    assert fsm.four_to_transition_count.tolist() == [1] * 7
+    yaw = torch.full((7,), .2)
+    yaw[1] = 0.0
+    pose_ready = false.clone()
+    pose_ready[0] = True
+    unsafe = false.clone()
+    unsafe[2] = True
+    fsm.update(yaw, pose_ready, false, false, unsafe)
+
+    terminal_ids = torch.arange(3, 7)
+    fsm.record_terminal_transition_exits(
+        terminal_ids,
+        torch.tensor([True, False, False, False]),
+        torch.tensor([True, True, False, False]),
+        torch.tensor([False, True, True, False]),
+    )
+    reasons = fsm.transition_exit_reasons
+    assert reasons == (
+        "yaw", "return", "safe", "unsafe_termination",
+        "transition_timeout", "episode_timeout", "other_termination",
+    )
+    assert torch.equal(fsm.transition_exit_counts, torch.eye(7, dtype=torch.long))
+    fsm.reset(terminal_ids)
+    assert not fsm.transition_exit_counts[terminal_ids].any()
+    assert not fsm.maneuver_requested[terminal_ids].any()
+    assert torch.equal(fsm.four_reward_gate[terminal_ids], torch.ones(4))
+    assert torch.equal(fsm.transition_exit_counts[:3], torch.eye(7, dtype=torch.long)[:3])
+
+
 def test_transition_telemetry_uses_active_support_lift_and_pose():
     tree = ast.parse(REWARDS_PATH.read_text(encoding="utf-8"))
     names = {"_fsm_step_telemetry", "_fsm_transition_telemetry"}
