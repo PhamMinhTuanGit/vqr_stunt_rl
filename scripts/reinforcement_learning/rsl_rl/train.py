@@ -14,6 +14,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import math
 import sys
 import os
 
@@ -427,6 +428,69 @@ def _install_critic_warmup(runner: OnPolicyRunner, num_iterations: int) -> None:
     print(f"[INFO] Critic-only warm-up enabled for {num_iterations} PPO updates.")
 
 
+def _configure_pos_resume_leg_std(runner: OnPolicyRunner, task_env, target_std: float = 0.25) -> None:
+    """Reduce only POS leg exploration after checkpoint model and optimizer load."""
+    policy = runner.alg.policy
+    if policy.noise_std_type != "log" or policy.state_dependent_std:
+        raise RuntimeError("POS leg exploration requires independent log_std action noise.")
+    if target_std <= 0.0:
+        raise ValueError("POS leg exploration std must be positive.")
+
+    action_manager = task_env.action_manager
+    term_names = action_manager.active_terms
+    term_dims = action_manager.action_term_dim
+    if term_names.count("joint_pos") != 1 or term_names.count("joint_vel") != 1 or len(term_names) != len(term_dims):
+        raise RuntimeError("Expected one POS joint_pos and one joint_vel action term.")
+    leg_term_index = term_names.index("joint_pos")
+    wheel_term_index = term_names.index("joint_vel")
+    leg_names = tuple(action_manager.get_term("joint_pos")._joint_names)
+    wheel_names = tuple(action_manager.get_term("joint_vel")._joint_names)
+    expected_leg_names = {
+        f"{side}_{joint}" for side in ("FL", "FR", "HL", "HR")
+        for joint in ("HipX_joint", "HipY_joint", "Knee_joint")
+    }
+    if len(leg_names) != 12 or set(leg_names) != expected_leg_names:
+        raise RuntimeError(f"Unexpected POS leg action names: {leg_names}.")
+    if len(wheel_names) != 4 or set(wheel_names) != {"FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL"}:
+        raise RuntimeError(f"Unexpected POS wheel action names: {wheel_names}.")
+    if (term_dims[leg_term_index] != len(leg_names)
+            or term_dims[wheel_term_index] != len(wheel_names)
+            or policy.log_std.numel() != sum(term_dims)):
+        raise RuntimeError("POS action dimensions do not match policy log_std.")
+
+    first_leg_index = sum(term_dims[:leg_term_index])
+    leg_indices = list(range(first_leg_index, first_leg_index + len(leg_names)))
+    first_wheel_index = sum(term_dims[:wheel_term_index])
+    wheel_indices = list(range(first_wheel_index, first_wheel_index + len(wheel_names)))
+    before = policy.log_std.detach()[leg_indices].exp().tolist()
+    with torch.no_grad():
+        policy.log_std[leg_indices] = math.log(target_std)
+        # The checkpoint also restores Adam moments. Clear only leg moments so
+        # old momentum cannot immediately undo this resume adjustment.
+        for value in runner.alg.optimizer.state.get(policy.log_std, {}).values():
+            if isinstance(value, torch.Tensor) and value.shape == policy.log_std.shape:
+                value[leg_indices] = 0
+    policy.distribution = None  # policy.act() constructs the next rollout distribution.
+    print(
+        "[INFO] POS resumed leg action std: "
+        + ", ".join(f"{name} {old:.3f}->{target_std:.3f}" for name, old in zip(leg_names, before))
+    )
+
+    original_log = runner.log
+
+    def log_with_pos_action_std(locs: dict, *args, **kwargs):
+        result = original_log(locs, *args, **kwargs)
+        for group_name, indices in (("leg", leg_indices), ("wheel", wheel_indices)):
+            actual_std = policy.log_std[indices].detach().exp()
+            runner.writer.add_scalar(f"Policy/action_std/{group_name}_mean", actual_std.mean().item(), locs["it"])
+            runner.writer.add_scalar(
+                f"Policy/action_std/{group_name}_std", actual_std.std(unbiased=False).item(), locs["it"]
+            )
+        return result
+
+    runner.log = log_with_pos_action_std
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
@@ -512,6 +576,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         checkpoint_infos = runner.load(resume_path)
+        if task_name == "Flat-VQR-Wheel-Yaw-POS" and agent_cfg.resume:
+            _configure_pos_resume_leg_std(runner, env.unwrapped)
 
     if yaw_task_env is not None:
         restored = _restore_yaw_curriculum_state(yaw_task_env, checkpoint_infos)

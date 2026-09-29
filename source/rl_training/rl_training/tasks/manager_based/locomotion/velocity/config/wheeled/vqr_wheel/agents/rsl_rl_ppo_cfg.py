@@ -98,6 +98,7 @@ class VQRWheelYawFlatPOSPPORunnerCfg(VQRWheelYawFlatPPORunnerCfg):
         super().__post_init__()
         self.experiment_name = "vqr_wheel_yaw_flat_pos"
         self.resume = False
+        self.algorithm.entropy_coef = 0.0025
 
 
 @configclass
