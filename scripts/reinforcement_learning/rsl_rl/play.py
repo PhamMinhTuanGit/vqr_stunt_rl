@@ -163,6 +163,12 @@ def _write_pos_keyboard_command(env, controller) -> None:
     env.unwrapped.command_manager.get_term("yaw_rate_cmd").set_external_command(yaw_cmd)
 
 
+def _write_yaw_keyboard_command(env, controller) -> None:
+    """Send signed keyboard yaw through the task's command term."""
+    command_term = env.unwrapped.command_manager.get_term("yaw_rate_cmd")
+    command_term.set_external_command(float(controller.advance()[2]))
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Play with RSL-RL agent."""
@@ -256,6 +262,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 v_x_sensitivity=0.0,
                 v_y_sensitivity=0.0,
                 omega_z_sensitivity=yaw_cfg.yaw_rate_range[1],
+            ))
+        elif task_name == "Flat-VQR-Wheel-Yaw":
+            yaw_cfg = env_cfg.commands.yaw_rate_cmd
+            controller = Se2Keyboard(Se2KeyboardCfg(
+                v_x_sensitivity=0.0,
+                v_y_sensitivity=0.0,
+                omega_z_sensitivity=max(abs(limit) for limit in yaw_cfg.yaw_rate_range),
             ))
         else:
             env_cfg.commands.base_velocity.debug_vis = False
@@ -418,6 +431,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         with torch.inference_mode():
             if args_cli.keyboard and task_name == "Flat-VQR-Wheel-Yaw-POS":
                 _write_pos_keyboard_command(env, controller)
+                obs = env.get_observations()
+            elif args_cli.keyboard and task_name == "Flat-VQR-Wheel-Yaw":
+                _write_yaw_keyboard_command(env, controller)
                 obs = env.get_observations()
             # agent stepping
             actions = policy(obs)
