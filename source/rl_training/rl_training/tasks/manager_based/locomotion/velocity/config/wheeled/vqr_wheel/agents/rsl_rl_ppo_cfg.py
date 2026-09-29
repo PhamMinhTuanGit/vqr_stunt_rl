@@ -106,3 +106,5 @@ class VQRWheelYawFlatFSMStagedPPORunnerCfg(VQRWheelYawFlatFSMPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
         self.experiment_name = "vqr_wheel_yaw_flat_fsm_staged"
+        self.policy.init_noise_std = 0.10
+        self.algorithm.entropy_coef = 0.002

@@ -35,6 +35,7 @@ class VQRWheelStagedCommandsCfg(VQRWheelFSMCommandsCfg):
         yaw_exit=0.05,
         yaw_min_dwell=0.20,
         four_stand_ready_dwell=0.20,
+        phase0_hold_s=1.0,
         recovery_dwell=0.50,
     )
 

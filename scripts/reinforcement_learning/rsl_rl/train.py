@@ -71,6 +71,7 @@ carb.logging.acquire_logging().set_level_threshold_for_source(
 
 import importlib.metadata as metadata
 import inspect
+import math
 import platform
 from packaging import version
 
@@ -140,6 +141,7 @@ _YAW_FSM_CURRICULUM_PERSISTENT_FIELDS = (
 )
 
 _STAGED_YAW_CHECKPOINT_KEY = "yaw_fsm_staged_curriculum"
+_STAGED_YAW_NOISE_STD_BY_PHASE = (0.10, 0.15, 0.25, 0.20)
 
 
 def _export_staged_yaw_state(task_env) -> dict:
@@ -200,6 +202,64 @@ def _install_staged_yaw_checkpointing(runner: OnPolicyRunner, task_env) -> None:
         original_save(path, checkpoint_infos)
 
     runner.save = save_with_staged_yaw
+
+
+def _install_staged_yaw_exploration(runner: OnPolicyRunner, task_env) -> None:
+    """Set fixed per-phase actor noise between PPO rollouts, never mid-rollout.
+
+    A promotion can leave the old std in use for the rest of its current
+    rollout. PPO updates that rollout with its original stored log-probabilities;
+    the new std takes effect before the next rollout starts.
+    """
+    policy = runner.alg.policy
+    if policy.noise_std_type != "log" or policy.state_dependent_std or not hasattr(policy, "log_std"):
+        raise RuntimeError("Staged yaw exploration requires a state-independent log-std actor.")
+    log_std = policy.log_std
+    log_std.requires_grad_(False)
+
+    def apply_phase(phase: int) -> None:
+        if not 0 <= phase < len(_STAGED_YAW_NOISE_STD_BY_PHASE):
+            raise ValueError(f"Invalid staged yaw phase for exploration: {phase}.")
+        target = _STAGED_YAW_NOISE_STD_BY_PHASE[phase]
+        with torch.no_grad():
+            log_std.fill_(math.log(target))
+        # Discard moments accumulated by an older staged checkpoint before
+        # log_std was fixed. Other policy and optimizer state remain intact.
+        runner.alg.optimizer.state.pop(log_std, None)
+        print(f"[INFO] Staged yaw Phase {phase} action noise std: {target:.2f}.")
+
+    applied_phase = getattr(task_env, "_staged_yaw_promotion", StagedPromotion()).phase
+    apply_phase(applied_phase)
+    original_update = runner.alg.update
+
+    def update_with_staged_yaw_exploration():
+        nonlocal applied_phase
+        losses = original_update()
+        phase = task_env._staged_yaw_promotion.phase
+        if phase != applied_phase:
+            apply_phase(phase)
+            applied_phase = phase
+        return losses
+
+    runner.alg.update = update_with_staged_yaw_exploration
+
+    original_log = runner.log
+
+    def log_with_staged_yaw_exploration(locs, *args, **kwargs):
+        result = original_log(locs, *args, **kwargs)
+        phase = task_env._staged_yaw_promotion.phase
+        step = locs["it"]
+        # RSL-RL's mean_noise_std uses its last cached distribution, which can
+        # still show the old scale on the promotion iteration. Read the actor
+        # parameter after phase synchronization for these staged-only metrics.
+        runner.writer.add_scalar("Curriculum/staged_phase", phase, step)
+        runner.writer.add_scalar(
+            "Policy/staged_target_exploration_std", _STAGED_YAW_NOISE_STD_BY_PHASE[phase], step
+        )
+        runner.writer.add_scalar("Policy/staged_actual_mean_actor_std", log_std.detach().exp().mean().item(), step)
+        return result
+
+    runner.log = log_with_staged_yaw_exploration
 
 
 def _export_yaw_curriculum_state(task_env) -> dict:
@@ -651,6 +711,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         elif agent_cfg.resume:
             print("[WARN] Checkpoint has no compatible staged yaw curriculum state; starting at Phase 0.")
         _install_staged_yaw_checkpointing(runner, staged_yaw_task_env)
+        _install_staged_yaw_exploration(runner, staged_yaw_task_env)
 
     critic_warmup_iterations = args_cli.critic_warmup_iterations
     if critic_warmup_iterations is None:

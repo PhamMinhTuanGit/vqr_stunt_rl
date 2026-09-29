@@ -243,10 +243,9 @@ def staged_yaw_task_levels(
         if state.phase == 3 and episode_yaw_index is not None:
             eligible &= episode_yaw_index[completed] == state.yaw_index
         clean = ~(failed[completed] | current_unsafe[completed])
-        hold_ok = (
-            cycle.four_hold_success[completed] & current_four_ready[completed]
-            & ~failed[completed] & ~current_unsafe[completed]
-        )
+        hold_ok = torch.zeros_like(completed, dtype=torch.bool)
+        if state.phase == 0:
+            hold_ok = cycle.phase0_hold_success[completed] & clean
         returned = (
             cycle.landed_four[completed] & ~failed[completed]
             & ~cycle.invalid[completed] & ~current_unsafe[completed]

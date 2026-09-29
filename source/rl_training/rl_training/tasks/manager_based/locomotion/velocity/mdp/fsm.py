@@ -912,18 +912,26 @@ class StagedYawSchedule:
 class StagedCycleTracker:
     """Episode milestones; a return is valid only after the intended YAW state."""
 
-    def __init__(self, num_envs: int, device: str, dt: float, four_dwell_s: float):
+    def __init__(
+        self, num_envs: int, device: str, dt: float, four_dwell_s: float,
+        phase0_hold_s: float = 1.0,
+    ):
+        if phase0_hold_s <= 0.0:
+            raise ValueError("phase0_hold_s must be positive.")
         self.dt = float(dt)
         self.four_dwell_s = float(four_dwell_s)
+        self.phase0_hold_s = float(phase0_hold_s)
         for name in (
             "entered_transition", "entered_yaw", "support_ready_seen", "pose_ready_seen",
             "zero_return_seen", "landed_four", "full_cycle_complete", "invalid",
-            "four_dwell_seen", "just_four_dwell",
+            "four_dwell_seen", "just_four_dwell", "phase0_hold_seen",
         ):
             setattr(self, name, torch.zeros(num_envs, device=device, dtype=torch.bool))
         self.four_ready_steps = torch.zeros(num_envs, device=device, dtype=torch.long)
         self.episode_steps = torch.zeros_like(self.four_ready_steps)
         self.four_ready_time = torch.zeros(num_envs, device=device)
+        self.phase0_ready_time = torch.zeros(num_envs, device=device)
+        self.max_continuous_four_ready_s = torch.zeros(num_envs, device=device)
         self.fresh_four_time = torch.zeros(num_envs, device=device)
         self.command_sum = torch.zeros(num_envs, device=device)
         self.error_sum = torch.zeros(num_envs, device=device)
@@ -940,7 +948,7 @@ class StagedCycleTracker:
         self, previous: torch.Tensor, state: torch.Tensor, sign: torch.Tensor,
         yaw_command: torch.Tensor, four_ready: torch.Tensor, pose_ready: torch.Tensor,
         support_ready: torch.Tensor, unsafe: torch.Tensor, yaw_velocity: torch.Tensor,
-        drift: torch.Tensor,
+        drift: torch.Tensor, phase0_active: torch.Tensor | None = None,
     ) -> None:
         four = state == int(VQRFsmState.FOUR_STAND)
         transition = torch.where(sign > 0, state == int(VQRFsmState.TRANSITION_POS),
@@ -961,6 +969,17 @@ class StagedCycleTracker:
         )
         self.four_dwell_seen |= self.just_four_dwell
         self.invalid |= unsafe | (state == int(VQRFsmState.SAFE_RECOVERY))
+        if phase0_active is None:
+            phase0_active = torch.ones_like(four_ready)
+        phase0_ready = phase0_active & four & four_ready & ~self.invalid
+        self.phase0_ready_time = torch.where(
+            phase0_ready, self.phase0_ready_time + self.dt,
+            torch.zeros_like(self.phase0_ready_time),
+        )
+        self.max_continuous_four_ready_s = torch.maximum(
+            self.max_continuous_four_ready_s, self.phase0_ready_time
+        )
+        self.phase0_hold_seen |= self.phase0_ready_time >= self.phase0_hold_s - 1.0e-6
         self.entered_transition |= transition
         self.entered_yaw |= yaw & self.entered_transition
         active = transition | yaw
@@ -984,12 +1003,8 @@ class StagedCycleTracker:
         self.drift_samples += yaw.long()
 
     @property
-    def four_hold_success(self) -> torch.Tensor:
-        return (
-            (self.four_ready_steps.float() / self.episode_steps.clamp_min(1) >= 0.90)
-            & (self.four_ready_time >= self.four_dwell_s - 1.0e-6)
-            & ~self.invalid
-        )
+    def phase0_hold_success(self) -> torch.Tensor:
+        return self.phase0_hold_seen & ~self.invalid
 
 
 class StagedYawCommand(YawFSMCommand):
@@ -1002,12 +1017,14 @@ class StagedYawCommand(YawFSMCommand):
         self.schedule = StagedYawSchedule(self.num_envs, self.device, env.step_dt,
                                           cfg.initial_hold_s, cfg.yaw_duration_s)
         self.cycle = StagedCycleTracker(self.num_envs, self.device, env.step_dt,
-                                         cfg.four_stand_ready_dwell)
+                                         cfg.four_stand_ready_dwell, cfg.phase0_hold_s)
         self.episode_phase = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.episode_clearance_index = torch.zeros_like(self.episode_phase)
         self.episode_yaw_index = torch.zeros_like(self.episode_phase)
         self.episode_yaw_limit = torch.zeros(self.num_envs, device=self.device)
         self.episode_target_clearance = torch.zeros(self.num_envs, device=self.device)
+        for name in ("four_ready_fraction", "max_continuous_four_ready_s", "phase0_hold_success"):
+            self.metrics[name] = torch.zeros(self.num_envs, device=self.device)
 
     def _resample_command(self, env_ids: Sequence[int]) -> None:
         self._command[env_ids, 0] = 0.0
@@ -1045,7 +1062,15 @@ class StagedYawCommand(YawFSMCommand):
         drift = torch.linalg.vector_norm(current_xy - self.yaw_entry_pos, dim=1)
         self.cycle.update(previous, self.fsm_state, sign, self._command[:, 0],
                           self.four_stand_ready, pose_ready, support_ready, self.unsafe,
-                          self.robot.data.root_ang_vel_b[:, 2], drift)
+                          self.robot.data.root_ang_vel_b[:, 2], drift,
+                          phase0_active=(self.episode_phase == 0) & (self._env.episode_length_buf > 0))
+        self.metrics["four_ready_fraction"].copy_(
+            self.cycle.four_ready_steps.float() / self.cycle.episode_steps.clamp_min(1)
+        )
+        self.metrics["max_continuous_four_ready_s"].copy_(self.cycle.max_continuous_four_ready_s)
+        self.metrics["phase0_hold_success"].copy_(
+            ((self.episode_phase == 0) & self.cycle.phase0_hold_success).float()
+        )
 
     def _update_fsm_predicates(self) -> None:
         original_clearance = self.cfg.target_clearance
@@ -1065,7 +1090,8 @@ class StagedYawCommand(YawFSMCommand):
     @property
     def staged_complete(self) -> torch.Tensor:
         return (
-            ((self.episode_phase == 1) & self.cycle.entered_transition)
+            ((self.episode_phase == 0) & self.cycle.phase0_hold_success)
+            | ((self.episode_phase == 1) & self.cycle.entered_transition)
             | ((self.episode_phase == 2) & self.cycle.entered_yaw)
             | ((self.episode_phase == 3) & self.cycle.full_cycle_complete)
         ) & ~self.cycle.invalid
@@ -1080,3 +1106,4 @@ class StagedYawCommandCfg(YawFSMCommandCfg):
     yaw_rate_limit: float = 0.15
     initial_hold_s: float = 0.5
     yaw_duration_s: float = 4.0
+    phase0_hold_s: float = 1.0
