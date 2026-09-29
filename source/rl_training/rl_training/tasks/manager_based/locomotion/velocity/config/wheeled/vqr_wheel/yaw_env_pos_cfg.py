@@ -77,7 +77,7 @@ class VQRWheelYawPosRewardsCfg(VQRWheelRewardsCfg):
                 "support_sensor_cfg": SceneEntityCfg("contact_forces", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
                 "lifted_asset_cfg": SceneEntityCfg("robot", body_names=POS_LIFTED_WHEELS, preserve_order=True),
                 "wheel_radius": WHEEL_RADIUS, "target_clearance": LIFT_CLEARANCE_LEVELS[0],
-                "std": 0.30, "deadband": YAW_DEADBAND, "contact_threshold": 1.0,
+                "std": 0.20, "neutral_std": 0.30, "deadband": YAW_DEADBAND, "contact_threshold": 1.0,
                 "clearance_gate_floor": 0.25, "edge_command_fraction": 0.80},
     )
     lifted_wheel_spin = RewTerm(

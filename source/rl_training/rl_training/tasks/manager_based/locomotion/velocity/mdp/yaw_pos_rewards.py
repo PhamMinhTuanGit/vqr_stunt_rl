@@ -111,6 +111,7 @@ def yaw_pos_gated_tracking(
     lifted_asset_cfg: SceneEntityCfg, wheel_radius: float, target_clearance: float, std: float,
     deadband: float, contact_threshold: float = 1.0, clearance_gate_floor: float = 0.25,
     edge_command_fraction: float = 0.80, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    neutral_std: float | None = None,
 ) -> torch.Tensor:
     command, active, neutral = yaw_pos_masks(env, command_name, deadband)
     robot = env.scene[asset_cfg.name]
@@ -120,7 +121,7 @@ def yaw_pos_gated_tracking(
     clearance_weight = clearance_gate_floor + (1.0 - clearance_gate_floor) * lift
     tracking = torch.exp(-(yaw_rate - command).square() / std**2)
     active_score = support * clearance_weight * tracking
-    neutral_score = torch.exp(-yaw_rate.square() / std**2)
+    neutral_score = torch.exp(-yaw_rate.square() / (std if neutral_std is None else neutral_std) ** 2)
 
     _accumulate(env, "_yaw_support_score", support, active)
     _accumulate(env, "_yaw_gate_open", support, active)

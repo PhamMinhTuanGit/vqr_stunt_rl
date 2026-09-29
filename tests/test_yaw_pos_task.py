@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import math
 import sys
 import types
 from pathlib import Path
@@ -167,6 +168,45 @@ def test_neutral_yaw_and_landing_improve_before_four_wheel_contact(monkeypatch):
     assert landing_scores == pytest.approx([0.0, 0.25, 0.5, 0.75, 1.0])
     assert reward.yaw_pos_four_wheel_contact(env, all_wheels, "yaw_rate_cmd", 0.1)[0].item() == pytest.approx(0.1)
     assert env._yaw_pos_neutral_four_contact_sum.item() == 0.0
+
+
+def test_pos_active_yaw_std_rejects_zero_yaw_without_changing_neutral(monkeypatch):
+    config = ast.parse((CONFIG / "yaw_env_pos_cfg.py").read_text())
+    rewards_cfg = next(node for node in config.body
+                       if isinstance(node, ast.ClassDef) and node.name == "VQRWheelYawPosRewardsCfg")
+    yaw_cfg = next(node.value for node in rewards_cfg.body
+                   if isinstance(node, ast.Assign) and node.targets[0].id == "gated_yaw_tracking")
+    params = next(keyword.value for keyword in yaw_cfg.keywords if keyword.arg == "params")
+    values = {ast.literal_eval(key): ast.literal_eval(value)
+              for key, value in zip(params.keys, params.values)
+              if isinstance(value, ast.Constant)}
+    assert values["std"] == 0.20
+    assert values["neutral_std"] == 0.30
+
+    reward = _reward_module(monkeypatch)
+    env = _env([0.15, 0.25, 0.0])
+    env.contacts[:] = torch.tensor([1.0, 0.0, 0.0, 1.0])
+    env.clearance[:, [1, 2]] = 1.0
+    support = EntityCfg("contact_forces", body_names=["FL_WHEEL", "HR_WHEEL"])
+    lifted = EntityCfg("robot", body_names=["FR_WHEEL", "HL_WHEEL"])
+
+    def yaw_scores():
+        return reward.yaw_pos_gated_tracking(
+            env, "yaw_rate_cmd", support, lifted, 0.091, 0.05,
+            values["std"], 0.1, neutral_std=values["neutral_std"],
+        ).tolist()
+
+    zero_yaw = yaw_scores()
+    assert zero_yaw == pytest.approx([math.exp(-(0.15 / 0.20) ** 2),
+                                      math.exp(-(0.25 / 0.20) ** 2), 1.0])
+    assert zero_yaw[0] < 0.6
+    assert zero_yaw[1] < 0.25
+
+    env.scene["robot"].data.root_ang_vel_b[:, 2] = torch.tensor([0.15, 0.245, 0.30])
+    matched_yaw = yaw_scores()
+    assert matched_yaw[0] == pytest.approx(1.0)
+    assert matched_yaw[1] > 0.99
+    assert matched_yaw[2] == pytest.approx(math.exp(-1.0))
 
 
 def test_sampler_and_external_command(monkeypatch):
