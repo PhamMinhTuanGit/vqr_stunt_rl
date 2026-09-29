@@ -289,6 +289,7 @@ class VQRWheelYawCurriculumCfg:
             "required_consecutive_windows": 3,
             "min_clearance_stage_steps": 1000,
             "min_yaw_stage_steps": 6000,
+            "active_only": False,
         },
     )
 

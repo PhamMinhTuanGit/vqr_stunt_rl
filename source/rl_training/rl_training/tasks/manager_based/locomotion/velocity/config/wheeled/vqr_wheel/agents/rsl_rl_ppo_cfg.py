@@ -91,20 +91,19 @@ class VQRWheelYawFlatPPORunnerCfg(VQRWheelFlatPPORunnerCfg):
 
 
 @configclass
+class VQRWheelYawFlatPOSPPORunnerCfg(VQRWheelYawFlatPPORunnerCfg):
+    """Fresh runs and logs dedicated to neutral/positive command conditioning."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "vqr_wheel_yaw_flat_pos"
+        self.resume = False
+
+
+@configclass
 class VQRWheelYawFlatFSMPPORunnerCfg(VQRWheelYawFlatPPORunnerCfg):
     """Runner settings with an isolated experiment directory for the FSM task."""
 
     def __post_init__(self):
         super().__post_init__()
         self.experiment_name = "vqr_wheel_yaw_flat_fsm"
-
-
-@configclass
-class VQRWheelYawFlatFSMStagedPPORunnerCfg(VQRWheelYawFlatFSMPPORunnerCfg):
-    """Separate checkpoint directory for the staged single-cycle task."""
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.experiment_name = "vqr_wheel_yaw_flat_fsm_staged"
-        self.policy.init_noise_std = 0.10
-        self.algorithm.entropy_coef = 0.002

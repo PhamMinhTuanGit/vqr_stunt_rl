@@ -167,7 +167,7 @@ def yaw_fsm_predicates(
     lifted_asset_cfg_mirror: SceneEntityCfg,
     all_wheel_sensor_cfg: SceneEntityCfg,
     torso_sensor_cfg: SceneEntityCfg,
-    target_clearance: float | torch.Tensor,
+    target_clearance: float,
     wheel_radius: float,
     contact_threshold: float = 1.0,
     clearance_fraction: float = 0.8,
@@ -182,7 +182,7 @@ def yaw_fsm_predicates(
     the NEG diagonal (FR, HL).  This keeps contact and clearance predicates on
     the same canonical mapping used by the FSM rewards.
     """
-    if not isinstance(target_clearance, torch.Tensor) and target_clearance < 0.0:
+    if target_clearance < 0.0:
         raise ValueError("target_clearance must be non-negative.")
     if contact_threshold < 0.0:
         raise ValueError("contact_threshold must be non-negative.")
@@ -226,12 +226,7 @@ def yaw_fsm_predicates(
     roll, pitch, _ = euler_xyz_from_quat(robot.data.root_quat_w)
     pose_is_safe = (torch.abs(roll) < pose_angle_limit) & (torch.abs(pitch) < pose_angle_limit)
 
-    if isinstance(target_clearance, torch.Tensor):
-        if target_clearance.shape != (env.num_envs,):
-            raise ValueError("Per-environment target_clearance must have shape (num_envs,).")
-        clearance_threshold = clearance_fraction * target_clearance.unsqueeze(1)
-    else:
-        clearance_threshold = clearance_fraction * target_clearance
+    clearance_threshold = clearance_fraction * target_clearance
     positive_pose_ready = (
         positive_support_contact.all(dim=-1)
         & (lifted_clearance >= clearance_threshold).all(dim=-1)

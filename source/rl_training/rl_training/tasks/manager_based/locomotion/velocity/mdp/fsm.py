@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import torch
-import math
 
 from enum import IntEnum
 from typing import Sequence
@@ -30,10 +29,6 @@ __all__ = [
     "YawFSMVectorized",
     "YawFSMCommand",
     "YawFSMCommandCfg",
-    "StagedYawSchedule",
-    "StagedCycleTracker",
-    "StagedYawCommand",
-    "StagedYawCommandCfg",
     "select_swing_wheel_contact",
 ]
 
@@ -244,7 +239,6 @@ class YawFSMVectorized:
         recovery_dwell: float = 0.5,
         yaw_pose_ready_dwell: float = 0.10,
         four_stand_ready_dwell: float = 0.20,
-        four_reward_grace_s: float = 0.40,
     ):
         self.num_envs = int(num_envs)
         if self.num_envs < 1:
@@ -278,11 +272,6 @@ class YawFSMVectorized:
         self.four_stand_ready_dwell = torch.as_tensor(
             four_stand_ready_dwell, dtype=torch.float32, device=self.device
         )
-        if four_reward_grace_s < four_stand_ready_dwell:
-            raise ValueError("four_reward_grace_s must cover the four-stand-ready dwell.")
-        self.four_reward_grace_s = torch.as_tensor(
-            four_reward_grace_s, dtype=torch.float32, device=self.device
-        )
 
         self.fsm_state = torch.full(
             (self.num_envs,),
@@ -314,23 +303,6 @@ class YawFSMVectorized:
         )
         self._four_stand_ready_time = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
-        )
-        self.maneuver_requested = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.maneuver_request_age = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
-        self.four_reward_gate = torch.ones(self.num_envs, dtype=torch.float32, device=self.device)
-        self.four_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self.yaw_request_count = torch.zeros_like(self.four_steps)
-        self.yaw_request_four_steps = torch.zeros_like(self.four_steps)
-        self.four_ready_request_steps = torch.zeros_like(self.four_steps)
-        self.dwell_completion_count = torch.zeros_like(self.four_steps)
-        self._request_dwell_completed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.four_to_transition_count = torch.zeros_like(self.four_steps)
-        self.transition_exit_reasons = (
-            "yaw", "return", "safe", "unsafe_termination",
-            "transition_timeout", "episode_timeout", "other_termination",
-        )
-        self.transition_exit_counts = torch.zeros(
-            self.num_envs, len(self.transition_exit_reasons), dtype=torch.long, device=self.device
         )
 
     @property
@@ -384,42 +356,6 @@ class YawFSMVectorized:
         self._yaw_pose_invalid_time[index] = 0.0
         self._yaw_pose_ready_time[index] = 0.0
         self._four_stand_ready_time[index] = 0.0
-        self.maneuver_requested[index] = False
-        self.maneuver_request_age[index] = 0.0
-        self.four_reward_gate[index] = 1.0
-        self.four_steps[index] = 0
-        self.yaw_request_count[index] = 0
-        self.yaw_request_four_steps[index] = 0
-        self.four_ready_request_steps[index] = 0
-        self.dwell_completion_count[index] = 0
-        self._request_dwell_completed[index] = False
-        self.four_to_transition_count[index] = 0
-        self.transition_exit_counts[index] = 0
-
-    def record_terminal_transition_exits(
-        self,
-        env_ids: torch.Tensor,
-        unsafe_termination: torch.Tensor,
-        transition_timeout: torch.Tensor,
-        episode_timeout: torch.Tensor,
-    ) -> None:
-        """Close visits still in TRANSITION at reset, using exclusive priorities."""
-        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
-        if env_ids.numel() == 0:
-            return
-        state = self.fsm_state[env_ids]
-        remaining = (state == int(VQRFsmState.TRANSITION_POS)) | (
-            state == int(VQRFsmState.TRANSITION_NEG)
-        )
-        for reason, mask in (
-            ("unsafe_termination", unsafe_termination),
-            ("transition_timeout", transition_timeout),
-            ("episode_timeout", episode_timeout),
-            ("other_termination", torch.ones_like(remaining)),
-        ):
-            selected = remaining & torch.as_tensor(mask, dtype=torch.bool, device=self.device)
-            self.transition_exit_counts[env_ids, self.transition_exit_reasons.index(reason)] += selected.long()
-            remaining &= ~selected
 
     def update(
         self,
@@ -451,22 +387,6 @@ class YawFSMVectorized:
         previous = self.fsm_state
         next_state = previous.clone()
 
-        # The request timer survives readiness flicker and RETURN. A neutral
-        # command or episode reset is the only way to rearm the grace period.
-        request_now = yaw.abs() > self.yaw_enter
-        neutral_now = yaw.abs() <= self.yaw_exit
-        new_request = ~self.maneuver_requested & request_now
-        latched = (self.maneuver_requested | request_now) & ~neutral_now
-        request_age = torch.where(
-            latched,
-            torch.where(self.maneuver_requested, self.maneuver_request_age + self.dt, 0.0),
-            0.0,
-        )
-        self.maneuver_requested.copy_(latched)
-        self.maneuver_request_age.copy_(request_age)
-        self.yaw_request_count += new_request.long()
-        self._request_dwell_completed.masked_fill_(~latched, False)
-
         # Safety has priority over all normal transitions.
         next_state = torch.where(
             unsafe_mask,
@@ -482,16 +402,6 @@ class YawFSMVectorized:
             torch.zeros_like(self._four_stand_ready_time),
         )
         stable_four = four_ready_time >= self.four_stand_ready_dwell - 1.0e-6
-        self.four_reward_gate.copy_(
-            (~latched | ((request_age < self.four_reward_grace_s - 1.0e-6) & ~stable_four)).float()
-        )
-        requested_four = four_stand & request_now
-        self.four_steps += four_stand.long()
-        self.yaw_request_four_steps += requested_four.long()
-        self.four_ready_request_steps += (requested_four & four_ready).long()
-        dwell_completed = four_stand & latched & stable_four & ~self._request_dwell_completed
-        self.dwell_completion_count += dwell_completed.long()
-        self._request_dwell_completed |= dwell_completed
         transition_pos = previous == int(VQRFsmState.TRANSITION_POS)
         yaw_pos = previous == int(VQRFsmState.YAW_POS)
         transition_neg = previous == int(VQRFsmState.TRANSITION_NEG)
@@ -511,7 +421,6 @@ class YawFSMVectorized:
             torch.full_like(previous, int(VQRFsmState.TRANSITION_NEG)),
             next_state,
         )
-        self.four_to_transition_count += (enter_pos | enter_neg).long()
 
         # A command exit takes priority over a temporary loss of pose readiness.
         abort_pos = active & (
@@ -569,15 +478,6 @@ class YawFSMVectorized:
             torch.full_like(previous, int(VQRFsmState.YAW_NEG)),
             next_state,
         )
-        from_transition = transition_pos | transition_neg
-        for reason, target in (
-            ("yaw", (next_state == int(VQRFsmState.YAW_POS)) | (next_state == int(VQRFsmState.YAW_NEG))),
-            ("return", next_state == int(VQRFsmState.RETURN_TO_4)),
-            ("safe", next_state == int(VQRFsmState.SAFE_RECOVERY)),
-        ):
-            self.transition_exit_counts[:, self.transition_exit_reasons.index(reason)] += (
-                from_transition & target
-            ).long()
         still_in_transition = (next_state == int(VQRFsmState.TRANSITION_POS)) | (
             next_state == int(VQRFsmState.TRANSITION_NEG)
         )
@@ -689,7 +589,6 @@ class YawFSMCommand(YawRateCommand):
             yaw_min_dwell=cfg.yaw_min_dwell,
             yaw_pose_ready_dwell=cfg.yaw_pose_ready_dwell,
             four_stand_ready_dwell=cfg.four_stand_ready_dwell,
-            four_reward_grace_s=cfg.four_reward_grace_s,
             yaw_pose_loss_grace=cfg.yaw_pose_loss_grace,
             recovery_dwell=cfg.recovery_dwell,
         )
@@ -706,7 +605,6 @@ class YawFSMCommand(YawRateCommand):
         self.transition_time = self._fsm.transition_time
         self.just_switched = self._fsm.just_switched
         self.just_returned_to_four = self._fsm.just_returned_to_four
-        self.four_reward_gate = self._fsm.four_reward_gate
         # This anchor belongs to the command, rather than the FSM helper or a
         # reward-local cache.  The drift reward must consume this exact buffer.
         self.yaw_entry_pos = torch.zeros(self.num_envs, 2, dtype=torch.float32, device=self.device)
@@ -736,11 +634,6 @@ class YawFSMCommand(YawRateCommand):
     def fsm_state(self) -> torch.Tensor:
         """Current FSM state for every environment as ``VQRFsmState`` values."""
         return self._fsm_state
-
-    @property
-    def fsm_diagnostics(self) -> YawFSMVectorized:
-        """Per-episode entry and exit counters, consumed before command reset."""
-        return self._fsm
 
     def set_fsm_inputs(
         self,
@@ -851,7 +744,6 @@ class YawFSMCommandCfg(YawRateCommandCfg):
     yaw_min_dwell: float = 0.20
     yaw_pose_ready_dwell: float = 0.10
     four_stand_ready_dwell: float = 0.20
-    four_reward_grace_s: float = 0.40
     yaw_pose_loss_grace: float = 0.10
     recovery_dwell: float = 0.50
     support_sensor_cfg: SceneEntityCfg | None = None
@@ -867,243 +759,3 @@ class YawFSMCommandCfg(YawRateCommandCfg):
     pose_angle_limit: float = 0.35
     unsafe_angle_limit: float = 0.80
     minimum_base_height: float = 0.35
-
-
-class StagedYawSchedule:
-    """One signed request per reset, with globally alternating directions."""
-
-    def __init__(self, num_envs: int, device: str, dt: float, hold_s: float = 0.5, yaw_s: float = 4.0):
-        self.elapsed = torch.zeros(num_envs, device=device)
-        self.ticks = torch.zeros(num_envs, device=device, dtype=torch.long)
-        self.sign = torch.ones(num_envs, dtype=torch.long, device=device)
-        self.dt = float(dt)
-        self.hold_s = float(hold_s)
-        self.yaw_s = float(yaw_s)
-        self.assignments = 0
-
-    def reset(self, env_ids: Sequence[int] | slice) -> None:
-        ids = torch.arange(len(self.elapsed), device=self.elapsed.device)[env_ids]
-        if ids.numel() == 0:
-            return
-        sequence = torch.arange(ids.numel(), device=self.elapsed.device) + self.assignments
-        self.sign[ids] = torch.where(sequence.remainder(2) == 0, 1, -1)
-        self.assignments += ids.numel()
-        self.elapsed[ids] = 0.0
-        self.ticks[ids] = 0
-
-    def step(
-        self, phase: int | torch.Tensor, yaw_limit: float | torch.Tensor,
-        advance_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if advance_mask is None:
-            self.ticks += 1
-        else:
-            self.ticks += advance_mask.to(dtype=torch.long)
-        self.elapsed.copy_(self.ticks.float() * self.dt)
-        first_tick = math.ceil((self.hold_s - 1.0e-9) / self.dt)
-        last_tick = math.ceil((self.hold_s + self.yaw_s - 1.0e-9) / self.dt)
-        phase = torch.as_tensor(phase, device=self.ticks.device)
-        yaw_limit = torch.as_tensor(yaw_limit, device=self.ticks.device)
-        requested = (phase > 0) & (self.ticks >= first_tick)
-        requested &= (phase != 3) | (self.ticks < last_tick)
-        return torch.where(requested, self.sign.float() * yaw_limit, 0.0)
-
-
-class StagedCycleTracker:
-    """Episode milestones; a return is valid only after the intended YAW state."""
-
-    def __init__(
-        self, num_envs: int, device: str, dt: float, four_dwell_s: float,
-        phase0_hold_s: float = 1.0,
-    ):
-        if phase0_hold_s <= 0.0:
-            raise ValueError("phase0_hold_s must be positive.")
-        self.dt = float(dt)
-        self.four_dwell_s = float(four_dwell_s)
-        self.phase0_hold_s = float(phase0_hold_s)
-        for name in (
-            "entered_transition", "entered_yaw", "support_ready_seen", "pose_ready_seen",
-            "zero_return_seen", "landed_four", "full_cycle_complete", "invalid",
-            "four_dwell_seen", "just_four_dwell", "phase0_hold_seen",
-        ):
-            setattr(self, name, torch.zeros(num_envs, device=device, dtype=torch.bool))
-        self.four_ready_steps = torch.zeros(num_envs, device=device, dtype=torch.long)
-        self.episode_steps = torch.zeros_like(self.four_ready_steps)
-        self.four_ready_time = torch.zeros(num_envs, device=device)
-        self.phase0_ready_time = torch.zeros(num_envs, device=device)
-        self.max_continuous_four_ready_s = torch.zeros(num_envs, device=device)
-        self.fresh_four_time = torch.zeros(num_envs, device=device)
-        self.command_sum = torch.zeros(num_envs, device=device)
-        self.error_sum = torch.zeros(num_envs, device=device)
-        self.yaw_samples = torch.zeros_like(self.four_ready_steps)
-        self.drift_sum = torch.zeros(num_envs, device=device)
-        self.drift_samples = torch.zeros_like(self.four_ready_steps)
-
-    def reset(self, env_ids: Sequence[int] | slice) -> None:
-        for value in vars(self).values():
-            if isinstance(value, torch.Tensor) and value.ndim == 1:
-                value[env_ids] = 0
-
-    def update(
-        self, previous: torch.Tensor, state: torch.Tensor, sign: torch.Tensor,
-        yaw_command: torch.Tensor, four_ready: torch.Tensor, pose_ready: torch.Tensor,
-        support_ready: torch.Tensor, unsafe: torch.Tensor, yaw_velocity: torch.Tensor,
-        drift: torch.Tensor, phase0_active: torch.Tensor | None = None,
-    ) -> None:
-        four = state == int(VQRFsmState.FOUR_STAND)
-        transition = torch.where(sign > 0, state == int(VQRFsmState.TRANSITION_POS),
-                                 state == int(VQRFsmState.TRANSITION_NEG))
-        yaw = torch.where(sign > 0, state == int(VQRFsmState.YAW_POS),
-                          state == int(VQRFsmState.YAW_NEG))
-        returned = state == int(VQRFsmState.RETURN_TO_4)
-        previous_yaw = (previous == int(VQRFsmState.YAW_POS)) | (previous == int(VQRFsmState.YAW_NEG))
-        previous_return = previous == int(VQRFsmState.RETURN_TO_4)
-        self.episode_steps += 1
-        self.four_ready_steps += (four & four_ready).long()
-        self.four_ready_time = torch.where(
-            four & four_ready, self.four_ready_time + self.dt, torch.zeros_like(self.four_ready_time)
-        )
-        self.just_four_dwell.copy_(
-            (self.four_ready_time >= self.four_dwell_s - 1.0e-6)
-            & four & ~self.four_dwell_seen
-        )
-        self.four_dwell_seen |= self.just_four_dwell
-        self.invalid |= unsafe | (state == int(VQRFsmState.SAFE_RECOVERY))
-        if phase0_active is None:
-            phase0_active = torch.ones_like(four_ready)
-        phase0_ready = phase0_active & four & four_ready & ~self.invalid
-        self.phase0_ready_time = torch.where(
-            phase0_ready, self.phase0_ready_time + self.dt,
-            torch.zeros_like(self.phase0_ready_time),
-        )
-        self.max_continuous_four_ready_s = torch.maximum(
-            self.max_continuous_four_ready_s, self.phase0_ready_time
-        )
-        self.phase0_hold_seen |= self.phase0_ready_time >= self.phase0_hold_s - 1.0e-6
-        self.entered_transition |= transition
-        self.entered_yaw |= yaw & self.entered_transition
-        active = transition | yaw
-        self.support_ready_seen |= active & support_ready
-        self.pose_ready_seen |= active & pose_ready
-        self.invalid |= returned & ((yaw_command.abs() > 0.05) | ~self.entered_yaw)
-        self.zero_return_seen |= returned & previous_yaw & (yaw_command.abs() <= 0.05) & ~self.invalid
-        newly_landed = four & previous_return & self.zero_return_seen & ~self.invalid
-        self.landed_four |= newly_landed
-        continuing = four & four_ready & self.landed_four & ~newly_landed & ~self.invalid
-        self.fresh_four_time = torch.where(
-            continuing, self.fresh_four_time + self.dt, torch.zeros_like(self.fresh_four_time)
-        )
-        self.full_cycle_complete |= self.landed_four & (
-            self.fresh_four_time >= self.four_dwell_s - 1.0e-6
-        ) & ~self.invalid
-        self.command_sum += yaw_command.abs() * yaw
-        self.error_sum += (yaw_velocity - yaw_command).abs() * yaw
-        self.yaw_samples += yaw.long()
-        self.drift_sum += drift * yaw
-        self.drift_samples += yaw.long()
-
-    @property
-    def phase0_hold_success(self) -> torch.Tensor:
-        return self.phase0_hold_seen & ~self.invalid
-
-
-class StagedYawCommand(YawFSMCommand):
-    """FSM command with an episode-owned schedule and cycle evidence."""
-
-    cfg: "StagedYawCommandCfg"
-
-    def __init__(self, cfg: "StagedYawCommandCfg", env):
-        super().__init__(cfg, env)
-        self.schedule = StagedYawSchedule(self.num_envs, self.device, env.step_dt,
-                                          cfg.initial_hold_s, cfg.yaw_duration_s)
-        self.cycle = StagedCycleTracker(self.num_envs, self.device, env.step_dt,
-                                         cfg.four_stand_ready_dwell, cfg.phase0_hold_s)
-        self.episode_phase = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        self.episode_clearance_index = torch.zeros_like(self.episode_phase)
-        self.episode_yaw_index = torch.zeros_like(self.episode_phase)
-        self.episode_yaw_limit = torch.zeros(self.num_envs, device=self.device)
-        self.episode_target_clearance = torch.zeros(self.num_envs, device=self.device)
-        for name in ("four_ready_fraction", "max_continuous_four_ready_s", "phase0_hold_success"):
-            self.metrics[name] = torch.zeros(self.num_envs, device=self.device)
-
-    def _resample_command(self, env_ids: Sequence[int]) -> None:
-        self._command[env_ids, 0] = 0.0
-        if hasattr(self, "schedule"):
-            self.schedule.reset(env_ids)
-            self.episode_phase[env_ids] = self.cfg.staged_phase
-            self.episode_clearance_index[env_ids] = self.cfg.staged_clearance_index
-            self.episode_yaw_index[env_ids] = self.cfg.staged_yaw_index
-            self.episode_yaw_limit[env_ids] = self.cfg.yaw_rate_limit
-            self.episode_target_clearance[env_ids] = self.cfg.target_clearance
-
-    def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
-        ids = torch.arange(self.num_envs, device=self.device) if env_ids is None else env_ids
-        extras = super().reset(ids)
-        self.cycle.reset(ids)
-        return extras
-
-    def _step_fsm(self) -> None:
-        previous = self.fsm_state.clone()
-        super()._step_fsm()
-        sign = self.schedule.sign
-        pose_ready = torch.where(sign > 0, self.positive_pose_ready, self.negative_pose_ready)
-        support_ready = pose_ready
-        if self._fsm_predicates_enabled:
-            pos_sensor = self._env.scene.sensors[self.cfg.support_sensor_cfg.name]
-            neg_sensor = self._env.scene.sensors[self.cfg.support_sensor_cfg_mirror.name]
-            pos_contact = torch.linalg.vector_norm(
-                pos_sensor.data.net_forces_w[:, self.cfg.support_sensor_cfg.body_ids], dim=-1
-            ).gt(self.cfg.contact_threshold).all(dim=1)
-            neg_contact = torch.linalg.vector_norm(
-                neg_sensor.data.net_forces_w[:, self.cfg.support_sensor_cfg_mirror.body_ids], dim=-1
-            ).gt(self.cfg.contact_threshold).all(dim=1)
-            support_ready = torch.where(sign > 0, pos_contact, neg_contact)
-        current_xy = self.robot.data.root_pos_w[:, :2] - self._env.scene.env_origins[:, :2]
-        drift = torch.linalg.vector_norm(current_xy - self.yaw_entry_pos, dim=1)
-        self.cycle.update(previous, self.fsm_state, sign, self._command[:, 0],
-                          self.four_stand_ready, pose_ready, support_ready, self.unsafe,
-                          self.robot.data.root_ang_vel_b[:, 2], drift,
-                          phase0_active=(self.episode_phase == 0) & (self._env.episode_length_buf > 0))
-        self.metrics["four_ready_fraction"].copy_(
-            self.cycle.four_ready_steps.float() / self.cycle.episode_steps.clamp_min(1)
-        )
-        self.metrics["max_continuous_four_ready_s"].copy_(self.cycle.max_continuous_four_ready_s)
-        self.metrics["phase0_hold_success"].copy_(
-            ((self.episode_phase == 0) & self.cycle.phase0_hold_success).float()
-        )
-
-    def _update_fsm_predicates(self) -> None:
-        original_clearance = self.cfg.target_clearance
-        self.cfg.target_clearance = self.episode_target_clearance
-        try:
-            super()._update_fsm_predicates()
-        finally:
-            self.cfg.target_clearance = original_clearance
-
-    def _update_command(self) -> None:
-        # ManagerBasedRLEnv computes commands immediately after resetting an
-        # environment. That zero-time call must not consume a schedule tick.
-        advance = self._env.episode_length_buf > 0
-        self._command[:, 0] = self.schedule.step(self.episode_phase, self.episode_yaw_limit, advance)
-        self._step_fsm()
-
-    @property
-    def staged_complete(self) -> torch.Tensor:
-        return (
-            ((self.episode_phase == 0) & self.cycle.phase0_hold_success)
-            | ((self.episode_phase == 1) & self.cycle.entered_transition)
-            | ((self.episode_phase == 2) & self.cycle.entered_yaw)
-            | ((self.episode_phase == 3) & self.cycle.full_cycle_complete)
-        ) & ~self.cycle.invalid
-
-
-@configclass
-class StagedYawCommandCfg(YawFSMCommandCfg):
-    class_type: type = StagedYawCommand
-    staged_phase: int = 0
-    staged_clearance_index: int = 0
-    staged_yaw_index: int = 0
-    yaw_rate_limit: float = 0.15
-    initial_hold_s: float = 0.5
-    yaw_duration_s: float = 4.0
-    phase0_hold_s: float = 1.0

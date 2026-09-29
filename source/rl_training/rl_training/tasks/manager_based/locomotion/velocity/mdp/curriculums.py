@@ -193,6 +193,7 @@ def yaw_task_levels(
     min_clearance_stage_steps: int,
     min_yaw_stage_steps: int,
     transition_reward_name: str | None = None,
+    active_only: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Learn the two-wheel pose first, then jointly increase yaw and online DR.
 
@@ -286,6 +287,12 @@ def yaw_task_levels(
 
     episode_steps = env.episode_length_buf[selected_env_ids]
     valid = episode_steps > 0
+    if active_only:
+        # A neutral-only episode contains no evidence about two-wheel yaw skill.
+        if hasattr(env, "_yaw_tracking_metric_samples"):
+            valid = valid & (env._yaw_tracking_metric_samples[selected_env_ids] > 0)
+        else:
+            valid = torch.zeros_like(valid)
     if torch.any(valid):
         completed_env_ids = selected_env_ids[valid]
         episode_duration = episode_steps[valid].float() * env.step_dt
@@ -316,7 +323,13 @@ def yaw_task_levels(
             # The initial reset happens before the reward has ever been evaluated.
             lift_progress_score = torch.zeros_like(support_score)
         balance_score = normalized_score(balance_reward_name)
-        yaw_score = normalized_score(yaw_reward_name)
+        if active_only:
+            yaw_score = (
+                env._yaw_active_yaw_score_sum[completed_env_ids]
+                / env._yaw_active_yaw_score_samples[completed_env_ids].clamp_min(1)
+            )
+        else:
+            yaw_score = normalized_score(yaw_reward_name)
         if hasattr(env, "_yaw_base_height_min"):
             minimum_episode_height = env._yaw_base_height_min[completed_env_ids]
         else:
@@ -420,6 +433,9 @@ def yaw_task_levels(
         env._yaw_edge_command_abs_sum[selected_env_ids] = 0.0
         env._yaw_edge_rate_abs_error_sum[selected_env_ids] = 0.0
         env._yaw_edge_tracking_samples[selected_env_ids] = 0
+    if active_only and hasattr(env, "_yaw_active_yaw_score_sum"):
+        env._yaw_active_yaw_score_sum[selected_env_ids] = 0.0
+        env._yaw_active_yaw_score_samples[selected_env_ids] = 0
     if hasattr(env, "_yaw_base_height_min"):
         env._yaw_base_height_min[selected_env_ids] = torch.inf
 
@@ -533,7 +549,7 @@ def yaw_task_levels(
 
     # Command curriculum.
     command_term = env.command_manager.get_term(command_name)
-    command_term.cfg.yaw_rate_range = (-yaw_limit, yaw_limit)
+    command_term.cfg.yaw_rate_range = (0.0, yaw_limit) if active_only else (-yaw_limit, yaw_limit)
     # The FSM predicate must use the same clearance stage as the lift/yaw
     # rewards.  Scalar YawRateCommandCfg has no such field, so the baseline
     # task remains bit-identical through this conditional extension.
@@ -802,13 +818,6 @@ def yaw_fsm_task_levels(
         "_yaw_fsm_telemetry_positive_budget_neg": 0.0,
         "_yaw_fsm_telemetry_transition_steps": 0,
         "_yaw_fsm_telemetry_transition_attempts": 0,
-        "_yaw_fsm_telemetry_four_steps": 0,
-        "_yaw_fsm_telemetry_yaw_request_count": 0,
-        "_yaw_fsm_telemetry_yaw_request_four_steps": 0,
-        "_yaw_fsm_telemetry_four_ready_request_steps": 0,
-        "_yaw_fsm_telemetry_dwell_completion_count": 0,
-        "_yaw_fsm_telemetry_four_to_transition_count": 0,
-        "_yaw_fsm_telemetry_transition_exit_counts": torch.zeros(7, dtype=torch.long, device=env.device),
     }
     telemetry_defaults.update({
         f"_yaw_fsm_telemetry_transition_{field}_sum": 0.0
@@ -854,23 +863,6 @@ def yaw_fsm_task_levels(
         if value is None:
             return torch.zeros(len(completed_env_ids), dtype=dtype, device=env.device)
         return torch.as_tensor(value, device=env.device, dtype=dtype)[completed_env_ids]
-
-    fsm_diagnostics = getattr(env.command_manager.get_term(command_name), "fsm_diagnostics", None)
-    if fsm_diagnostics is not None and len(completed_env_ids):
-        # FSM state changes are counted by the command. Visits that remain in
-        # TRANSITION at reset need the live done masks before managers reset.
-        done = env.termination_manager
-        unsafe_done = (
-            done.get_term("torso_contact")
-            | done.get_term("base_height_failure")
-            | done.get_term("tilt_failure")
-        )
-        fsm_diagnostics.record_terminal_transition_exits(
-            completed_env_ids,
-            unsafe_done[completed_env_ids],
-            done.get_term("fsm_transition_timeout")[completed_env_ids],
-            done.get_term("time_out")[completed_env_ids],
-        )
 
     if len(completed_env_ids):
         for suffix in ("pos", "neg"):
@@ -988,18 +980,6 @@ def yaw_fsm_task_levels(
             )
             env._yaw_fsm_telemetry_transition_attempts += int(
                 env._yaw_fsm_transition_attempts[completed_env_ids].sum().item()
-            )
-        if fsm_diagnostics is not None:
-            for field in (
-                "four_steps", "yaw_request_count", "yaw_request_four_steps",
-                "four_ready_request_steps", "dwell_completion_count", "four_to_transition_count",
-            ):
-                name = f"_yaw_fsm_telemetry_{field}"
-                setattr(env, name, getattr(env, name) + int(
-                    getattr(fsm_diagnostics, field)[completed_env_ids].sum().item()
-                ))
-            env._yaw_fsm_telemetry_transition_exit_counts += (
-                fsm_diagnostics.transition_exit_counts[completed_env_ids].sum(dim=0)
             )
         for field in transition_fields:
             episode_name = f"_yaw_fsm_transition_{field}_sum"
@@ -1305,28 +1285,6 @@ def yaw_fsm_task_levels(
         env.step_dt * env._yaw_fsm_telemetry_transition_steps
         / max(env._yaw_fsm_telemetry_transition_attempts, 1)
     )
-    four_steps = max(env._yaw_fsm_telemetry_four_steps, 1)
-    requested_four_steps = max(env._yaw_fsm_telemetry_yaw_request_four_steps, 1)
-    # Readiness is a step fraction during requested FOUR; dwell completion is
-    # one event per latched yaw request, even if readiness later flickers.
-    telemetry.update({
-        "entry/yaw_request_rate": scalar(env._yaw_fsm_telemetry_yaw_request_four_steps / four_steps),
-        "entry/four_ready_rate": scalar(env._yaw_fsm_telemetry_four_ready_request_steps / requested_four_steps),
-        "entry/dwell_completion_rate": scalar(
-            env._yaw_fsm_telemetry_dwell_completion_count
-            / max(env._yaw_fsm_telemetry_yaw_request_count, 1)
-        ),
-        "entry/four_to_transition_count": scalar(env._yaw_fsm_telemetry_four_to_transition_count),
-        "entry/four_steps": scalar(env._yaw_fsm_telemetry_four_steps),
-        "entry/yaw_request_count": scalar(env._yaw_fsm_telemetry_yaw_request_count),
-        "entry/yaw_request_four_steps": scalar(env._yaw_fsm_telemetry_yaw_request_four_steps),
-    })
-    exit_counts = env._yaw_fsm_telemetry_transition_exit_counts
-    for index, reason in enumerate((
-        "yaw", "return", "safe", "unsafe_termination",
-        "transition_timeout", "episode_timeout", "other_termination",
-    )):
-        telemetry[f"exit/{reason}"] = scalar(exit_counts[index].item())
     for suffix in ("pos", "neg"):
         prefix = f"_yaw_fsm_telemetry_{suffix}"
         telemetry[f"{suffix}/transition_success"] = scalar(
