@@ -37,6 +37,10 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--pos_leg_std_override", type=float, default=None,
+    help="Optional POS leg-action std override after resume. Omit to preserve checkpoint std.",
+)
+parser.add_argument(
     "--critic_warmup_iterations",
     type=int,
     default=None,
@@ -428,12 +432,16 @@ def _install_critic_warmup(runner: OnPolicyRunner, num_iterations: int) -> None:
     print(f"[INFO] Critic-only warm-up enabled for {num_iterations} PPO updates.")
 
 
-def _configure_pos_resume_leg_std(runner: OnPolicyRunner, task_env, target_std: float = 0.25) -> None:
-    """Reduce only POS leg exploration after checkpoint model and optimizer load."""
+def _configure_pos_resume_leg_std(runner: OnPolicyRunner, task_env, target_std: float | None = 0.25) -> None:
+    """Optionally set POS leg exploration and always log leg/wheel action std."""
     policy = runner.alg.policy
-    if policy.noise_std_type != "log" or policy.state_dependent_std:
-        raise RuntimeError("POS leg exploration requires independent log_std action noise.")
-    if target_std <= 0.0:
+    if (
+        getattr(policy, "state_dependent_std", None) is True
+        or getattr(policy, "noise_std_type", None) != "log"
+        or not isinstance(getattr(policy, "log_std", None), torch.nn.Parameter)
+    ):
+        raise RuntimeError("POS leg exploration requires an independent log_std parameter.")
+    if target_std is not None and target_std <= 0.0:
         raise ValueError("POS leg exploration std must be positive.")
 
     action_manager = task_env.action_manager
@@ -463,17 +471,26 @@ def _configure_pos_resume_leg_std(runner: OnPolicyRunner, task_env, target_std: 
     first_wheel_index = sum(term_dims[:wheel_term_index])
     wheel_indices = list(range(first_wheel_index, first_wheel_index + len(wheel_names)))
     before = policy.log_std.detach()[leg_indices].exp().tolist()
-    with torch.no_grad():
-        policy.log_std[leg_indices] = math.log(target_std)
-        # The checkpoint also restores Adam moments. Clear only leg moments so
-        # old momentum cannot immediately undo this resume adjustment.
-        for value in runner.alg.optimizer.state.get(policy.log_std, {}).values():
-            if isinstance(value, torch.Tensor) and value.shape == policy.log_std.shape:
-                value[leg_indices] = 0
-    policy.distribution = None  # policy.act() constructs the next rollout distribution.
+    if target_std is None:
+        print("[INFO] POS preserved leg action std: " + ", ".join(
+            f"{name} {value:.3f}" for name, value in zip(leg_names, before)
+        ))
+    else:
+        with torch.no_grad():
+            policy.log_std[leg_indices] = math.log(target_std)
+            # Clear only leg moments so old momentum cannot undo the override.
+            for value in runner.alg.optimizer.state.get(policy.log_std, {}).values():
+                if isinstance(value, torch.Tensor) and value.shape == policy.log_std.shape:
+                    value[leg_indices] = 0
+        policy.distribution = None  # policy.act() constructs the next rollout distribution.
+        print(
+            "[INFO] POS resumed leg action std: "
+            + ", ".join(f"{name} {old:.3f}->{target_std:.3f}" for name, old in zip(leg_names, before))
+        )
+    wheel_std = policy.log_std.detach()[wheel_indices].exp().tolist()
     print(
-        "[INFO] POS resumed leg action std: "
-        + ", ".join(f"{name} {old:.3f}->{target_std:.3f}" for name, old in zip(leg_names, before))
+        "[INFO] POS preserved wheel action std: "
+        + ", ".join(f"{name} {value:.3f}" for name, value in zip(wheel_names, wheel_std))
     )
 
     original_log = runner.log
@@ -489,6 +506,33 @@ def _configure_pos_resume_leg_std(runner: OnPolicyRunner, task_env, target_std: 
         return result
 
     runner.log = log_with_pos_action_std
+
+
+def _verify_pos_resume_state(runner: OnPolicyRunner, task_env, checkpoint_path: str, additional_iterations: int, save_interval: int) -> None:
+    """Verify a POS resume before any PPO update and print every action std."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    policy = runner.alg.policy
+    checkpoint_log_std = checkpoint["model_state_dict"]["log_std"]
+    if not torch.equal(policy.log_std.detach().cpu(), checkpoint_log_std):
+        raise RuntimeError("POS action std differs from the checkpoint after resume.")
+    if runner.current_learning_iteration != checkpoint["iter"]:
+        raise RuntimeError("POS starting iteration differs from the checkpoint.")
+
+    action_names = [
+        name for term in task_env.action_manager.active_terms
+        for name in task_env.action_manager.get_term(term)._joint_names
+    ]
+    if len(action_names) != checkpoint_log_std.numel():
+        raise RuntimeError("POS action names do not match checkpoint std dimensions.")
+    start = runner.current_learning_iteration
+    print(f"[PRESTART] checkpoint={os.path.realpath(checkpoint_path)}", flush=True)
+    print(
+        f"[PRESTART] starting_iteration={start}, max_iteration={start + additional_iterations}, "
+        f"additional_iterations={additional_iterations}, save_interval={save_interval}",
+        flush=True,
+    )
+    for index, (name, std) in enumerate(zip(action_names, policy.log_std.detach().exp().tolist())):
+        print(f"[PRESTART] action_std[{index:02d}] {name}={std:.9g}", flush=True)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -547,7 +591,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        if agent_cfg.load_checkpoint is not None and os.path.isabs(agent_cfg.load_checkpoint):
+            resume_path = os.path.realpath(agent_cfg.load_checkpoint)
+            if not os.path.isfile(resume_path):
+                raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        else:
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
     if args_cli.video:
@@ -575,9 +624,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
-        checkpoint_infos = runner.load(resume_path)
+        checkpoint_infos = runner.load(resume_path, load_optimizer=True)
         if task_name == "Flat-VQR-Wheel-Yaw-POS" and agent_cfg.resume:
-            _configure_pos_resume_leg_std(runner, env.unwrapped)
+            _configure_pos_resume_leg_std(runner, env.unwrapped, target_std=args_cli.pos_leg_std_override)
+            if args_cli.pos_leg_std_override is None:
+                _verify_pos_resume_state(
+                    runner, env.unwrapped, resume_path, agent_cfg.max_iterations, agent_cfg.save_interval
+                )
 
     if yaw_task_env is not None:
         restored = _restore_yaw_curriculum_state(yaw_task_env, checkpoint_infos)
