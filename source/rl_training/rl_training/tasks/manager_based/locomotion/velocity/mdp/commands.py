@@ -203,6 +203,7 @@ class YawRateCommand(CommandTerm):
         self.robot = env.scene[cfg.asset_name]
 
         self._command = torch.zeros(self.num_envs, 1, device=self.device)
+        self._external_control = False
         self.metrics["error_yaw_rate"] = torch.zeros(self.num_envs, device=self.device)
 
     @property
@@ -211,10 +212,23 @@ class YawRateCommand(CommandTerm):
 
     def _resample_command(self, env_ids: Sequence[int]):
         """Sample new yaw-rate target."""
+        if self._external_control:
+            return
         # Advanced indexing returns a copy, so calling ``uniform_`` directly on
         # ``self._command[env_ids, 0]`` leaves the command buffer unchanged.
         sampled = torch.empty_like(self._command[env_ids, 0]).uniform_(*self.cfg.yaw_rate_range)
         self._command[env_ids, 0] = sampled
+
+    def set_external_command(self, yaw_cmd: float | torch.Tensor, env_ids: Sequence[int] | slice = slice(None)) -> None:
+        """Write a runtime yaw target into the command buffer used by observations."""
+        values = torch.as_tensor(yaw_cmd, dtype=self._command.dtype, device=self.device).flatten()
+        count = self._command[env_ids, 0].numel()
+        if values.numel() not in (1, count):
+            raise ValueError(f"Expected one yaw command or {count} commands, got {values.numel()}.")
+        if not torch.isfinite(values).all():
+            raise ValueError("Yaw command must be finite.")
+        self._command[env_ids, 0] = values.expand(count).clamp(*self.cfg.yaw_rate_range)
+        self._external_control = True
 
     def _update_command(self):
         # Command is constant until next resampling.
