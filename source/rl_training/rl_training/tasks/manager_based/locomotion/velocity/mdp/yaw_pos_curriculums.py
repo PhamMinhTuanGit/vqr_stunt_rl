@@ -50,6 +50,10 @@ def yaw_pos_task_levels(
         required_consecutive_windows, min_clearance_stage_steps, min_yaw_stage_steps,
         transition_reward_name=transition_reward_name, active_only=True,
     )
+    # The POS-only landing signal uses the same clearance target as active lift.
+    landing_cfg = env.reward_manager.get_term_cfg("neutral_landing_progress")
+    landing_cfg.params["target_clearance"] = env.reward_manager.get_term_cfg(lift_reward_name).params["target_clearance"]
+    env.reward_manager.set_term_cfg("neutral_landing_progress", landing_cfg)
     for name in (
         "_yaw_pos_neutral_four_contact_sum", "_yaw_pos_neutral_four_contact_samples",
         "_yaw_pos_neutral_pose_error_sum", "_yaw_pos_neutral_pose_error_samples",

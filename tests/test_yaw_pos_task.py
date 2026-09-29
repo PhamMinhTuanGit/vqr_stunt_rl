@@ -87,6 +87,7 @@ def test_masks_and_neutral_rewards(monkeypatch):
     env.clearance[3, [1, 2]] = 1.0
     assert reward.yaw_pos_com_support(env, EntityCfg("robot"), 0.08, "yaw_rate_cmd", 0.1).tolist() == [0, 0, 0, 1]
     assert reward.yaw_pos_lift_clearance(env, lifted, support, 0.091, 0.05, "yaw_rate_cmd", 0.1).tolist() == [0, 0, 0, 1]
+    assert reward.yaw_pos_neutral_landing_progress(env, lifted, 0.091, 0.05, "yaw_rate_cmd", 0.1).tolist() == [1, 1, 1, 0]
     assert reward.yaw_pos_four_stand_pose(env, legs, "yaw_rate_cmd", 0.1).tolist() == [1, 1, 1, 0]
     assert reward.yaw_pos_four_wheel_contact(env, all_wheels, "yaw_rate_cmd", 0.1).tolist() == [1, 1, 1, 0]
     env.scene["robot"].data.joint_pos[0] = 0.5
@@ -114,17 +115,58 @@ def test_command_sequence_changes_reward_target_without_reset(monkeypatch):
             env.clearance[0] = 0.0
             env.scene["robot"].data.root_ang_vel_b[0, 2] = 0.0
         yaw = reward.yaw_pos_gated_tracking(
-            env, "yaw_rate_cmd", support, all_wheels, lifted, 0.091, 0.05, 0.30, 0.1,
+            env, "yaw_rate_cmd", support, lifted, 0.091, 0.05, 0.30, 0.1,
         )[0]
         reward.yaw_pos_lift_clearance(env, lifted, support, 0.091, 0.05, "yaw_rate_cmd", 0.1)
+        landing = reward.yaw_pos_neutral_landing_progress(env, lifted, 0.091, 0.05, "yaw_rate_cmd", 0.1)[0]
         pose = reward.yaw_pos_four_stand_pose(env, legs, "yaw_rate_cmd", 0.1)[0]
         contact = reward.yaw_pos_four_wheel_contact(env, all_wheels, "yaw_rate_cmd", 0.1)[0]
-        scores.append((yaw.item(), pose.item(), contact.item()))
-    assert scores[0] == scores[2] == (1.0, 0.0, 0.0)
-    assert scores[1] == scores[3] == (1.0, 1.0, 1.0)
+        scores.append((yaw.item(), landing.item(), pose.item(), contact.item()))
+    assert scores[0] == scores[2] == (1.0, 0.0, 0.0, 0.0)
+    assert scores[1] == scores[3] == (1.0, 1.0, 1.0, 1.0)
     assert env._yaw_tracking_metric_samples.item() == 2
     assert env._yaw_pos_neutral_samples.item() == 2
     assert env._yaw_lift_min_progress_samples.item() == 2
+
+
+def test_neutral_yaw_and_landing_improve_before_four_wheel_contact(monkeypatch):
+    reward = _reward_module(monkeypatch)
+    env = _env([0.0])
+    env.contacts[0] = torch.tensor([1., 0., 0., 1.])  # FL+HR support; FR+HL still airborne.
+    support = EntityCfg("contact_forces", body_names=["FL_WHEEL", "HR_WHEEL"])
+    lifted = EntityCfg("robot", body_names=["FR_WHEEL", "HL_WHEEL"])
+    all_wheels = EntityCfg("contact_forces", body_names=["FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL"])
+    index = {"FR_WHEEL": 1, "HL_WHEEL": 2}
+    monkeypatch.setattr(
+        reward, "_yaw_lift_progress",
+        lambda env, cfg, radius, target: (env.clearance[:, [index[name] for name in cfg.body_names]] / target).clamp(0, 1),
+    )
+    env.clearance[0, [1, 2]] = 0.05
+    yaw_scores = []
+    for yaw_rate in (0.7, 0.35, 0.0):
+        env.scene["robot"].data.root_ang_vel_b[0, 2] = yaw_rate
+        yaw_scores.append(reward.yaw_pos_gated_tracking(
+            env, "yaw_rate_cmd", support, lifted, 0.091, 0.05, 0.30, 0.1,
+        )[0].item())
+    assert 0 < yaw_scores[0] < yaw_scores[1] < yaw_scores[2] == 1.0
+    env.contacts[0] = 1.0
+    env.scene["robot"].data.root_ang_vel_b[0, 2] = 0.35
+    full_contact_yaw_score = reward.yaw_pos_gated_tracking(
+        env, "yaw_rate_cmd", support, lifted, 0.091, 0.05, 0.30, 0.1,
+    )[0].item()
+    assert full_contact_yaw_score == pytest.approx(yaw_scores[1])
+    env.contacts[0] = torch.tensor([1., 0., 0., 1.])
+
+    landing_scores = []
+    for fr_clearance, hl_clearance in ((0.05, 0.05), (0.025, 0.05), (0.025, 0.025),
+                                       (0.0, 0.025), (0.0, 0.0)):
+        env.clearance[0, [1, 2]] = torch.tensor([fr_clearance, hl_clearance])
+        landing_scores.append(reward.yaw_pos_neutral_landing_progress(
+            env, lifted, 0.091, 0.05, "yaw_rate_cmd", 0.1,
+        )[0].item())
+    assert landing_scores == pytest.approx([0.0, 0.25, 0.5, 0.75, 1.0])
+    assert reward.yaw_pos_four_wheel_contact(env, all_wheels, "yaw_rate_cmd", 0.1)[0].item() == pytest.approx(0.1)
+    assert env._yaw_pos_neutral_four_contact_sum.item() == 0.0
 
 
 def test_sampler_and_external_command(monkeypatch):
@@ -174,7 +216,8 @@ def test_new_registration_runner_and_existing_config_are_isolated():
     assert "VQRWheelFlatEnvPOSCfg" in classes
     reward_names = {node.targets[0].id for node in classes["VQRWheelYawPosRewardsCfg"].body if isinstance(node, ast.Assign)}
     assert reward_names == {"com_support", "support_span_band", "lift_clearance", "com_inside_segment",
-                            "gated_yaw_tracking", "lifted_wheel_spin", "four_stand_pose", "four_wheel_contact"}
+                            "gated_yaw_tracking", "lifted_wheel_spin", "neutral_landing_progress",
+                            "four_stand_pose", "four_wheel_contact"}
 
 
 def test_curriculum_uses_active_metrics_and_logs_neutral_separately(monkeypatch):
@@ -190,9 +233,17 @@ def test_curriculum_uses_active_metrics_and_logs_neutral_separately(monkeypatch)
     baseline.yaw_task_levels = fake_yaw_task_levels
     monkeypatch.setitem(sys.modules, baseline.__name__, baseline)
     module = _load(monkeypatch, "yaw_pos_curriculums", MDP / "yaw_pos_curriculums.py")
+    reward_configs = {
+        "lift_clearance": SimpleNamespace(params={"target_clearance": 0.10}),
+        "neutral_landing_progress": SimpleNamespace(params={"target_clearance": 0.05}),
+    }
     env = SimpleNamespace(
         num_envs=1, device="cpu", _yaw_tracking_metric_samples=torch.tensor([2]),
         _yaw_pos_neutral_samples=torch.tensor([2]),
+        reward_manager=SimpleNamespace(
+            get_term_cfg=lambda name: reward_configs[name],
+            set_term_cfg=lambda name, cfg: reward_configs.__setitem__(name, cfg),
+        ),
         _yaw_pos_neutral_four_contact_sum=torch.tensor([2.]),
         _yaw_pos_neutral_four_contact_samples=torch.tensor([2]),
         _yaw_pos_neutral_pose_error_sum=torch.tensor([0.2]),
@@ -213,6 +264,7 @@ def test_curriculum_uses_active_metrics_and_logs_neutral_separately(monkeypatch)
     assert result["neutral_pose_error"] == pytest.approx(0.1)
     assert result["neutral_abs_yaw_rate"] == pytest.approx(0.2)
     assert result["neutral_planar_speed"] == pytest.approx(0.3)
+    assert reward_configs["neutral_landing_progress"].params["target_clearance"] == pytest.approx(0.10)
     assert env._yaw_pos_neutral_four_contact_sum.item() == 0
 
 
@@ -265,3 +317,38 @@ def test_neutral_only_episode_cannot_promote_yaw_ladder(monkeypatch):
     assert result["pending_evaluated_episodes"].item() == 0
     assert result["yaw_stage"].item() == 0
     assert command_term.cfg.yaw_rate_range == (0.0, 0.25)
+
+
+def test_pos_resume_restores_and_installs_yaw_curriculum_checkpoint_hook():
+    train = ROOT / "scripts/reinforcement_learning/rsl_rl/train.py"
+    main = next(node for node in ast.parse(train.read_text()).body
+                if isinstance(node, ast.FunctionDef) and node.name == "main")
+    selection = next(node.value for node in main.body if isinstance(node, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == "yaw_task_env"
+                             for target in node.targets))
+    task_env = SimpleNamespace(_yaw_task_curriculum_stage=2, _yaw_task_curriculum_yaw_stage=1)
+    env = SimpleNamespace(unwrapped=task_env)
+    task_name = "Flat-VQR-Wheel-Yaw-POS"
+    selected = eval(compile(ast.Expression(selection), str(train), "eval"),
+                    {"task_name": task_name, "env": env})
+    assert selected is task_env
+
+    resume_block = next(node for node in main.body if isinstance(node, ast.If)
+                        and ast.unparse(node.test) == "yaw_task_env is not None")
+    calls = []
+    runner = SimpleNamespace()
+    checkpoint_infos = {"yaw_curriculum": {"version": 1}}
+    namespace = {
+        "task_name": task_name, "yaw_task_env": selected,
+        "checkpoint_infos": checkpoint_infos, "runner": runner,
+        "agent_cfg": SimpleNamespace(resume=True),
+        "_restore_yaw_curriculum_state": lambda task, info: calls.append(("restore", task, info)) or True,
+        "_install_yaw_curriculum_checkpointing": lambda run, task: calls.append(("hook", run, task)),
+    }
+    exec(compile(ast.Module(body=[resume_block], type_ignores=[]), str(train), "exec"), namespace)
+    assert calls == [("restore", task_env, checkpoint_infos), ("hook", runner, task_env)]
+
+    reward_guard = next(node for node in main.body if isinstance(node, ast.If)
+                        and any(isinstance(child, ast.Name) and child.id == "_verify_yaw_reward_config"
+                                for child in ast.walk(node)))
+    assert "Flat-VQR-Wheel-Yaw-POS" not in ast.unparse(reward_guard.test)

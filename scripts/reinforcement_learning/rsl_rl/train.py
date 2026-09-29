@@ -470,7 +470,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-    yaw_task_env = env.unwrapped if task_name == "Flat-VQR-Wheel-Yaw" else None
+    yaw_task_env = env.unwrapped if task_name in ("Flat-VQR-Wheel-Yaw", "Flat-VQR-Wheel-Yaw-POS") else None
     yaw_fsm_task_env = env.unwrapped if task_name == "Flat-VQR-Wheel-Yaw-FSM" else None
     if task_name == "Flat-VQR-Wheel-Yaw":
         _verify_yaw_reward_config(env, env_cfg)
@@ -517,7 +517,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         restored = _restore_yaw_curriculum_state(yaw_task_env, checkpoint_infos)
         if restored:
             print(
-                "[INFO] Restored Flat-VQR-Wheel-Yaw curriculum: "
+                f"[INFO] Restored {task_name} curriculum: "
                 f"clearance_stage={yaw_task_env._yaw_task_curriculum_stage}, "
                 f"yaw_stage={yaw_task_env._yaw_task_curriculum_yaw_stage}."
             )

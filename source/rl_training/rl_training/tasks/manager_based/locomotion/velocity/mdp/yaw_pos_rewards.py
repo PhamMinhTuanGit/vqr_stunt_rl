@@ -84,6 +84,16 @@ def yaw_pos_four_wheel_contact(
     return torch.where(neutral, score, 0.0)
 
 
+def yaw_pos_neutral_landing_progress(
+    env, asset_cfg: SceneEntityCfg, wheel_radius: float, target_clearance: float,
+    command_name: str, deadband: float,
+) -> torch.Tensor:
+    """Credit each FR/HL wheel as it descends from target clearance to ground."""
+    _, _, neutral = yaw_pos_masks(env, command_name, deadband)
+    lift_progress = _yaw_lift_progress(env, asset_cfg, wheel_radius, target_clearance)
+    return torch.where(neutral, 1.0 - lift_progress.mean(dim=1), 0.0)
+
+
 def yaw_pos_four_stand_pose(
     env, asset_cfg: SceneEntityCfg, command_name: str, deadband: float, std: float = 0.25,
 ) -> torch.Tensor:
@@ -97,7 +107,7 @@ def yaw_pos_four_stand_pose(
 
 
 def yaw_pos_gated_tracking(
-    env, command_name: str, support_sensor_cfg: SceneEntityCfg, all_wheel_sensor_cfg: SceneEntityCfg,
+    env, command_name: str, support_sensor_cfg: SceneEntityCfg,
     lifted_asset_cfg: SceneEntityCfg, wheel_radius: float, target_clearance: float, std: float,
     deadband: float, contact_threshold: float = 1.0, clearance_gate_floor: float = 0.25,
     edge_command_fraction: float = 0.80, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -110,8 +120,7 @@ def yaw_pos_gated_tracking(
     clearance_weight = clearance_gate_floor + (1.0 - clearance_gate_floor) * lift
     tracking = torch.exp(-(yaw_rate - command).square() / std**2)
     active_score = support * clearance_weight * tracking
-    four_score, _ = _four_contact_score(env, all_wheel_sensor_cfg, contact_threshold)
-    neutral_score = four_score * torch.exp(-yaw_rate.square() / std**2)
+    neutral_score = torch.exp(-yaw_rate.square() / std**2)
 
     _accumulate(env, "_yaw_support_score", support, active)
     _accumulate(env, "_yaw_gate_open", support, active)

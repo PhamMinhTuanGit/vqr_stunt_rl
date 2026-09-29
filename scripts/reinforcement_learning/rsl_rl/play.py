@@ -153,6 +153,16 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import rl_training.tasks  # noqa: F401
 
 
+def _write_pos_keyboard_command(env, controller) -> None:
+    """Send only keyboard yaw through the POS task's command term."""
+    command_term = env.unwrapped.command_manager.get_term("yaw_rate_cmd")
+    yaw_limit = float(command_term.cfg.yaw_rate_range[1])
+    yaw_cmd = max(0.0, min(float(controller.advance()[2]), yaw_limit))
+    if yaw_cmd <= command_term.cfg.deadband:
+        yaw_cmd = 0.0
+    env.unwrapped.command_manager.get_term("yaw_rate_cmd").set_external_command(yaw_cmd)
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Play with RSL-RL agent."""
@@ -226,7 +236,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if command_name is not None and final_yaw_limit is not None:
                 command_cfg = getattr(env_cfg.commands, command_name)
                 final_yaw_limit = float(final_yaw_limit)
-                command_cfg.yaw_rate_range = (-final_yaw_limit, final_yaw_limit)
+                command_cfg.yaw_rate_range = (
+                    0.0 if task_name == "Flat-VQR-Wheel-Yaw-POS" else -final_yaw_limit,
+                    final_yaw_limit,
+                )
 
         for curriculum_name in ("command_levels", "task_levels"):
             if hasattr(env_cfg.curriculum, curriculum_name):
@@ -235,16 +248,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.keyboard:
         env_cfg.scene.num_envs = 1
         env_cfg.terminations.time_out = None
-        env_cfg.commands.base_velocity.debug_vis = False
-        config = Se2KeyboardCfg(
-            v_x_sensitivity=env_cfg.commands.base_velocity.ranges.lin_vel_x[1]/2,
-            v_y_sensitivity=env_cfg.commands.base_velocity.ranges.lin_vel_y[1],
-            omega_z_sensitivity=env_cfg.commands.base_velocity.ranges.ang_vel_z[1],
-        )
-        controller = Se2Keyboard(config)
-        env_cfg.observations.policy.velocity_commands = ObsTerm(
-            func=lambda env: torch.tensor(controller.advance(), dtype=torch.float32).unsqueeze(0).to(env.device),
-        )
+        if task_name == "Flat-VQR-Wheel-Yaw-POS":
+            yaw_cfg = env_cfg.commands.yaw_rate_cmd
+            yaw_cfg.debug_vis = False
+            yaw_cfg.external_control = True
+            controller = Se2Keyboard(Se2KeyboardCfg(
+                v_x_sensitivity=0.0,
+                v_y_sensitivity=0.0,
+                omega_z_sensitivity=yaw_cfg.yaw_rate_range[1],
+            ))
+        else:
+            env_cfg.commands.base_velocity.debug_vis = False
+            config = Se2KeyboardCfg(
+                v_x_sensitivity=env_cfg.commands.base_velocity.ranges.lin_vel_x[1]/2,
+                v_y_sensitivity=env_cfg.commands.base_velocity.ranges.lin_vel_y[1],
+                omega_z_sensitivity=env_cfg.commands.base_velocity.ranges.ang_vel_z[1],
+            )
+            controller = Se2Keyboard(config)
+            env_cfg.observations.policy.velocity_commands = ObsTerm(
+                func=lambda env: torch.tensor(controller.advance(), dtype=torch.float32).unsqueeze(0).to(env.device),
+            )
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -393,6 +416,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
+            if args_cli.keyboard and task_name == "Flat-VQR-Wheel-Yaw-POS":
+                _write_pos_keyboard_command(env, controller)
+                obs = env.get_observations()
             # agent stepping
             actions = policy(obs)
 

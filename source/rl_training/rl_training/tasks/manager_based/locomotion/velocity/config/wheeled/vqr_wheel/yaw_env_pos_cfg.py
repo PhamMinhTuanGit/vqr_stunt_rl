@@ -75,7 +75,6 @@ class VQRWheelYawPosRewardsCfg(VQRWheelRewardsCfg):
         func=pos_rewards.yaw_pos_gated_tracking, weight=8.0,
         params={"command_name": "yaw_rate_cmd",
                 "support_sensor_cfg": SceneEntityCfg("contact_forces", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
-                "all_wheel_sensor_cfg": SceneEntityCfg("contact_forces", body_names=ALL_WHEELS, preserve_order=True),
                 "lifted_asset_cfg": SceneEntityCfg("robot", body_names=POS_LIFTED_WHEELS, preserve_order=True),
                 "wheel_radius": WHEEL_RADIUS, "target_clearance": LIFT_CLEARANCE_LEVELS[0],
                 "std": 0.30, "deadband": YAW_DEADBAND, "contact_threshold": 1.0,
@@ -85,6 +84,12 @@ class VQRWheelYawPosRewardsCfg(VQRWheelRewardsCfg):
         func=pos_rewards.yaw_pos_lifted_wheel_spin_l2, weight=-0.02,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=POS_LIFTED_WHEELS, preserve_order=True),
                 "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND, "yaw_reference": YAW_REF},
+    )
+    neutral_landing_progress = RewTerm(
+        func=pos_rewards.yaw_pos_neutral_landing_progress, weight=3.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=POS_LIFTED_WHEELS, preserve_order=True),
+                "wheel_radius": WHEEL_RADIUS, "target_clearance": LIFT_CLEARANCE_LEVELS[0],
+                "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND},
     )
     four_stand_pose = RewTerm(
         func=pos_rewards.yaw_pos_four_stand_pose, weight=2.0,
