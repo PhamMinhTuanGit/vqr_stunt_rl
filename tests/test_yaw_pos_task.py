@@ -66,11 +66,16 @@ def _env(commands):
         body_pos_w=torch.zeros(n, 4, 3), whole_body_com_xy=torch.zeros(n, 2),
         joint_pos=torch.zeros(n, 12), default_joint_pos=torch.zeros(n, 12),
         joint_vel=torch.zeros(n, 12),
+        body_com_pos_w=torch.zeros(n, 4, 3),
+    )
+    robot = SimpleNamespace(
+        data=data, device="cpu",
+        root_physx_view=SimpleNamespace(get_masses=lambda: torch.ones(n, 4)),
     )
     env = SimpleNamespace(
         command=commands, contacts=torch.ones(n, 4), clearance=torch.zeros(n, 4),
         distance=torch.zeros(n), projection=torch.full((n,), 0.5), length=torch.ones(n),
-        scene={"robot": SimpleNamespace(data=data)},
+        scene={"robot": robot},
     )
     env.command_manager = SimpleNamespace(
         get_command=lambda _: env.command,
@@ -306,10 +311,66 @@ def test_new_registration_runner_and_existing_config_are_isolated():
     classes = {node.name: node for node in pos.body if isinstance(node, ast.ClassDef)}
     assert "VQRWheelFlatEnvPOSCfg" in classes
     reward_names = {node.targets[0].id for node in classes["VQRWheelYawPosRewardsCfg"].body if isinstance(node, ast.Assign)}
-    assert reward_names == {"com_support", "support_span_band", "lift_clearance", "com_inside_segment",
+    assert reward_names == {"com_support", "support_span_band", "support_line", "support_y_collapse",
+                            "lift_clearance", "com_inside_segment",
                             "heading_support",
                             "gated_yaw_tracking", "lifted_wheel_spin", "neutral_landing_progress",
                             "four_stand_pose", "four_wheel_contact"}
+
+
+def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch):
+    import copy
+
+    reward = _reward_module(monkeypatch)
+    helper = _load(monkeypatch, "wheel_contact_kinematics", MDP / "wheel_contact_kinematics.py")
+    baseline_rolling = SimpleNamespace(func=object(), weight=-0.5, params={
+        "wheel_radius": 0.091, "yaw_reference": 1., "command_name": "yaw_rate_cmd", "threshold": 1.,
+    })
+    class BaseRewards:
+        rolling_slip = baseline_rolling
+        support_span_band = SimpleNamespace(weight=-1.)
+    class BaseEnv:
+        def __post_init__(self):
+            self.parent_initialized = True
+    namespace = dict(
+        RewTerm=SimpleNamespace, SceneEntityCfg=EntityCfg,
+        VQRWheelRewardsCfg=BaseRewards, VQRWheelFlatEnvCfg=BaseEnv,
+        pos_rewards=reward, wheel_contact_kinematics=helper,
+        POS_SUPPORT_WHEELS=["FL_WHEEL", "HR_WHEEL"], POS_LIFTED_WHEELS=["FR_WHEEL", "HL_WHEEL"],
+        ALL_WHEELS=["FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL"], LEG_JOINT_NAMES=[".*"],
+        LIFT_CLEARANCE_LEVELS=(0.05,), YAW_RATE_LEVELS=(0.25,), WHEEL_RADIUS=0.091, YAW_REF=1.,
+    )
+    tree = ast.parse((CONFIG / "yaw_env_pos_cfg.py").read_text())
+    nodes = [node for node in tree.body if isinstance(node, ast.Assign)
+             and node.targets[0].id in ("YAW_DEADBAND", "SUPPORT_LINE_SIGMA", "SUPPORT_Y_MIN_SEPARATION")]
+    for name in ("VQRWheelYawPosRewardsCfg", "VQRWheelFlatEnvPOSCfg"):
+        node = copy.deepcopy(next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name))
+        node.decorator_list = []
+        # Evaluate reward declarations and the real post-init methods; environment
+        # command/curriculum defaults are outside this isolated wiring contract.
+        if name == "VQRWheelFlatEnvPOSCfg":
+            node.body = [part for part in node.body if isinstance(part, ast.FunctionDef)]
+        nodes.append(node)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), "POS config", "exec"), namespace)
+    cfg = namespace["VQRWheelYawPosRewardsCfg"]()
+    cfg.rolling_slip = copy.deepcopy(baseline_rolling)
+    cfg.__post_init__()
+    assert cfg.support_span_band is None
+    assert cfg.support_line.func is reward.yaw_pos_support_line
+    assert cfg.support_line.weight == 1. and cfg.support_line.params["sigma"] == 0.20
+    assert cfg.support_y_collapse.weight == -1. and cfg.support_y_collapse.params["minimum_separation"] == 0.45
+    assert cfg.rolling_slip.func is reward.yaw_pos_rolling_wheel_slip
+    assert cfg.rolling_slip.weight == baseline_rolling.weight
+    assert cfg.rolling_slip.params == {**baseline_rolling.params, "deadband": 0.1}
+    assert baseline_rolling.func is not cfg.rolling_slip.func
+    env_cfg = namespace["VQRWheelFlatEnvPOSCfg"]()
+    obs_cfg = SimpleNamespace(func=object(), params={"wheel_radius": 0.091}, scale=1.)
+    env_cfg.observations = SimpleNamespace(critic=SimpleNamespace(rolling_lateral_contact_velocity=obs_cfg))
+    env_cfg.commands = SimpleNamespace(yaw_rate_cmd=SimpleNamespace(yaw_rate_range=(-0.25, 0.25)))
+    env_cfg.__post_init__()
+    assert env_cfg.parent_initialized
+    assert obs_cfg.func is helper.rolling_lateral_contact_velocity
+    assert obs_cfg.params == {"wheel_radius": 0.091} and obs_cfg.scale == 1.
 
 
 def test_curriculum_uses_active_metrics_and_logs_neutral_separately(monkeypatch):
@@ -371,6 +432,120 @@ def test_curriculum_uses_active_metrics_and_logs_neutral_separately(monkeypatch)
     assert reward_configs["neutral_landing_progress"].params["target_clearance"] == pytest.approx(0.10)
     assert env._yaw_pos_neutral_four_contact_sum.item() == 0
     assert env._yaw_pos_heading_support_x_rms_sum.item() == 0
+
+
+def test_new_diagnostics_normalize_active_samples_and_clear_only_reset_rows(monkeypatch):
+    baseline = types.ModuleType("yaw_pos_test_package.curriculums")
+    baseline.yaw_task_levels = lambda *args, **kwargs: {}
+    monkeypatch.setitem(sys.modules, baseline.__name__, baseline)
+    module = _load(monkeypatch, "yaw_pos_curriculums", MDP / "yaw_pos_curriculums.py")
+    reward_configs = {
+        "lift_clearance": SimpleNamespace(params={"target_clearance": 0.10}),
+        "neutral_landing_progress": SimpleNamespace(params={"target_clearance": 0.10}),
+    }
+    env = SimpleNamespace(num_envs=2, device="cpu", reward_manager=SimpleNamespace(
+        get_term_cfg=lambda name: reward_configs[name],
+        set_term_cfg=lambda name, cfg: reward_configs.__setitem__(name, cfg),
+    ))
+    metrics = ("support_line_error", "wheel1_line_error", "wheel2_line_error", "support_y_separation", "rolling_error")
+    for index, metric in enumerate(metrics, 1):
+        setattr(env, f"_yaw_pos_{metric}_sum", torch.tensor([index * 0.2, 9.]))
+        setattr(env, f"_yaw_pos_{metric}_samples", torch.tensor([2, 3]))
+    def run(ids):
+        return module.yaw_pos_task_levels(
+            env, ids, "yaw_rate_cmd", (0.05,), (0.25,), (0.30,), (0.30,), (0.20,),
+            "lift_clearance", "balance", "gated_yaw_tracking", "torso_contact", 0.35,
+            0.85, 0.8, 0.75, 0.65, 2048, 0.85, 3, 1000, 6000,
+        )
+    result = run([0])
+    for index, metric in enumerate(metrics, 1):
+        assert result[metric].item() == pytest.approx(index * 0.1)
+        assert getattr(env, f"_yaw_pos_{metric}_sum").tolist() == [0., 9.]
+        assert getattr(env, f"_yaw_pos_{metric}_samples").tolist() == [0, 3]
+    assert all(run([0])[metric].item() == 0. for metric in metrics)
+
+
+@pytest.mark.parametrize("points,expected_error,expected_separation", [
+    ([[0., 0.2365, 0.], [0., -0.2365, 0.]], 0., 0.473),
+    ([[0.20, 0.25, 0.], [-0.20, -0.25, 0.]], 0.20, 0.50),
+    ([[0., 0.25, 0.], [0.30, -0.25, 0.]], 0.30, 0.50),
+    ([[0.15, 0.25, 0.], [0.15, -0.25, 0.]], 0.15, 0.50),
+    ([[0., 0.10, 0.], [0., -0.10, 0.]], 0., 0.20),
+    ([[0., 0.80, 0.], [0., -0.80, 0.]], 0., 1.60),
+    ([[0.50, 0.05, 0.], [-0.50, -0.05, 0.]], 0.50, 0.10),
+])
+def test_support_line_uses_worst_wheel_and_collapse_only_body_y(
+    monkeypatch, points, expected_error, expected_separation,
+):
+    reward = _reward_module(monkeypatch)
+    env = _env([0.25])
+    support = EntityCfg("robot", body_names=["FL_WHEEL", "HR_WHEEL"])
+    env.scene["robot"].data.body_pos_w[0, [0, 3]] = torch.tensor(points)
+    result = reward.yaw_pos_support_line(env, support, 0.20, "yaw_rate_cmd", 0.1)
+    collapse = reward.yaw_pos_support_y_collapse_l2(env, support, 0.45, "yaw_rate_cmd", 0.1)
+    assert result.item() == pytest.approx(math.exp(-(expected_error / 0.20)**2))
+    assert collapse.item() == pytest.approx(max(0.45 - expected_separation, 0.)**2)
+    assert env._yaw_pos_support_line_error_sum.item() == pytest.approx(expected_error)
+    assert env._yaw_pos_wheel1_line_error_sum.item() == pytest.approx(abs(points[0][0]))
+    assert env._yaw_pos_wheel2_line_error_sum.item() == pytest.approx(abs(points[1][0]))
+    assert env._yaw_pos_support_y_separation_sum.item() == pytest.approx(expected_separation)
+
+
+@pytest.mark.parametrize("rotation", ["identity", "yaw90", "pitch90", "roll90"])
+def test_support_geometry_uses_full_body_frame_and_mass_weighted_com(monkeypatch, rotation):
+    reward = _reward_module(monkeypatch)
+    env = _env([0.25])
+    robot = env.scene["robot"]
+    # Independent rotation matrices, including roll/pitch, catch yaw-only geometry.
+    h = 2.0**-0.5
+    quaternion, matrix = {
+        "identity": ([1., 0., 0., 0.], [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]),
+        "yaw90": ([h, 0., 0., h], [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]),
+        "pitch90": ([h, 0., h, 0.], [[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]]),
+        "roll90": ([h, h, 0., 0.], [[1., 0., 0.], [0., 0., -1.], [0., 1., 0.]]),
+    }[rotation]
+    matrix = torch.tensor(matrix)
+    com = torch.tensor([2., -3., 0.7])
+    robot.data.root_quat_w[0] = torch.tensor(quaternion)
+    robot.data.root_pos_w = torch.tensor([[-10., 20., 5.]])  # Root is not whole-body CoM.
+    masses = torch.tensor([[1., 2., 3., 4.]])
+    robot.root_physx_view.get_masses = lambda: masses
+    body_com_offsets = torch.tensor([[1., 0., 0.], [-0.5, 0., 0.], [0., 0., 0.], [0., 0., 0.]])
+    robot.data.body_com_pos_w[0] = com + body_com_offsets @ matrix.T
+    points_body = torch.tensor([[0.05, 0.30, -0.4], [-0.20, -0.20, -0.4]])
+    robot.data.body_pos_w[0, [0, 3]] = com + points_body @ matrix.T
+    support = EntityCfg("robot", body_names=["FL_WHEEL", "HR_WHEEL"])
+    e1, e2, separation = reward._yaw_pos_support_line_geometry(env, support)
+    assert [e1.item(), e2.item(), separation.item()] == pytest.approx([0.05, 0.20, 0.50], abs=1e-6)
+    assert reward.yaw_pos_support_line(env, support, 0.20, "yaw_rate_cmd", 0.1).item() == pytest.approx(
+        math.exp(-1.), abs=1e-6
+    )
+
+
+def test_new_geometry_rewards_and_metrics_apply_only_in_active_pos(monkeypatch):
+    reward = _reward_module(monkeypatch)
+    env = _env([0.25, 0., 0.1, -0.25])
+    env.scene["robot"].data.body_pos_w[:, 0, 0] = 0.20
+    support = EntityCfg("robot", body_names=["FL_WHEEL", "HR_WHEEL"])
+    assert reward.yaw_pos_support_line(env, support, 0.20, "yaw_rate_cmd", 0.1).tolist() == pytest.approx(
+        [math.exp(-1.), 0., 0., 0.]
+    )
+    assert reward.yaw_pos_support_y_collapse_l2(env, support, 0.45, "yaw_rate_cmd", 0.1).tolist() == pytest.approx(
+        [0.45**2, 0., 0., 0.]
+    )
+    assert env._yaw_pos_support_line_error_samples.tolist() == [1, 0, 0, 0]
+
+
+def test_geometry_rejects_invalid_parameters_and_support_count(monkeypatch):
+    reward = _reward_module(monkeypatch)
+    env = _env([0.25])
+    support = EntityCfg("robot", body_names=["FL_WHEEL", "HR_WHEEL"])
+    with pytest.raises(ValueError, match="sigma"):
+        reward.yaw_pos_support_line(env, support, 0., "yaw_rate_cmd", 0.1)
+    with pytest.raises(ValueError, match="minimum_separation"):
+        reward.yaw_pos_support_y_collapse_l2(env, support, -0.1, "yaw_rate_cmd", 0.1)
+    with pytest.raises(ValueError, match="exactly two"):
+        reward._yaw_pos_support_line_geometry(env, EntityCfg("robot", body_names=["FL_WHEEL"]))
 
 
 def test_neutral_only_episode_cannot_promote_yaw_ladder(monkeypatch):

@@ -14,6 +14,7 @@ from .rewards import (
     _yaw_wheel_contacts,
     yaw_support_contact,
 )
+from .wheel_contact_kinematics import contacted_wheel_velocities, rotate_vector
 
 
 def yaw_pos_masks(env, command_name: str, deadband: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -87,14 +88,76 @@ def yaw_pos_heading_support(
     return torch.where(active, score, 0.0)
 
 
-def yaw_pos_support_span_band_l2(
-    env, asset_cfg: SceneEntityCfg, minimum_span: float, maximum_span: float, std: float,
-    command_name: str, deadband: float,
+def _yaw_pos_support_line_geometry(
+    env, asset_cfg: SceneEntityCfg,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Absolute body-X errors and body-Y separation about whole-body CoM.
+
+    Use the full body orientation and mass-weighted 3D CoM, not a yaw-only
+    heading frame, root position, or Euclidean distance between the wheels.
+    Wheel order is FL, HR in the POS configuration.
+    """
+    robot = env.scene[asset_cfg.name]
+    support_positions = robot.data.body_pos_w[:, asset_cfg.body_ids]
+    if support_positions.shape[1] != 2:
+        raise ValueError("POS support line geometry requires exactly two ordered support wheels.")
+    masses = robot.root_physx_view.get_masses().to(robot.device)
+    com = (robot.data.body_com_pos_w * masses.unsqueeze(-1)).sum(dim=1) / masses.sum(
+        dim=1, keepdim=True
+    ).clamp_min(1.0e-6)
+    orientation = robot.data.root_quat_w
+    body_x = rotate_vector(orientation, orientation.new_tensor((1.0, 0.0, 0.0)))
+    body_y = rotate_vector(orientation, orientation.new_tensor((0.0, 1.0, 0.0)))
+    offsets = support_positions - com.unsqueeze(1)
+    line_errors = (offsets * body_x.unsqueeze(1)).sum(dim=-1).abs()
+    support_y = (offsets * body_y.unsqueeze(1)).sum(dim=-1)
+    separation = (support_y[:, 0] - support_y[:, 1]).abs()
+    return line_errors[:, 0], line_errors[:, 1], separation
+
+
+def yaw_pos_support_line(
+    env, asset_cfg: SceneEntityCfg, sigma: float, command_name: str, deadband: float,
 ) -> torch.Tensor:
+    """Reward the worse of the two wheel distances to the body-Y line through CoM."""
+    if sigma <= 0.0:
+        raise ValueError("sigma must be positive.")
     _, active, _ = yaw_pos_masks(env, command_name, deadband)
-    _, _, span = _yaw_support_geometry(env, asset_cfg)
-    outside = torch.relu(minimum_span - span) + torch.relu(span - maximum_span)
-    return torch.where(active, (outside / std).square(), 0.0)
+    error1, error2, separation = _yaw_pos_support_line_geometry(env, asset_cfg)
+    error = torch.maximum(error1, error2)
+    for name, value in (
+        ("support_line_error", error), ("wheel1_line_error", error1),
+        ("wheel2_line_error", error2), ("support_y_separation", separation),
+    ):
+        _accumulate(env, f"_yaw_pos_{name}", value, active)
+    return torch.where(active, torch.exp(-(error / sigma).square()), 0.0)
+
+
+def yaw_pos_support_y_collapse_l2(
+    env, asset_cfg: SceneEntityCfg, minimum_separation: float, command_name: str, deadband: float,
+) -> torch.Tensor:
+    """Mild raw-metre-squared minimum separation penalty, with no upper bound."""
+    if minimum_separation < 0.0:
+        raise ValueError("minimum_separation must be nonnegative.")
+    _, active, _ = yaw_pos_masks(env, command_name, deadband)
+    _, _, separation = _yaw_pos_support_line_geometry(env, asset_cfg)
+    return torch.where(active, torch.relu(minimum_separation - separation).square(), 0.0)
+
+
+def yaw_pos_rolling_wheel_slip(
+    env, sensor_cfg: SceneEntityCfg, body_asset_cfg: SceneEntityCfg, joint_asset_cfg: SceneEntityCfg,
+    wheel_radius: float, command_name: str, yaw_reference: float, deadband: float, threshold: float = 1.0,
+) -> torch.Tensor:
+    """Phase-invariant rolling penalty with unchanged contact and command scaling."""
+    velocities, in_contact = contacted_wheel_velocities(
+        env, sensor_cfg, body_asset_cfg, joint_asset_cfg, wheel_radius, threshold
+    )
+    rolling = velocities[..., 0]
+    penalty = (in_contact * rolling.square()).sum(dim=1)
+    _, active, _ = yaw_pos_masks(env, command_name, deadband)
+    contact_count = in_contact.sum(dim=1)
+    mean_error = (in_contact * rolling.abs()).sum(dim=1) / contact_count.clamp_min(1)
+    _accumulate(env, "_yaw_pos_rolling_error", mean_error, active & (contact_count > 0))
+    return _yaw_command_penalty_scale(env, command_name, yaw_reference) * penalty
 
 
 def yaw_pos_lift_clearance(

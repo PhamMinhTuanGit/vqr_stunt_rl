@@ -8,6 +8,7 @@ from isaaclab.utils import configclass
 from rl_training.tasks.manager_based.locomotion.velocity.mdp import yaw_pos_commands as pos_commands
 from rl_training.tasks.manager_based.locomotion.velocity.mdp import yaw_pos_curriculums as pos_curriculums
 from rl_training.tasks.manager_based.locomotion.velocity.mdp import yaw_pos_rewards as pos_rewards
+from rl_training.tasks.manager_based.locomotion.velocity.mdp import wheel_contact_kinematics
 from rl_training.tasks.manager_based.locomotion.velocity.velocity_yaw_env_cfg import CommandsCfg
 
 from .yaw_env_cfg import (
@@ -15,8 +16,6 @@ from .yaw_env_cfg import (
     LIFT_CLEARANCE_LEVELS,
     MIN_BASE_HEIGHT,
     ONLINE_DR_SCALE_LEVELS,
-    SUPPORT_SPAN_MAX,
-    SUPPORT_SPAN_MIN,
     SUPPORT_WHEEL_NAMES,
     LIFTED_WHEEL_NAMES,
     WHEEL_NAMES,
@@ -33,6 +32,8 @@ YAW_DEADBAND = 0.1
 POS_SUPPORT_WHEELS = SUPPORT_WHEEL_NAMES
 POS_LIFTED_WHEELS = LIFTED_WHEEL_NAMES
 ALL_WHEELS = WHEEL_NAMES
+SUPPORT_LINE_SIGMA = 0.20
+SUPPORT_Y_MIN_SEPARATION = 0.45
 
 
 @configclass
@@ -53,11 +54,18 @@ class VQRWheelYawPosRewardsCfg(VQRWheelRewardsCfg):
         params={"asset_cfg": SceneEntityCfg("robot", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
                 "std": 0.08, "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND},
     )
-    support_span_band = RewTerm(
-        func=pos_rewards.yaw_pos_support_span_band_l2, weight=-1.0,
+    # Disable the inherited Euclidean span band; align each support about CoM.
+    support_span_band = None
+    support_line = RewTerm(
+        func=pos_rewards.yaw_pos_support_line, weight=1.0,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
-                "minimum_span": SUPPORT_SPAN_MIN, "maximum_span": SUPPORT_SPAN_MAX,
-                "std": 0.05, "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND},
+                "sigma": SUPPORT_LINE_SIGMA, "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND},
+    )
+    support_y_collapse = RewTerm(
+        func=pos_rewards.yaw_pos_support_y_collapse_l2, weight=-1.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
+                "minimum_separation": SUPPORT_Y_MIN_SEPARATION,
+                "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND},
     )
     lift_clearance = RewTerm(
         func=pos_rewards.yaw_pos_lift_clearance, weight=3.0,
@@ -107,6 +115,12 @@ class VQRWheelYawPosRewardsCfg(VQRWheelRewardsCfg):
                 "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND, "threshold": 1.0},
     )
 
+    def __post_init__(self):
+        # Retain the inherited rolling weight (-0.5), wheel order, contact
+        # threshold and command relief; replace only its kinematics.
+        self.rolling_slip.func = pos_rewards.yaw_pos_rolling_wheel_slip
+        self.rolling_slip.params["deadband"] = YAW_DEADBAND
+
 
 @configclass
 class VQRWheelYawPosCurriculumCfg:
@@ -135,5 +149,8 @@ class VQRWheelFlatEnvPOSCfg(VQRWheelFlatEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+        self.observations.critic.rolling_lateral_contact_velocity.func = (
+            wheel_contact_kinematics.rolling_lateral_contact_velocity
+        )
         # The baseline post-init initializes a symmetric range; this task is positive-only.
         self.commands.yaw_rate_cmd.yaw_rate_range = (0.0, YAW_RATE_LEVELS[0])

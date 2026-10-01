@@ -48,6 +48,14 @@ def yaw_pos_task_levels(
             total("_yaw_pos_heading_support_line_body_y_alignment_sum") / heading_count
         ),
     }
+    geometry_metrics = (
+        "support_line_error", "wheel1_line_error", "wheel2_line_error",
+        "support_y_separation", "rolling_error",
+    )
+    for metric in geometry_metrics:
+        diagnostics[metric] = total(f"_yaw_pos_{metric}_sum") / total(
+            f"_yaw_pos_{metric}_samples"
+        ).clamp_min(1)
     result = yaw_task_levels(
         env, env_ids, command_name, clearance_levels, yaw_rate_levels, dr_scale_levels,
         tracking_ratio_thresholds, edge_tracking_ratio_thresholds, lift_reward_name,
@@ -74,5 +82,10 @@ def yaw_pos_task_levels(
     ):
         if hasattr(env, name):
             getattr(env, name)[selected] = 0
+    for metric in geometry_metrics:
+        for suffix in ("sum", "samples"):
+            name = f"_yaw_pos_{metric}_{suffix}"
+            if hasattr(env, name):
+                getattr(env, name)[selected] = 0
     result.update(diagnostics)
     return result
