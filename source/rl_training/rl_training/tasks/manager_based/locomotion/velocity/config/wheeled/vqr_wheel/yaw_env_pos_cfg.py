@@ -34,6 +34,7 @@ POS_LIFTED_WHEELS = LIFTED_WHEEL_NAMES
 ALL_WHEELS = WHEEL_NAMES
 SUPPORT_LINE_SIGMA = 0.20
 SUPPORT_Y_MIN_SEPARATION = 0.45
+SUPPORT_Y_COLLAPSE_SCALE = 0.05
 
 
 @configclass
@@ -42,6 +43,7 @@ class VQRWheelYawPosCommandsCfg(CommandsCfg):
         asset_name="robot", resampling_time_range=(4.0, 6.0),
         yaw_rate_range=(0.0, YAW_RATE_LEVELS[0]), deadband=YAW_DEADBAND,
         neutral_probability=0.30, debug_vis=False,
+        use_ground_heading_rate=True,
     )
 
 
@@ -62,9 +64,10 @@ class VQRWheelYawPosRewardsCfg(VQRWheelRewardsCfg):
                 "sigma": SUPPORT_LINE_SIGMA, "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND},
     )
     support_y_collapse = RewTerm(
-        func=pos_rewards.yaw_pos_support_y_collapse_l2, weight=-1.0,
+        func=pos_rewards.yaw_pos_support_y_collapse_l2, weight=-0.25,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
                 "minimum_separation": SUPPORT_Y_MIN_SEPARATION,
+                "separation_scale": SUPPORT_Y_COLLAPSE_SCALE,
                 "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND},
     )
     lift_clearance = RewTerm(
@@ -91,7 +94,13 @@ class VQRWheelYawPosRewardsCfg(VQRWheelRewardsCfg):
                 "lifted_asset_cfg": SceneEntityCfg("robot", body_names=POS_LIFTED_WHEELS, preserve_order=True),
                 "wheel_radius": WHEEL_RADIUS, "target_clearance": LIFT_CLEARANCE_LEVELS[0],
                 "std": 0.20, "neutral_std": 0.30, "deadband": YAW_DEADBAND, "contact_threshold": 1.0,
+                "support_asset_cfg": SceneEntityCfg("robot", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
+                "support_joint_cfg": SceneEntityCfg("robot", joint_names=POS_SUPPORT_WHEELS, preserve_order=True),
                 "clearance_gate_floor": 0.25, "edge_command_fraction": 0.80},
+    )
+    body_angular_xy = RewTerm(
+        func=pos_rewards.yaw_pos_body_angular_xy_l2, weight=-0.1,
+        params={"command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND},
     )
     lifted_wheel_spin = RewTerm(
         func=pos_rewards.yaw_pos_lifted_wheel_spin_l2, weight=-0.02,

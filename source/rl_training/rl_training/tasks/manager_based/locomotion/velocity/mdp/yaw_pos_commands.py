@@ -9,6 +9,7 @@ import torch
 from isaaclab.utils import configclass
 
 from .commands import YawRateCommand, YawRateCommandCfg
+from .yaw_pos_kinematics import ground_heading_yaw_rate
 
 
 class YawPosCommand(YawRateCommand):
@@ -52,6 +53,12 @@ class YawPosCommand(YawRateCommand):
         """Return control to the scheduled within-episode sampler."""
         self._external_control = False
 
+    def _update_metrics(self) -> None:
+        if not self.cfg.use_ground_heading_rate:
+            return super()._update_metrics()
+        rate, _ = ground_heading_yaw_rate(self.robot.data.root_quat_w, self.robot.data.root_ang_vel_w)
+        self.metrics["error_yaw_rate"] = (rate - self._command[:, 0]).abs()
+
 
 @configclass
 class YawPosCommandCfg(YawRateCommandCfg):
@@ -60,3 +67,5 @@ class YawPosCommandCfg(YawRateCommandCfg):
     deadband: float = 0.1
     neutral_probability: float = 0.30
     external_control: bool = False
+    # Opt in only in Flat-VQR-Wheel-Yaw-POS; transfer tasks retain their metric.
+    use_ground_heading_rate: bool = False

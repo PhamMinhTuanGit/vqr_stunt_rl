@@ -1,4 +1,4 @@
-"""Active-only yaw curriculum with separate neutral diagnostics."""
+"""Active-only ground-heading yaw certification with separate neutral diagnostics."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import Sequence
 import torch
 
 from .curriculums import yaw_task_levels
+from .yaw_pos_kinematics import POS_MOTION_METRICS
 
 
 def yaw_pos_task_levels(
@@ -50,12 +51,14 @@ def yaw_pos_task_levels(
     }
     geometry_metrics = (
         "support_line_error", "wheel1_line_error", "wheel2_line_error",
-        "support_y_separation", "rolling_error",
+        "support_y_separation", "rolling_error", "body_omega_xy_squared", *POS_MOTION_METRICS,
     )
     for metric in geometry_metrics:
         diagnostics[metric] = total(f"_yaw_pos_{metric}_sum") / total(
             f"_yaw_pos_{metric}_samples"
         ).clamp_min(1)
+    # Certification consumes the heading-based score/error accumulators from
+    # yaw_pos_gated_tracking; it must not reconstruct yaw from body-Z velocity.
     result = yaw_task_levels(
         env, env_ids, command_name, clearance_levels, yaw_rate_levels, dr_scale_levels,
         tracking_ratio_thresholds, edge_tracking_ratio_thresholds, lift_reward_name,
@@ -88,4 +91,13 @@ def yaw_pos_task_levels(
             if hasattr(env, name):
                 getattr(env, name)[selected] = 0
     result.update(diagnostics)
+    # Logging aliases only: preserve the existing rewards and certification.
+    for alias, original in (
+        ("heading_error", "mean_error_yaw_rate"),
+        ("support_contact", "support_score"),
+        ("lift_progress", "lift_min_progress"),
+    ):
+        if original in result:
+            result[alias] = result[original]
+    result["body_omega_xy"] = diagnostics["body_omega_xy_squared"].clamp_min(0).sqrt()
     return result

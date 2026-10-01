@@ -41,6 +41,10 @@ parser.add_argument(
     help="Base Flat-VQR-Wheel-Yaw checkpoint for POS-Transfer; reset optimizer, iteration and curriculum.",
 )
 parser.add_argument(
+    "--pos_adaptation_checkpoint", type=str, default=None,
+    help="Strict POS actor/critic/log_std initialization; new optimizer, iteration zero and fresh curriculum.",
+)
+parser.add_argument(
     "--pos_leg_std_override", type=float, default=None,
     help="Optional POS leg-action std override after resume. Omit to preserve checkpoint std.",
 )
@@ -543,10 +547,20 @@ def _verify_pos_resume_state(runner: OnPolicyRunner, task_env, checkpoint_path: 
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
     from yaw_pos_transfer import TASK_ID as transfer_task_id, load_base_policy
+    from yaw_pos_adaptation import TASK_ID as adaptation_task_id, load_pos_policy, finish_adaptation_audit
 
     task_name = args_cli.task.split(":")[-1]
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    if args_cli.pos_adaptation_checkpoint:
+        if task_name != adaptation_task_id:
+            raise ValueError("--pos_adaptation_checkpoint is only supported for Flat-VQR-Wheel-Yaw-POS.")
+        if agent_cfg.resume or args_cli.transfer_checkpoint or agent_cfg.algorithm.class_name != "PPO":
+            raise ValueError("POS adaptation requires fresh PPO; --resume and --transfer_checkpoint are forbidden.")
+        if args_cli.pos_leg_std_override is not None or args_cli.critic_warmup_iterations not in (None, 0):
+            raise ValueError("POS adaptation preserves checkpoint log_std and uses normal PPO updates without critic warm-up.")
+        if not agent_cfg.run_name:
+            agent_cfg.run_name = "pos_adapt_21000_collapse025"
     if task_name == transfer_task_id:
         if agent_cfg.resume or not args_cli.transfer_checkpoint:
             raise ValueError("POS-Transfer requires --transfer_checkpoint with resume=False; --resume restores optimizer state.")
@@ -586,6 +600,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
     log_dir = os.path.join(log_root_path, log_dir)
+    if args_cli.pos_adaptation_checkpoint and os.path.exists(log_dir):
+        raise FileExistsError(f"Adaptation needs a new independent run directory: {log_dir}")
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -632,6 +648,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
     checkpoint_infos = None
+    adaptation_report = None
+    if args_cli.pos_adaptation_checkpoint:
+        adaptation_report = load_pos_policy(
+            runner, env.unwrapped, args_cli.pos_adaptation_checkpoint, agent_cfg.to_dict()
+        )
     if task_name == transfer_task_id:
         load_base_policy(runner, env.unwrapped, args_cli.transfer_checkpoint)
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
@@ -646,7 +667,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 )
 
     if yaw_task_env is not None:
-        restored = _restore_yaw_curriculum_state(yaw_task_env, checkpoint_infos)
+        restored = False if adaptation_report is not None else _restore_yaw_curriculum_state(yaw_task_env, checkpoint_infos)
         if restored:
             print(
                 f"[INFO] Restored {task_name} curriculum: "
@@ -697,6 +718,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     
     # run training
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    if adaptation_report is not None:
+        finish_adaptation_audit(runner, adaptation_report)
 
     # close the simulator
     env.close()

@@ -52,3 +52,26 @@ def test_video_uses_external_command_and_refreshes_observation():
     assert loop_source.index("obs = env.get_observations()") < loop_source.index("actions = policy(obs)")
     assert "base_velocity" not in source
     assert "velocity_commands" not in source
+
+
+def test_trace_row_uses_pre_reset_snapshots_and_converts_reward_rate():
+    import torch
+    raw = SimpleNamespace(
+        _yaw_pos_motion_metrics_current={"true_heading_rate": torch.tensor([.3]),
+                                         "support_fl_motor_speed": torch.tensor([1.7])},
+        _yaw_pos_geometry_metrics_current={"support_y_separation": torch.tensor([.36])},
+        # Deliberately different reset state: the writer must not read it.
+        scene={"robot": SimpleNamespace(data=SimpleNamespace(root_ang_vel_w=torch.tensor([[0., 0., 99.]])))},
+        reward_manager=SimpleNamespace(
+            active_terms=["gated_yaw_tracking", "support_y_collapse", "body_angular_xy"],
+            _step_reward=torch.tensor([[.08, -.00648, -.002]]),
+        ),
+    )
+    row = _function("_trace_row")(raw, 4, .02, .4, True)
+    assert row["step"] == 5 and row["time_s"] == pytest.approx(.10) and row["done"] == 1
+    assert row["heading_error"] == pytest.approx(.1)
+    assert row["support_fl_motor_speed"] == pytest.approx(1.7)
+    assert row["support_y_separation"] == pytest.approx(.36)
+    assert row["reward_gated_yaw_tracking"] == pytest.approx(4.)
+    assert row["reward_support_y_collapse"] == pytest.approx(-.324)
+    assert row["reward_body_angular_xy"] == pytest.approx(-.1)

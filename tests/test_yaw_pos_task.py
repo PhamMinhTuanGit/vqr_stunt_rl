@@ -61,7 +61,7 @@ def _env(commands):
     commands = torch.tensor(commands, dtype=torch.float32).reshape(-1, 1)
     n = len(commands)
     data = SimpleNamespace(
-        root_ang_vel_b=torch.zeros(n, 3), root_lin_vel_b=torch.zeros(n, 3),
+        root_ang_vel_b=torch.zeros(n, 3), root_ang_vel_w=torch.zeros(n, 3), root_lin_vel_b=torch.zeros(n, 3),
         root_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(n, 1),
         body_pos_w=torch.zeros(n, 4, 3), whole_body_com_xy=torch.zeros(n, 2),
         joint_pos=torch.zeros(n, 12), default_joint_pos=torch.zeros(n, 12),
@@ -166,11 +166,11 @@ def test_command_sequence_changes_reward_target_without_reset(monkeypatch):
         if command:
             env.contacts[0] = torch.tensor([1., 0., 0., 1.])
             env.clearance[0] = torch.tensor([0., 1., 1., 0.])
-            env.scene["robot"].data.root_ang_vel_b[0, 2] = command
+            env.scene["robot"].data.root_ang_vel_w[0, 2] = command
         else:
             env.contacts[0] = 1.0
             env.clearance[0] = 0.0
-            env.scene["robot"].data.root_ang_vel_b[0, 2] = 0.0
+            env.scene["robot"].data.root_ang_vel_w[0, 2] = 0.0
         yaw = reward.yaw_pos_gated_tracking(
             env, "yaw_rate_cmd", support, lifted, 0.091, 0.05, 0.30, 0.1,
         )[0]
@@ -201,13 +201,13 @@ def test_neutral_yaw_and_landing_improve_before_four_wheel_contact(monkeypatch):
     env.clearance[0, [1, 2]] = 0.05
     yaw_scores = []
     for yaw_rate in (0.7, 0.35, 0.0):
-        env.scene["robot"].data.root_ang_vel_b[0, 2] = yaw_rate
+        env.scene["robot"].data.root_ang_vel_w[0, 2] = yaw_rate
         yaw_scores.append(reward.yaw_pos_gated_tracking(
             env, "yaw_rate_cmd", support, lifted, 0.091, 0.05, 0.30, 0.1,
         )[0].item())
     assert 0 < yaw_scores[0] < yaw_scores[1] < yaw_scores[2] == 1.0
     env.contacts[0] = 1.0
-    env.scene["robot"].data.root_ang_vel_b[0, 2] = 0.35
+    env.scene["robot"].data.root_ang_vel_w[0, 2] = 0.35
     full_contact_yaw_score = reward.yaw_pos_gated_tracking(
         env, "yaw_rate_cmd", support, lifted, 0.091, 0.05, 0.30, 0.1,
     )[0].item()
@@ -258,7 +258,7 @@ def test_pos_active_yaw_std_rejects_zero_yaw_without_changing_neutral(monkeypatc
     assert zero_yaw[0] < 0.6
     assert zero_yaw[1] < 0.25
 
-    env.scene["robot"].data.root_ang_vel_b[:, 2] = torch.tensor([0.15, 0.245, 0.30])
+    env.scene["robot"].data.root_ang_vel_w[:, 2] = torch.tensor([0.15, 0.245, 0.30])
     matched_yaw = yaw_scores()
     assert matched_yaw[0] == pytest.approx(1.0)
     assert matched_yaw[1] > 0.99
@@ -311,7 +311,7 @@ def test_new_registration_runner_and_existing_config_are_isolated():
     classes = {node.name: node for node in pos.body if isinstance(node, ast.ClassDef)}
     assert "VQRWheelFlatEnvPOSCfg" in classes
     reward_names = {node.targets[0].id for node in classes["VQRWheelYawPosRewardsCfg"].body if isinstance(node, ast.Assign)}
-    assert reward_names == {"com_support", "support_span_band", "support_line", "support_y_collapse",
+    assert reward_names == {"com_support", "support_span_band", "support_line", "support_y_collapse", "body_angular_xy",
                             "lift_clearance", "com_inside_segment",
                             "heading_support",
                             "gated_yaw_tracking", "lifted_wheel_spin", "neutral_landing_progress",
@@ -342,7 +342,7 @@ def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch
     )
     tree = ast.parse((CONFIG / "yaw_env_pos_cfg.py").read_text())
     nodes = [node for node in tree.body if isinstance(node, ast.Assign)
-             and node.targets[0].id in ("YAW_DEADBAND", "SUPPORT_LINE_SIGMA", "SUPPORT_Y_MIN_SEPARATION")]
+             and node.targets[0].id in ("YAW_DEADBAND", "SUPPORT_LINE_SIGMA", "SUPPORT_Y_MIN_SEPARATION", "SUPPORT_Y_COLLAPSE_SCALE")]
     for name in ("VQRWheelYawPosRewardsCfg", "VQRWheelFlatEnvPOSCfg"):
         node = copy.deepcopy(next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name))
         node.decorator_list = []
@@ -358,7 +358,10 @@ def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch
     assert cfg.support_span_band is None
     assert cfg.support_line.func is reward.yaw_pos_support_line
     assert cfg.support_line.weight == 1. and cfg.support_line.params["sigma"] == 0.20
-    assert cfg.support_y_collapse.weight == -1. and cfg.support_y_collapse.params["minimum_separation"] == 0.45
+    assert cfg.support_y_collapse.weight == -0.25 and cfg.support_y_collapse.params["minimum_separation"] == 0.45
+    assert cfg.support_y_collapse.params["separation_scale"] == 0.05
+    assert cfg.body_angular_xy.weight == -0.1
+    assert cfg.body_angular_xy.func is reward.yaw_pos_body_angular_xy_l2
     assert cfg.rolling_slip.func is reward.yaw_pos_rolling_wheel_slip
     assert cfg.rolling_slip.weight == baseline_rolling.weight
     assert cfg.rolling_slip.params == {**baseline_rolling.params, "deadband": 0.1}
@@ -484,36 +487,40 @@ def test_support_line_uses_worst_wheel_and_collapse_only_body_y(
     result = reward.yaw_pos_support_line(env, support, 0.20, "yaw_rate_cmd", 0.1)
     collapse = reward.yaw_pos_support_y_collapse_l2(env, support, 0.45, "yaw_rate_cmd", 0.1)
     assert result.item() == pytest.approx(math.exp(-(expected_error / 0.20)**2))
-    assert collapse.item() == pytest.approx(max(0.45 - expected_separation, 0.)**2)
+    assert collapse.item() == pytest.approx((max(0.45 - expected_separation, 0.) / 0.05)**2)
     assert env._yaw_pos_support_line_error_sum.item() == pytest.approx(expected_error)
     assert env._yaw_pos_wheel1_line_error_sum.item() == pytest.approx(abs(points[0][0]))
     assert env._yaw_pos_wheel2_line_error_sum.item() == pytest.approx(abs(points[1][0]))
     assert env._yaw_pos_support_y_separation_sum.item() == pytest.approx(expected_separation)
 
 
-@pytest.mark.parametrize("rotation", ["identity", "yaw90", "pitch90", "roll90"])
-def test_support_geometry_uses_full_body_frame_and_mass_weighted_com(monkeypatch, rotation):
+@pytest.mark.parametrize("heading_degrees", [0., 90., -37.])
+@pytest.mark.parametrize("roll_degrees,pitch_degrees", [(0., 0.), (30., 0.), (0., -35.), (25., 40.)])
+def test_support_geometry_uses_ground_heading_and_mass_weighted_com(
+    monkeypatch, heading_degrees, roll_degrees, pitch_degrees,
+):
     reward = _reward_module(monkeypatch)
     env = _env([0.25])
     robot = env.scene["robot"]
-    # Independent rotation matrices, including roll/pitch, catch yaw-only geometry.
-    h = 2.0**-0.5
-    quaternion, matrix = {
-        "identity": ([1., 0., 0., 0.], [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]),
-        "yaw90": ([h, 0., 0., h], [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]),
-        "pitch90": ([h, 0., h, 0.], [[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]]),
-        "roll90": ([h, h, 0., 0.], [[1., 0., 0.], [0., 0., -1.], [0., 1., 0.]]),
-    }[rotation]
-    matrix = torch.tensor(matrix)
+    # Fixed ground geometry: change only root roll/pitch at the same heading.
+    yaw, roll, pitch = map(math.radians, (heading_degrees, roll_degrees, pitch_degrees))
+    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+    cr, sr = math.cos(roll / 2), math.sin(roll / 2)
+    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
+    robot.data.root_quat_w[0] = torch.tensor([
+        cy*cp*cr + sy*sp*sr, cy*cp*sr - sy*sp*cr,
+        cy*sp*cr + sy*cp*sr, sy*cp*cr - cy*sp*sr,
+    ])
+    heading_rotation = torch.tensor([[math.cos(yaw), -math.sin(yaw), 0.],
+                                     [math.sin(yaw), math.cos(yaw), 0.], [0., 0., 1.]])
     com = torch.tensor([2., -3., 0.7])
-    robot.data.root_quat_w[0] = torch.tensor(quaternion)
-    robot.data.root_pos_w = torch.tensor([[-10., 20., 5.]])  # Root is not whole-body CoM.
+    robot.data.root_pos_w = torch.tensor([[-10., 20., 5.]])
     masses = torch.tensor([[1., 2., 3., 4.]])
     robot.root_physx_view.get_masses = lambda: masses
-    body_com_offsets = torch.tensor([[1., 0., 0.], [-0.5, 0., 0.], [0., 0., 0.], [0., 0., 0.]])
-    robot.data.body_com_pos_w[0] = com + body_com_offsets @ matrix.T
-    points_body = torch.tensor([[0.05, 0.30, -0.4], [-0.20, -0.20, -0.4]])
-    robot.data.body_pos_w[0, [0, 3]] = com + points_body @ matrix.T
+    com_offsets = torch.tensor([[1., 0., 0.], [-0.5, 0., 0.], [0., 0., 0.], [0., 0., 0.]])
+    robot.data.body_com_pos_w[0] = com + com_offsets @ heading_rotation.T
+    points_heading = torch.tensor([[0.05, 0.30, -0.4], [-0.20, -0.20, -0.4]])
+    robot.data.body_pos_w[0, [0, 3]] = com + points_heading @ heading_rotation.T
     support = EntityCfg("robot", body_names=["FL_WHEEL", "HR_WHEEL"])
     e1, e2, separation = reward._yaw_pos_support_line_geometry(env, support)
     assert [e1.item(), e2.item(), separation.item()] == pytest.approx([0.05, 0.20, 0.50], abs=1e-6)
@@ -531,7 +538,7 @@ def test_new_geometry_rewards_and_metrics_apply_only_in_active_pos(monkeypatch):
         [math.exp(-1.), 0., 0., 0.]
     )
     assert reward.yaw_pos_support_y_collapse_l2(env, support, 0.45, "yaw_rate_cmd", 0.1).tolist() == pytest.approx(
-        [0.45**2, 0., 0., 0.]
+        [(0.45 / 0.05)**2, 0., 0., 0.]
     )
     assert env._yaw_pos_support_line_error_samples.tolist() == [1, 0, 0, 0]
 
@@ -621,6 +628,7 @@ def test_pos_resume_restores_and_installs_yaw_curriculum_checkpoint_hook():
     namespace = {
         "task_name": task_name, "yaw_task_env": selected,
         "checkpoint_infos": checkpoint_infos, "runner": runner,
+        "adaptation_report": None,
         "agent_cfg": SimpleNamespace(resume=True),
         "_restore_yaw_curriculum_state": lambda task, info: calls.append(("restore", task, info)) or True,
         "_install_yaw_curriculum_checkpointing": lambda run, task: calls.append(("hook", run, task)),

@@ -14,7 +14,8 @@ from .rewards import (
     _yaw_wheel_contacts,
     yaw_support_contact,
 )
-from .wheel_contact_kinematics import contacted_wheel_velocities, rotate_vector
+from .wheel_contact_kinematics import contacted_wheel_velocities
+from .yaw_pos_kinematics import ground_heading_axes, ground_heading_yaw_rate, yaw_pos_motion_telemetry
 
 
 def yaw_pos_masks(env, command_name: str, deadband: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -91,10 +92,10 @@ def yaw_pos_heading_support(
 def _yaw_pos_support_line_geometry(
     env, asset_cfg: SceneEntityCfg,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Absolute body-X errors and body-Y separation about whole-body CoM.
+    """Ground-heading-X errors and heading-Y separation about whole-body CoM.
 
-    Use the full body orientation and mass-weighted 3D CoM, not a yaw-only
-    heading frame, root position, or Euclidean distance between the wheels.
+    Heading axes are horizontal, so body roll/pitch cannot use the vertical
+    CoM-to-wheel offset to improve alignment. Do not use Euclidean span.
     Wheel order is FL, HR in the POS configuration.
     """
     robot = env.scene[asset_cfg.name]
@@ -105,12 +106,10 @@ def _yaw_pos_support_line_geometry(
     com = (robot.data.body_com_pos_w * masses.unsqueeze(-1)).sum(dim=1) / masses.sum(
         dim=1, keepdim=True
     ).clamp_min(1.0e-6)
-    orientation = robot.data.root_quat_w
-    body_x = rotate_vector(orientation, orientation.new_tensor((1.0, 0.0, 0.0)))
-    body_y = rotate_vector(orientation, orientation.new_tensor((0.0, 1.0, 0.0)))
+    heading_x, heading_y, _ = ground_heading_axes(robot.data.root_quat_w)
     offsets = support_positions - com.unsqueeze(1)
-    line_errors = (offsets * body_x.unsqueeze(1)).sum(dim=-1).abs()
-    support_y = (offsets * body_y.unsqueeze(1)).sum(dim=-1)
+    line_errors = (offsets * heading_x.unsqueeze(1)).sum(dim=-1).abs()
+    support_y = (offsets * heading_y.unsqueeze(1)).sum(dim=-1)
     separation = (support_y[:, 0] - support_y[:, 1]).abs()
     return line_errors[:, 0], line_errors[:, 1], separation
 
@@ -118,7 +117,7 @@ def _yaw_pos_support_line_geometry(
 def yaw_pos_support_line(
     env, asset_cfg: SceneEntityCfg, sigma: float, command_name: str, deadband: float,
 ) -> torch.Tensor:
-    """Reward the worse of the two wheel distances to the body-Y line through CoM."""
+    """Reward the worse distance to the horizontal heading-Y line through CoM."""
     if sigma <= 0.0:
         raise ValueError("sigma must be positive.")
     _, active, _ = yaw_pos_masks(env, command_name, deadband)
@@ -129,18 +128,38 @@ def yaw_pos_support_line(
         ("wheel2_line_error", error2), ("support_y_separation", separation),
     ):
         _accumulate(env, f"_yaw_pos_{name}", value, active)
-    return torch.where(active, torch.exp(-(error / sigma).square()), 0.0)
+    env._yaw_pos_geometry_metrics_current = {
+        "support_line_error": error.detach().clone(),
+        "wheel1_line_error": error1.detach().clone(),
+        "wheel2_line_error": error2.detach().clone(),
+        "support_y_separation": separation.detach().clone(),
+    }
+    _, _, heading_valid = ground_heading_axes(env.scene[asset_cfg.name].data.root_quat_w)
+    return torch.where(active & heading_valid, torch.exp(-(error / sigma).square()), 0.0)
 
 
 def yaw_pos_support_y_collapse_l2(
     env, asset_cfg: SceneEntityCfg, minimum_separation: float, command_name: str, deadband: float,
+    separation_scale: float = 0.05,
 ) -> torch.Tensor:
-    """Mild raw-metre-squared minimum separation penalty, with no upper bound."""
+    """Normalized squared heading-Y minimum separation cost, with no upper bound."""
     if minimum_separation < 0.0:
         raise ValueError("minimum_separation must be nonnegative.")
+    if separation_scale <= 0.0:
+        raise ValueError("separation_scale must be positive.")
     _, active, _ = yaw_pos_masks(env, command_name, deadband)
     _, _, separation = _yaw_pos_support_line_geometry(env, asset_cfg)
-    return torch.where(active, torch.relu(minimum_separation - separation).square(), 0.0)
+    return torch.where(active, (torch.relu(minimum_separation - separation) / separation_scale).square(), 0.0)
+
+
+def yaw_pos_body_angular_xy_l2(
+    env, command_name: str, deadband: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """POS-only world-X/Y angular velocity cost; no command relief."""
+    _, active, _ = yaw_pos_masks(env, command_name, deadband)
+    cost = env.scene[asset_cfg.name].data.root_ang_vel_w[:, :2].square().sum(dim=1)
+    _accumulate(env, "_yaw_pos_body_omega_xy_squared", cost, active)
+    return torch.where(active, cost, 0.)
 
 
 def yaw_pos_rolling_wheel_slip(
@@ -225,16 +244,25 @@ def yaw_pos_gated_tracking(
     deadband: float, contact_threshold: float = 1.0, clearance_gate_floor: float = 0.25,
     edge_command_fraction: float = 0.80, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     neutral_std: float | None = None,
+    support_asset_cfg: SceneEntityCfg | None = None,
+    support_joint_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     command, active, neutral = yaw_pos_masks(env, command_name, deadband)
     robot = env.scene[asset_cfg.name]
-    yaw_rate = robot.data.root_ang_vel_b[:, 2]
+    yaw_rate, heading_valid = ground_heading_yaw_rate(robot.data.root_quat_w, robot.data.root_ang_vel_w)
     support = yaw_support_contact(env, support_sensor_cfg, contact_threshold)
     lift = _yaw_lift_progress(env, lifted_asset_cfg, wheel_radius, target_clearance).mean(dim=1)
     clearance_weight = clearance_gate_floor + (1.0 - clearance_gate_floor) * lift
-    tracking = torch.exp(-(yaw_rate - command).square() / std**2)
+    tracking = torch.exp(-(yaw_rate - command).square() / std**2) * heading_valid
     active_score = support * clearance_weight * tracking
-    neutral_score = torch.exp(-yaw_rate.square() / (std if neutral_std is None else neutral_std) ** 2)
+    neutral_score = torch.exp(-yaw_rate.square() / (std if neutral_std is None else neutral_std) ** 2) * heading_valid
+
+    if support_asset_cfg is not None and support_joint_cfg is not None:
+        motion = yaw_pos_motion_telemetry(robot, support_asset_cfg.body_ids, support_joint_cfg.joint_ids)
+        for name, value in motion.items():
+            _accumulate(env, f"_yaw_pos_{name}", value, active)
+        # Freeze the reward's pre-reset state for per-step rollout traces.
+        env._yaw_pos_motion_metrics_current = {name: value.detach().clone() for name, value in motion.items()}
 
     _accumulate(env, "_yaw_support_score", support, active)
     _accumulate(env, "_yaw_gate_open", support, active)
