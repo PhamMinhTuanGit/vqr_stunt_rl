@@ -22,6 +22,36 @@ def _keyboard_writer():
     return namespace[node.name]
 
 
+def _checkpoint_limit_reader(checkpoint):
+    node = next(node for node in _play_tree().body if isinstance(node, ast.FunctionDef)
+                and node.name == "_checkpoint_pos_yaw_limit")
+    torch = SimpleNamespace(load=lambda path, **kwargs: checkpoint)
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(PLAY), "exec"), namespace)
+    return namespace[node.name]
+
+
+@pytest.mark.parametrize(("stage", "expected"), [(0, 0.25), (2, 0.55)])
+def test_pos_keyboard_limit_uses_checkpoint_yaw_stage(stage, expected):
+    levels = [0.25, 0.40, 0.55, 1.0]
+    checkpoint = {"infos": {"yaw_curriculum": {
+        "yaw_rate_levels": levels,
+        "values": {"_yaw_task_curriculum_yaw_stage": stage},
+    }}}
+    assert _checkpoint_limit_reader(checkpoint)("model.pt", levels) == expected
+
+
+@pytest.mark.parametrize("checkpoint", [
+    {"infos": None},
+    {"infos": {"yaw_curriculum": {
+        "yaw_rate_levels": [0.25, 0.40],
+        "values": {"_yaw_task_curriculum_yaw_stage": 1},
+    }}},
+])
+def test_pos_keyboard_limit_falls_back_to_first_stage_without_matching_metadata(checkpoint):
+    assert _checkpoint_limit_reader(checkpoint)("model.pt", [0.25, 0.40, 1.0]) == 0.25
+
+
 def test_pos_keyboard_branch_isolated_from_base_velocity():
     main = next(node for node in _play_tree().body if isinstance(node, ast.FunctionDef) and node.name == "main")
     keyboard = next(node for node in ast.walk(main) if isinstance(node, ast.If)

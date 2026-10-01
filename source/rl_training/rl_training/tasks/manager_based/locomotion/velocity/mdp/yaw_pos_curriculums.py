@@ -33,6 +33,7 @@ def yaw_pos_task_levels(
     neutral_count = total("_yaw_pos_neutral_samples")
     denominator = (active_count + neutral_count).clamp_min(1)
     neutral_denominator = neutral_count.clamp_min(1)
+    heading_count = total("_yaw_pos_heading_support_x_rms_samples").clamp_min(1)
     diagnostics = {
         "mode_positive_fraction": active_count / denominator,
         "mode_neutral_fraction": neutral_count / denominator,
@@ -40,6 +41,12 @@ def yaw_pos_task_levels(
         "neutral_pose_error": total("_yaw_pos_neutral_pose_error_sum") / neutral_denominator,
         "neutral_abs_yaw_rate": total("_yaw_pos_neutral_abs_yaw_rate_sum") / neutral_denominator,
         "neutral_planar_speed": total("_yaw_pos_neutral_planar_speed_sum") / neutral_denominator,
+        "heading_fl_x_from_com_m": total("_yaw_pos_heading_fl_x_from_com_sum") / heading_count,
+        "heading_hr_x_from_com_m": total("_yaw_pos_heading_hr_x_from_com_sum") / heading_count,
+        "heading_support_x_rms_m": total("_yaw_pos_heading_support_x_rms_sum") / heading_count,
+        "heading_support_line_body_y_alignment": (
+            total("_yaw_pos_heading_support_line_body_y_alignment_sum") / heading_count
+        ),
     }
     result = yaw_task_levels(
         env, env_ids, command_name, clearance_levels, yaw_rate_levels, dr_scale_levels,
@@ -59,6 +66,11 @@ def yaw_pos_task_levels(
         "_yaw_pos_neutral_pose_error_sum", "_yaw_pos_neutral_pose_error_samples",
         "_yaw_pos_neutral_abs_yaw_rate_sum", "_yaw_pos_neutral_abs_yaw_rate_samples",
         "_yaw_pos_neutral_planar_speed_sum", "_yaw_pos_neutral_planar_speed_samples",
+        "_yaw_pos_heading_fl_x_from_com_sum", "_yaw_pos_heading_fl_x_from_com_samples",
+        "_yaw_pos_heading_hr_x_from_com_sum", "_yaw_pos_heading_hr_x_from_com_samples",
+        "_yaw_pos_heading_support_x_rms_sum", "_yaw_pos_heading_support_x_rms_samples",
+        "_yaw_pos_heading_support_line_body_y_alignment_sum",
+        "_yaw_pos_heading_support_line_body_y_alignment_samples",
     ):
         if hasattr(env, name):
             getattr(env, name)[selected] = 0

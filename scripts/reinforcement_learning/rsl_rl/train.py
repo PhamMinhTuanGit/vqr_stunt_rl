@@ -37,6 +37,10 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--transfer_checkpoint", type=str, default=None,
+    help="Base Flat-VQR-Wheel-Yaw checkpoint for POS-Transfer; reset optimizer, iteration and curriculum.",
+)
+parser.add_argument(
     "--pos_leg_std_override", type=float, default=None,
     help="Optional POS leg-action std override after resume. Omit to preserve checkpoint std.",
 )
@@ -538,9 +542,16 @@ def _verify_pos_resume_state(runner: OnPolicyRunner, task_env, checkpoint_path: 
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
+    from yaw_pos_transfer import TASK_ID as transfer_task_id, load_base_policy
+
     task_name = args_cli.task.split(":")[-1]
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    if task_name == transfer_task_id:
+        if agent_cfg.resume or not args_cli.transfer_checkpoint:
+            raise ValueError("POS-Transfer requires --transfer_checkpoint with resume=False; --resume restores optimizer state.")
+    elif args_cli.transfer_checkpoint:
+        raise ValueError("--transfer_checkpoint is only supported for Flat-VQR-Wheel-Yaw-POS-Transfer.")
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
@@ -578,7 +589,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-    yaw_task_env = env.unwrapped if task_name in ("Flat-VQR-Wheel-Yaw", "Flat-VQR-Wheel-Yaw-POS") else None
+    yaw_task_env = env.unwrapped if task_name in ("Flat-VQR-Wheel-Yaw", "Flat-VQR-Wheel-Yaw-POS", "Flat-VQR-Wheel-Yaw-POS-Transfer") else None
     yaw_fsm_task_env = env.unwrapped if task_name == "Flat-VQR-Wheel-Yaw-FSM" else None
     if task_name == "Flat-VQR-Wheel-Yaw":
         _verify_yaw_reward_config(env, env_cfg)
@@ -621,6 +632,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
     checkpoint_infos = None
+    if task_name == transfer_task_id:
+        load_base_policy(runner, env.unwrapped, args_cli.transfer_checkpoint)
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model

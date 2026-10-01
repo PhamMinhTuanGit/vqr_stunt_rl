@@ -71,6 +71,11 @@ class VQRWheelYawPosRewardsCfg(VQRWheelRewardsCfg):
         params={"asset_cfg": SceneEntityCfg("robot", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
                 "std": 0.05, "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND},
     )
+    heading_support = RewTerm(
+        func=pos_rewards.yaw_pos_heading_support, weight=1.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
+                "scale": 0.27, "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND},
+    )
     gated_yaw_tracking = RewTerm(
         func=pos_rewards.yaw_pos_gated_tracking, weight=8.0,
         params={"command_name": "yaw_rate_cmd",

@@ -10,6 +10,7 @@ from .rewards import (
     _yaw_command_penalty_scale,
     _yaw_lift_progress,
     _yaw_support_geometry,
+    _yaw_whole_body_com_xy,
     _yaw_wheel_contacts,
     yaw_support_contact,
 )
@@ -35,6 +36,55 @@ def yaw_pos_com_support(env, asset_cfg: SceneEntityCfg, std: float, command_name
     _, active, _ = yaw_pos_masks(env, command_name, deadband)
     distance, _, _ = _yaw_support_geometry(env, asset_cfg)
     return torch.where(active, 1.0 / (1.0 + distance / std), 0.0)
+
+
+def _yaw_pos_heading_support_geometry(
+    env, asset_cfg: SceneEntityCfg,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FL/HR x offsets from whole-body CoM and line alignment in the yaw-only heading frame."""
+    robot = env.scene[asset_cfg.name]
+    support_xy = robot.data.body_pos_w[:, asset_cfg.body_ids, :2]
+    if support_xy.shape[1] != 2:
+        raise ValueError("POS heading geometry requires ordered FL and HR support wheels.")
+
+    # Isaac Lab stores quaternions as (w, x, y, z). Ignore roll/pitch so the
+    # diagnostic measures horizontal support geometry relative to body heading.
+    w, x, y, z = robot.data.root_quat_w.unbind(dim=-1)
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y.square() + z.square()))
+    heading_x = torch.stack((torch.cos(yaw), torch.sin(yaw)), dim=-1)
+    heading_y = torch.stack((-torch.sin(yaw), torch.cos(yaw)), dim=-1)
+
+    offsets = support_xy - _yaw_whole_body_com_xy(robot).unsqueeze(1)
+    support_x = (offsets * heading_x.unsqueeze(1)).sum(dim=-1)
+    support_x_rms = torch.linalg.vector_norm(support_x, dim=1) / 2.0**0.5
+    support_line = support_xy[:, 1] - support_xy[:, 0]
+    alignment = torch.abs((support_line * heading_y).sum(dim=-1)) / torch.linalg.vector_norm(
+        support_line, dim=-1
+    ).clamp_min(1.0e-8)
+    alignment = alignment.clamp(max=1.0)
+    return support_x[:, 0], support_x[:, 1], support_x_rms, alignment
+
+
+def yaw_pos_heading_support(
+    env, asset_cfg: SceneEntityCfg, scale: float, command_name: str, deadband: float,
+) -> torch.Tensor:
+    """Reward both support wheels approaching the body-y line through CoM in POS mode."""
+    if scale <= 0.0:
+        raise ValueError("scale must be positive.")
+    _, active, _ = yaw_pos_masks(env, command_name, deadband)
+    fl_x, hr_x, support_x_rms, alignment = _yaw_pos_heading_support_geometry(env, asset_cfg)
+    for name, value in (
+        ("fl_x_from_com", fl_x),
+        ("hr_x_from_com", hr_x),
+        ("support_x_rms", support_x_rms),
+        ("support_line_body_y_alignment", alignment),
+    ):
+        _accumulate(env, f"_yaw_pos_heading_{name}", value, active)
+    env._yaw_pos_heading_metrics_current = torch.stack((fl_x, hr_x, support_x_rms, alignment), dim=-1).detach()
+    env._yaw_pos_heading_active_current = active.clone()
+    # Keep a constant gradient through the observed 0.20–0.25 m plateau.
+    score = 1.0 - support_x_rms / scale
+    return torch.where(active, score, 0.0)
 
 
 def yaw_pos_support_span_band_l2(

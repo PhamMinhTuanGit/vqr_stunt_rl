@@ -23,6 +23,8 @@ class EntityCfg:
     def __init__(self, name, body_names=None, joint_names=None, **_):
         self.name = name
         self.body_names = body_names
+        wheel_index = {"FL_WHEEL": 0, "FR_WHEEL": 1, "HL_WHEEL": 2, "HR_WHEEL": 3}
+        self.body_ids = [wheel_index[body] for body in body_names] if isinstance(body_names, list) else []
         self.joint_names = joint_names
         self.joint_ids = list(range(12)) if joint_names else []
 
@@ -49,6 +51,7 @@ def _reward_module(monkeypatch):
     baseline.yaw_support_contact = lambda env, cfg, threshold: baseline._yaw_wheel_contacts(env, cfg, threshold).float().prod(dim=1)
     baseline._yaw_lift_progress = lambda env, cfg, *_: env.clearance[:, [index[x] for x in cfg.body_names]]
     baseline._yaw_support_geometry = lambda env, cfg: (env.distance, env.projection, env.length)
+    baseline._yaw_whole_body_com_xy = lambda asset: asset.data.whole_body_com_xy
     baseline._yaw_command_penalty_scale = lambda env, *_: torch.ones(env.command.shape[0])
     monkeypatch.setitem(sys.modules, baseline.__name__, baseline)
     return _load(monkeypatch, "yaw_pos_rewards", MDP / "yaw_pos_rewards.py")
@@ -59,6 +62,8 @@ def _env(commands):
     n = len(commands)
     data = SimpleNamespace(
         root_ang_vel_b=torch.zeros(n, 3), root_lin_vel_b=torch.zeros(n, 3),
+        root_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(n, 1),
+        body_pos_w=torch.zeros(n, 4, 3), whole_body_com_xy=torch.zeros(n, 2),
         joint_pos=torch.zeros(n, 12), default_joint_pos=torch.zeros(n, 12),
         joint_vel=torch.zeros(n, 12),
     )
@@ -95,6 +100,52 @@ def test_masks_and_neutral_rewards(monkeypatch):
     env.contacts[0] = torch.tensor([1., 0., 0., 1.])
     assert reward.yaw_pos_four_stand_pose(env, legs, "yaw_rate_cmd", 0.1)[0] < 1
     assert reward.yaw_pos_four_wheel_contact(env, all_wheels, "yaw_rate_cmd", 0.1)[0] < 0.2
+
+
+def test_diagonal_line_through_com_does_not_enforce_body_y_alignment(monkeypatch):
+    reward = _reward_module(monkeypatch)
+    baseline_path = MDP / "rewards.py"
+    geometry_node = next(node for node in ast.parse(baseline_path.read_text()).body
+                         if isinstance(node, ast.FunctionDef) and node.name == "_yaw_support_geometry")
+    geometry_namespace = {"torch": torch, "_yaw_whole_body_com_xy": lambda asset: asset.data.whole_body_com_xy}
+    future_annotations = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    geometry_module = ast.fix_missing_locations(ast.Module(body=[future_annotations, geometry_node], type_ignores=[]))
+    exec(compile(geometry_module, str(baseline_path), "exec"),
+         geometry_namespace)
+    monkeypatch.setattr(reward, "_yaw_support_geometry", geometry_namespace["_yaw_support_geometry"])
+    env = _env([0.25, 0.25, 0.25, 0.0])
+    support = EntityCfg("robot", body_names=["FL_WHEEL", "HR_WHEEL"])
+    data = env.scene["robot"].data
+    # Both lines pass through CoM and stay within the support segment.
+    fl = torch.tensor([0.15, 0.25])
+    hr = -fl
+    data.body_pos_w[0, 0, :2], data.body_pos_w[0, 3, :2] = fl, hr
+    data.body_pos_w[1, 0, :2] = torch.tensor([0.0, 0.29])
+    data.body_pos_w[1, 3, :2] = torch.tensor([0.0, -0.29])
+    # Rotate the first pose by 90 degrees and translate it in world space.
+    data.whole_body_com_xy[2] = torch.tensor([1.0, 2.0])
+    data.root_quat_w[2] = torch.tensor([2.0**-0.5, 0.0, 0.0, 2.0**-0.5])
+    data.body_pos_w[2, 0, :2] = data.whole_body_com_xy[2] + torch.tensor([-0.25, 0.15])
+    data.body_pos_w[2, 3, :2] = data.whole_body_com_xy[2] + torch.tensor([0.25, -0.15])
+    data.body_pos_w[3] = data.body_pos_w[0]
+
+    distance, projection, _ = reward._yaw_support_geometry(env, support)
+    assert distance[:3].tolist() == pytest.approx([0.0, 0.0, 0.0], abs=1e-6)
+    assert projection[:3].tolist() == pytest.approx([0.5, 0.5, 0.5])
+    assert reward.yaw_pos_com_support(env, support, 0.08, "yaw_rate_cmd", 0.1).tolist() == pytest.approx(
+        [1, 1, 1, 0], abs=1e-6
+    )
+    assert reward.yaw_pos_com_inside_segment(env, support, 0.05, "yaw_rate_cmd", 0.1).tolist() == [1, 1, 1, 0]
+    shaped = reward.yaw_pos_heading_support(env, support, 0.27, "yaw_rate_cmd", 0.1)
+    assert shaped.tolist() == pytest.approx([1.0 - 0.15 / 0.27, 1.0, 1.0 - 0.15 / 0.27, 0.0])
+    current = env._yaw_pos_heading_metrics_current
+    assert current[:3, 0].tolist() == pytest.approx([0.15, 0.0, 0.15])
+    assert current[:3, 1].tolist() == pytest.approx([-0.15, 0.0, -0.15])
+    assert current[:3, 2].tolist() == pytest.approx([0.15, 0.0, 0.15])
+    assert current[0, 3].item() < 0.9
+    assert current[1, 3].item() == pytest.approx(1.0)
+    assert current[2, 3].item() == pytest.approx(current[0, 3].item())
+    assert env._yaw_pos_heading_support_x_rms_samples.tolist() == [1, 1, 1, 0]
 
 
 def test_command_sequence_changes_reward_target_without_reset(monkeypatch):
@@ -256,6 +307,7 @@ def test_new_registration_runner_and_existing_config_are_isolated():
     assert "VQRWheelFlatEnvPOSCfg" in classes
     reward_names = {node.targets[0].id for node in classes["VQRWheelYawPosRewardsCfg"].body if isinstance(node, ast.Assign)}
     assert reward_names == {"com_support", "support_span_band", "lift_clearance", "com_inside_segment",
+                            "heading_support",
                             "gated_yaw_tracking", "lifted_wheel_spin", "neutral_landing_progress",
                             "four_stand_pose", "four_wheel_contact"}
 
@@ -292,6 +344,14 @@ def test_curriculum_uses_active_metrics_and_logs_neutral_separately(monkeypatch)
         _yaw_pos_neutral_abs_yaw_rate_samples=torch.tensor([2]),
         _yaw_pos_neutral_planar_speed_sum=torch.tensor([0.6]),
         _yaw_pos_neutral_planar_speed_samples=torch.tensor([2]),
+        _yaw_pos_heading_fl_x_from_com_sum=torch.tensor([0.12]),
+        _yaw_pos_heading_fl_x_from_com_samples=torch.tensor([2]),
+        _yaw_pos_heading_hr_x_from_com_sum=torch.tensor([-0.08]),
+        _yaw_pos_heading_hr_x_from_com_samples=torch.tensor([2]),
+        _yaw_pos_heading_support_x_rms_sum=torch.tensor([0.14]),
+        _yaw_pos_heading_support_x_rms_samples=torch.tensor([2]),
+        _yaw_pos_heading_support_line_body_y_alignment_sum=torch.tensor([1.8]),
+        _yaw_pos_heading_support_line_body_y_alignment_samples=torch.tensor([2]),
     )
     result = module.yaw_pos_task_levels(
         env, [0], "yaw_rate_cmd", (0.05,), (0.25,), (0.30,), (0.30,), (0.20,),
@@ -304,8 +364,13 @@ def test_curriculum_uses_active_metrics_and_logs_neutral_separately(monkeypatch)
     assert result["neutral_pose_error"] == pytest.approx(0.1)
     assert result["neutral_abs_yaw_rate"] == pytest.approx(0.2)
     assert result["neutral_planar_speed"] == pytest.approx(0.3)
+    assert result["heading_fl_x_from_com_m"] == pytest.approx(0.06)
+    assert result["heading_hr_x_from_com_m"] == pytest.approx(-0.04)
+    assert result["heading_support_x_rms_m"] == pytest.approx(0.07)
+    assert result["heading_support_line_body_y_alignment"] == pytest.approx(0.9)
     assert reward_configs["neutral_landing_progress"].params["target_clearance"] == pytest.approx(0.10)
     assert env._yaw_pos_neutral_four_contact_sum.item() == 0
+    assert env._yaw_pos_heading_support_x_rms_sum.item() == 0
 
 
 def test_neutral_only_episode_cannot_promote_yaw_ladder(monkeypatch):

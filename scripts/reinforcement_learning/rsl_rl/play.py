@@ -153,6 +153,18 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import rl_training.tasks  # noqa: F401
 
 
+def _checkpoint_pos_yaw_limit(checkpoint_path: str, yaw_rate_levels) -> float:
+    """Use the POS checkpoint's trained yaw stage instead of the final curriculum stage."""
+    levels = [float(level) for level in yaw_rate_levels]
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    curriculum = (checkpoint.get("infos") or {}).get("yaw_curriculum") or {}
+    stage = curriculum.get("values", {}).get("_yaw_task_curriculum_yaw_stage")
+    if curriculum.get("yaw_rate_levels") == levels and type(stage) is int and 0 <= stage < len(levels):
+        return levels[stage]
+    print("[WARN] POS checkpoint has no matching yaw curriculum stage; using the first training yaw limit.")
+    return levels[0]
+
+
 def _write_pos_keyboard_command(env, controller) -> None:
     """Send only keyboard yaw through the POS task's command term."""
     command_term = env.unwrapped.command_manager.get_term("yaw_rate_cmd")
@@ -212,6 +224,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if hasattr(env_cfg.events, event_name):
                 setattr(env_cfg.events, event_name, None)
 
+    # Resolve the checkpoint before setting playback commands: POS checkpoints
+    # can be saved before the yaw curriculum reaches its final stage.
+    log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
+    print(f"[INFO] Loading experiment from directory: {log_root_path}")
+    if args_cli.checkpoint:
+        resume_path = retrieve_file_path(args_cli.checkpoint)
+    else:
+        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+    log_dir = os.path.dirname(resume_path)
+
     if args_cli.yaw_contact_trace:
         env_cfg.commands.yaw_rate_cmd.yaw_rate_range = (
             -args_cli.yaw_contact_limit,
@@ -235,7 +257,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     final_yaw_limit = yaw_rate_levels[-1]
             if command_name is not None and final_yaw_limit is not None:
                 command_cfg = getattr(env_cfg.commands, command_name)
-                final_yaw_limit = float(final_yaw_limit)
+                if task_name == "Flat-VQR-Wheel-Yaw-POS":
+                    final_yaw_limit = _checkpoint_pos_yaw_limit(resume_path, task_levels.params["yaw_rate_levels"])
+                    print(f"[INFO] POS checkpoint yaw limit: {final_yaw_limit:g} rad/s")
+                else:
+                    final_yaw_limit = float(final_yaw_limit)
                 command_cfg.yaw_rate_range = (
                     0.0 if task_name == "Flat-VQR-Wheel-Yaw-POS" else -final_yaw_limit,
                     final_yaw_limit,
@@ -268,17 +294,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             env_cfg.observations.policy.velocity_commands = ObsTerm(
                 func=lambda env: torch.tensor(controller.advance(), dtype=torch.float32).unsqueeze(0).to(env.device),
             )
-
-    # specify directory for logging experiments
-    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
-    log_root_path = os.path.abspath(log_root_path)
-    print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    if args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
-    else:
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-
-    log_dir = os.path.dirname(resume_path)
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -398,11 +413,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     reward_diagnostic_sum = None
     reward_diagnostic_samples = 0
     gate_open_sum = 0.0
+    gate_open_samples = 0
     mean_abs_yaw_command_sum = 0.0
     yaw_rate_error_sum = 0.0
+    heading_geometry_sum = None
+    heading_geometry_samples = 0
     if args_cli.reward_diagnostics:
         reward_manager = env.unwrapped.reward_manager
         reward_diagnostic_sum = torch.zeros(len(reward_manager.active_terms), device=env.unwrapped.device)
+        if task_name == "Flat-VQR-Wheel-Yaw-POS":
+            heading_geometry_sum = torch.zeros(4, device=env.unwrapped.device)
         print("[INFO] Reward diagnostics enabled; values are weighted reward rates averaged across environments.")
         if "yaw_rate_cmd" in env.unwrapped.command_manager.active_terms:
             yaw_command_term = env.unwrapped.command_manager.get_term("yaw_rate_cmd")
@@ -477,9 +497,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             unwrapped_env = env.unwrapped
             if hasattr(unwrapped_env, "_yaw_gate_open_current"):
                 gate_open_sum += float(unwrapped_env._yaw_gate_open_current.mean().item())
+                gate_open_samples += 1
             if hasattr(unwrapped_env, "_yaw_command_abs_current"):
                 mean_abs_yaw_command_sum += float(unwrapped_env._yaw_command_abs_current.mean().item())
                 yaw_rate_error_sum += float(unwrapped_env._yaw_rate_abs_error_current.mean().item())
+            if heading_geometry_sum is not None and hasattr(unwrapped_env, "_yaw_pos_heading_metrics_current"):
+                heading_active = unwrapped_env._yaw_pos_heading_active_current
+                heading_geometry_sum += unwrapped_env._yaw_pos_heading_metrics_current[heading_active].sum(dim=0)
+                heading_geometry_samples += int(heading_active.sum().item())
             if reward_diagnostic_samples == args_cli.reward_diagnostics_interval:
                 mean_terms = reward_diagnostic_sum / reward_diagnostic_samples
                 positive_total = mean_terms.clamp_min(0.0).sum()
@@ -495,7 +520,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if yaw_index is not None and positive_total.item() > 0.0:
                     yaw_share = mean_terms[yaw_index].clamp_min(0.0) / positive_total
                     print(f"  {'gated_yaw_positive_share':32s} {yaw_share.item(): .3%}")
-                gate_open_rate = gate_open_sum / reward_diagnostic_samples
                 mean_abs_yaw_command = mean_abs_yaw_command_sum / reward_diagnostic_samples
                 mean_yaw_rate_error = yaw_rate_error_sum / reward_diagnostic_samples
                 tracking_ratio = (
@@ -503,15 +527,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     if mean_abs_yaw_command > 1.0e-6
                     else 0.0
                 )
-                print(f"  {'gate_open_rate':32s} {gate_open_rate: .6f}")
+                if gate_open_samples:
+                    print(f"  {'gate_open_rate':32s} {gate_open_sum / gate_open_samples: .6f}")
                 print(f"  {'mean_abs_yaw_cmd':32s} {mean_abs_yaw_command: .6f}")
                 print(f"  {'mean_error_yaw_rate':32s} {mean_yaw_rate_error: .6f}")
                 print(f"  {'tracking_ratio':32s} {tracking_ratio: .6f}")
+                if heading_geometry_samples:
+                    heading_means = (heading_geometry_sum / heading_geometry_samples).tolist()
+                    for name, value in zip(
+                        ("heading_FL_x_from_com_m", "heading_HR_x_from_com_m",
+                         "heading_support_x_rms_m", "heading_support_line_body_y_alignment"),
+                        heading_means,
+                    ):
+                        print(f"  {name:40s} {value: .6f}")
                 reward_diagnostic_sum.zero_()
                 reward_diagnostic_samples = 0
                 gate_open_sum = 0.0
+                gate_open_samples = 0
                 mean_abs_yaw_command_sum = 0.0
                 yaw_rate_error_sum = 0.0
+                if heading_geometry_sum is not None:
+                    heading_geometry_sum.zero_()
+                    heading_geometry_samples = 0
         timestep += 1
         if args_cli.video:
             # Exit the play loop after recording one video
