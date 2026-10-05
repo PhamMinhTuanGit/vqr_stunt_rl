@@ -44,12 +44,23 @@ def test_pos_keyboard_limit_uses_checkpoint_yaw_stage(stage, expected):
 @pytest.mark.parametrize("checkpoint", [
     {"infos": None},
     {"infos": {"yaw_curriculum": {
-        "yaw_rate_levels": [0.25, 0.40],
+        "yaw_rate_levels": [0.25, 0.45],
         "values": {"_yaw_task_curriculum_yaw_stage": 1},
     }}},
 ])
 def test_pos_keyboard_limit_falls_back_to_first_stage_without_matching_metadata(checkpoint):
     assert _checkpoint_limit_reader(checkpoint)("model.pt", [0.25, 0.40, 1.0]) == 0.25
+
+
+def test_pos_keyboard_limit_accepts_appended_stages_without_raising_trained_limit():
+    saved = [0.25, 0.40, 0.55, 0.70, 0.85, 1.0]
+    checkpoint = {"infos": {"yaw_curriculum": {
+        "yaw_rate_levels": saved, "values": {"_yaw_task_curriculum_yaw_stage": 5},
+    }}}
+    read = _checkpoint_limit_reader(checkpoint)
+    assert read("model.pt", saved + [1.25, 1.5, 1.75, 2.0, 2.5, 3.0]) == 1.0
+    checkpoint["infos"]["yaw_curriculum"]["values"]["_yaw_task_curriculum_yaw_stage"] = 6
+    assert read("model.pt", saved + [1.25]) == 0.25
 
 
 def test_pos_keyboard_branch_isolated_from_base_velocity():

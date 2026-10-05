@@ -49,6 +49,10 @@ parser.add_argument(
     help="Optional POS leg-action std override after resume. Omit to preserve checkpoint std.",
 )
 parser.add_argument(
+    "--pos_support_wheel_std_override", type=float, default=None,
+    help="POS resume only: set FL/HR action std, preserving every other action std.",
+)
+parser.add_argument(
     "--critic_warmup_iterations",
     type=int,
     default=None,
@@ -154,14 +158,17 @@ _YAW_FSM_CURRICULUM_PERSISTENT_FIELDS = (
 
 def _export_yaw_curriculum_state(task_env) -> dict:
     """Serialize scalar yaw-curriculum state without simulator tensors."""
+    term_params = task_env.cfg.curriculum.task_levels.params
+    persistent_fields = _YAW_CURRICULUM_PERSISTENT_FIELDS
+    if term_params.get("certify_behavior", False):
+        persistent_fields = tuple(name for name in vars(task_env) if name.startswith(_YAW_CURRICULUM_PREFIX))
     values = {
         name: getattr(task_env, name)
-        for name in _YAW_CURRICULUM_PERSISTENT_FIELDS
+        for name in persistent_fields
         if hasattr(task_env, name) and isinstance(getattr(task_env, name), (bool, int, float))
     }
     current_step = int(task_env.common_step_counter)
     stage_start_step = int(getattr(task_env, "_yaw_task_curriculum_stage_start_step", current_step))
-    term_params = task_env.cfg.curriculum.task_levels.params
     return {
         "version": 1,
         "values": values,
@@ -179,18 +186,33 @@ def _restore_yaw_curriculum_state(task_env, checkpoint_infos) -> bool:
     if not isinstance(payload, dict) or payload.get("version") != 1:
         return False
     term_params = task_env.cfg.curriculum.task_levels.params
-    if payload.get("yaw_rate_levels") != list(term_params["yaw_rate_levels"]) or payload.get(
-        "dr_scale_levels"
-    ) != list(term_params["dr_scale_levels"]):
+    compatible = True
+    for key in ("yaw_rate_levels", "dr_scale_levels"):
+        saved, current = payload.get(key), list(term_params[key])
+        matches = saved == current
+        if term_params.get("certify_behavior", False) and isinstance(saved, list) and saved:
+            matches = len(saved) <= len(current) and saved == current[:len(saved)]
+        compatible = compatible and matches
+    if not compatible or len(payload["yaw_rate_levels"]) != len(payload["dr_scale_levels"]):
         print("[WARN] Saved yaw curriculum stage table differs from the active config; ignoring saved state.")
         return False
 
     values = payload.get("values")
     if not isinstance(values, dict):
         return False
+    if term_params.get("certify_behavior", False):
+        yaw_stage = values.get("_yaw_task_curriculum_yaw_stage")
+        clearance_stage = values.get("_yaw_task_curriculum_stage")
+        if (type(yaw_stage) is not int or not 0 <= yaw_stage < len(payload["yaw_rate_levels"])
+                or type(clearance_stage) is not int or not 0 <= clearance_stage < len(term_params["clearance_levels"])):
+            return False
     for name, value in values.items():
         if name.startswith(_YAW_CURRICULUM_PREFIX) and isinstance(value, (bool, int, float)):
             setattr(task_env, name, value)
+    if term_params.get("certify_behavior", False) and values.get("_yaw_task_curriculum_behavior_version") != 1:
+        # Old windows did not certify differential motion or neutral holding.
+        # Preserve skill levels and elapsed time, but require fresh passing windows.
+        task_env._yaw_task_curriculum_consecutive_passes = 0
 
     elapsed_steps = max(0, int(payload.get("stage_elapsed_steps", 0)))
     task_env._yaw_task_curriculum_stage_start_step = int(task_env.common_step_counter) - elapsed_steps
@@ -516,13 +538,38 @@ def _configure_pos_resume_leg_std(runner: OnPolicyRunner, task_env, target_std: 
     runner.log = log_with_pos_action_std
 
 
-def _verify_pos_resume_state(runner: OnPolicyRunner, task_env, checkpoint_path: str, additional_iterations: int, save_interval: int) -> None:
+def _configure_pos_resume_support_wheel_std(runner: OnPolicyRunner, task_env, target_std: float) -> None:
+    """Change only FL/HR independent exploration and their optimizer moments."""
+    policy = runner.alg.policy
+    if (getattr(policy, "state_dependent_std", False)
+            or getattr(policy, "noise_std_type", None) != "log"
+            or not isinstance(getattr(policy, "log_std", None), torch.nn.Parameter)):
+        raise RuntimeError("POS wheel exploration requires an independent log_std parameter.")
+    if not math.isfinite(target_std) or target_std <= 0.0:
+        raise ValueError("POS support wheel action std must be finite and positive.")
+    names = [name for term in task_env.action_manager.active_terms
+             for name in task_env.action_manager.get_term(term)._joint_names]
+    if len(names) != policy.log_std.numel() or any(names.count(name) != 1 for name in ("FL_WHEEL", "HR_WHEEL")):
+        raise RuntimeError("POS support wheel std requires unique FL/HR action indices.")
+    indices = [names.index(name) for name in ("FL_WHEEL", "HR_WHEEL")]
+    before = policy.log_std.detach()[indices].exp().tolist()
+    with torch.no_grad():
+        policy.log_std[indices] = math.log(target_std)
+        for value in runner.alg.optimizer.state.get(policy.log_std, {}).values():
+            if isinstance(value, torch.Tensor) and value.shape == policy.log_std.shape:
+                value[indices] = 0.0
+    policy.distribution = None
+    print("[INFO] POS resumed support wheel action std: " + ", ".join(
+        f"{name} {old:.6f}->{target_std:.6f}" for name, old in zip(("FL_WHEEL", "HR_WHEEL"), before)
+    ), flush=True)
+
+
+def _verify_pos_resume_state(runner: OnPolicyRunner, task_env, checkpoint_path: str, additional_iterations: int,
+                             save_interval: int, support_wheel_std: float | None = None) -> None:
     """Verify a POS resume before any PPO update and print every action std."""
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     policy = runner.alg.policy
     checkpoint_log_std = checkpoint["model_state_dict"]["log_std"]
-    if not torch.equal(policy.log_std.detach().cpu(), checkpoint_log_std):
-        raise RuntimeError("POS action std differs from the checkpoint after resume.")
     if runner.current_learning_iteration != checkpoint["iter"]:
         raise RuntimeError("POS starting iteration differs from the checkpoint.")
 
@@ -532,6 +579,16 @@ def _verify_pos_resume_state(runner: OnPolicyRunner, task_env, checkpoint_path: 
     ]
     if len(action_names) != checkpoint_log_std.numel():
         raise RuntimeError("POS action names do not match checkpoint std dimensions.")
+    actual = policy.log_std.detach().cpu()
+    changed = [] if support_wheel_std is None else [action_names.index(name) for name in ("FL_WHEEL", "HR_WHEEL")]
+    preserved = [index for index in range(len(action_names)) if index not in changed]
+    if not torch.equal(actual[preserved], checkpoint_log_std[preserved]):
+        raise RuntimeError("POS action std differs from the checkpoint outside the requested override.")
+    if changed and not torch.allclose(actual[changed].exp(), actual.new_full((2,), support_wheel_std)):
+        raise RuntimeError("POS support wheel std differs from the requested override.")
+    for name, tensor in policy.state_dict().items():
+        if name != "log_std" and not torch.equal(tensor.detach().cpu(), checkpoint["model_state_dict"][name]):
+            raise RuntimeError(f"POS model parameter {name} differs from the resume checkpoint.")
     start = runner.current_learning_iteration
     print(f"[PRESTART] checkpoint={os.path.realpath(checkpoint_path)}", flush=True)
     print(
@@ -552,6 +609,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     task_name = args_cli.task.split(":")[-1]
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    if args_cli.pos_support_wheel_std_override is not None:
+        if task_name != "Flat-VQR-Wheel-Yaw-POS" or not agent_cfg.resume:
+            raise ValueError("--pos_support_wheel_std_override requires a Flat-VQR-Wheel-Yaw-POS resume.")
+        if args_cli.pos_leg_std_override is not None:
+            raise ValueError("The POS support-wheel experiment must preserve leg action std.")
     if args_cli.pos_adaptation_checkpoint:
         if task_name != adaptation_task_id:
             raise ValueError("--pos_adaptation_checkpoint is only supported for Flat-VQR-Wheel-Yaw-POS.")
@@ -661,9 +723,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         checkpoint_infos = runner.load(resume_path, load_optimizer=True)
         if task_name == "Flat-VQR-Wheel-Yaw-POS" and agent_cfg.resume:
             _configure_pos_resume_leg_std(runner, env.unwrapped, target_std=args_cli.pos_leg_std_override)
+            if args_cli.pos_support_wheel_std_override is not None:
+                _configure_pos_resume_support_wheel_std(
+                    runner, env.unwrapped, args_cli.pos_support_wheel_std_override
+                )
             if args_cli.pos_leg_std_override is None:
                 _verify_pos_resume_state(
-                    runner, env.unwrapped, resume_path, agent_cfg.max_iterations, agent_cfg.save_interval
+                    runner, env.unwrapped, resume_path, agent_cfg.max_iterations, agent_cfg.save_interval,
+                    support_wheel_std=args_cli.pos_support_wheel_std_override,
                 )
 
     if yaw_task_env is not None:
@@ -672,7 +739,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(
                 f"[INFO] Restored {task_name} curriculum: "
                 f"clearance_stage={yaw_task_env._yaw_task_curriculum_stage}, "
-                f"yaw_stage={yaw_task_env._yaw_task_curriculum_yaw_stage}."
+                f"yaw_stage={yaw_task_env._yaw_task_curriculum_yaw_stage}, "
+                f"yaw_range={yaw_task_env.command_manager.get_term('yaw_rate_cmd').cfg.yaw_rate_range}, "
+                f"dr_scale={yaw_task_env.cfg.curriculum.task_levels.params['dr_scale_levels'][yaw_task_env._yaw_task_curriculum_yaw_stage]}, "
+                f"stage_elapsed_steps={yaw_task_env.common_step_counter - yaw_task_env._yaw_task_curriculum_stage_start_step}."
             )
         elif agent_cfg.resume:
             print("[WARN] Checkpoint has no yaw curriculum state; starting curriculum from stage zero.")

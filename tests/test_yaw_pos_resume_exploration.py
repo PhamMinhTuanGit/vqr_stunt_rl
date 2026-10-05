@@ -81,7 +81,8 @@ def test_pos_resume_prestart_checks_all_std_and_iteration(tmp_path, capsys):
     checkpoint_std = torch.linspace(0.1, 0.85, 16)
     checkpoint = tmp_path / "model_5000.pt"
     torch.save({"iter": 5000, "model_state_dict": {"log_std": checkpoint_std.log()}}, checkpoint)
-    policy = SimpleNamespace(log_std=torch.nn.Parameter(checkpoint_std.log()))
+    policy = SimpleNamespace(log_std=torch.nn.Parameter(checkpoint_std.log()),
+                             state_dict=lambda: {"log_std": checkpoint_std.log()})
     runner = SimpleNamespace(alg=SimpleNamespace(policy=policy), current_learning_iteration=5000)
     action_manager = SimpleNamespace(
         active_terms=["joint_pos", "joint_vel"],

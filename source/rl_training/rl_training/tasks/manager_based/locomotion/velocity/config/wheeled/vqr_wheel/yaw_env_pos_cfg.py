@@ -8,6 +8,7 @@ from isaaclab.utils import configclass
 from rl_training.tasks.manager_based.locomotion.velocity.mdp import yaw_pos_commands as pos_commands
 from rl_training.tasks.manager_based.locomotion.velocity.mdp import yaw_pos_curriculums as pos_curriculums
 from rl_training.tasks.manager_based.locomotion.velocity.mdp import yaw_pos_rewards as pos_rewards
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_noise import YawPosJointVelocityNoiseCfg
 from rl_training.tasks.manager_based.locomotion.velocity.mdp import wheel_contact_kinematics
 from rl_training.tasks.manager_based.locomotion.velocity.velocity_yaw_env_cfg import CommandsCfg
 
@@ -35,6 +36,10 @@ ALL_WHEELS = WHEEL_NAMES
 SUPPORT_LINE_SIGMA = 0.20
 SUPPORT_Y_MIN_SEPARATION = 0.45
 SUPPORT_Y_COLLAPSE_SCALE = 0.05
+POS_YAW_RATE_LEVELS = YAW_RATE_LEVELS + (1.25, 1.50, 1.75, 2.00, 2.50, 3.00)
+POS_DR_SCALE_LEVELS = ONLINE_DR_SCALE_LEVELS + (1.0,) * 6
+POS_TRACKING_RATIO_THRESHOLDS = YAW_TRACKING_RATIO_THRESHOLDS + (0.55,) * 6
+POS_EDGE_TRACKING_RATIO_THRESHOLDS = YAW_EDGE_TRACKING_RATIO_THRESHOLDS + (0.45,) * 6
 
 
 @configclass
@@ -49,7 +54,7 @@ class VQRWheelYawPosCommandsCfg(CommandsCfg):
 
 @configclass
 class VQRWheelYawPosRewardsCfg(VQRWheelRewardsCfg):
-    """Inherit all baseline safety terms; replace only pose-dependent terms."""
+    """POS differential rolling and neutral holding with baseline safety terms."""
 
     com_support = RewTerm(
         func=pos_rewards.yaw_pos_com_support, weight=3.0,
@@ -123,6 +128,34 @@ class VQRWheelYawPosRewardsCfg(VQRWheelRewardsCfg):
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=ALL_WHEELS, preserve_order=True),
                 "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND, "threshold": 1.0},
     )
+    signed_ground_participation = RewTerm(
+        func=pos_rewards.yaw_pos_signed_ground_participation, weight=2.0,
+        params={"support_asset_cfg": SceneEntityCfg("robot", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
+                "support_sensor_cfg": SceneEntityCfg("contact_forces", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
+                "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND},
+    )
+    rolling_tracking = RewTerm(
+        func=pos_rewards.yaw_pos_rolling_tracking, weight=2.0,
+        params={"support_asset_cfg": SceneEntityCfg("robot", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
+                "support_joint_cfg": SceneEntityCfg("robot", joint_names=POS_SUPPORT_WHEELS, preserve_order=True),
+                "support_sensor_cfg": SceneEntityCfg("contact_forces", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
+                "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND, "wheel_radius": WHEEL_RADIUS,
+                "relative_std": 0.25, "speed_std": 0.05, "minimum_speed_fraction": 0.5, "settle_time": 0.5},
+    )
+    active_com_stationary = RewTerm(
+        func=pos_rewards.yaw_pos_active_com_stationary, weight=3.0,
+        params={"command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND, "std": 0.05},
+    )
+    neutral_velocity = RewTerm(
+        func=pos_rewards.yaw_pos_neutral_velocity, weight=3.0,
+        params={"command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND, "std": 0.05},
+    )
+    neutral_position = RewTerm(
+        func=pos_rewards.yaw_pos_neutral_position, weight=2.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=ALL_WHEELS, preserve_order=True),
+                "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND, "std": 0.05,
+                "contact_dwell": 0.2, "speed_threshold": 0.03, "drift_threshold": 0.05},
+    )
 
     def __post_init__(self):
         # Retain the inherited rolling weight (-0.5), wheel order, contact
@@ -136,9 +169,9 @@ class VQRWheelYawPosCurriculumCfg:
     task_levels = CurrTerm(
         func=pos_curriculums.yaw_pos_task_levels,
         params={"command_name": "yaw_rate_cmd", "clearance_levels": LIFT_CLEARANCE_LEVELS,
-                "yaw_rate_levels": YAW_RATE_LEVELS, "dr_scale_levels": ONLINE_DR_SCALE_LEVELS,
-                "tracking_ratio_thresholds": YAW_TRACKING_RATIO_THRESHOLDS,
-                "edge_tracking_ratio_thresholds": YAW_EDGE_TRACKING_RATIO_THRESHOLDS,
+                "yaw_rate_levels": POS_YAW_RATE_LEVELS, "dr_scale_levels": POS_DR_SCALE_LEVELS,
+                "tracking_ratio_thresholds": POS_TRACKING_RATIO_THRESHOLDS,
+                "edge_tracking_ratio_thresholds": POS_EDGE_TRACKING_RATIO_THRESHOLDS,
                 "lift_reward_name": "lift_clearance", "balance_reward_name": "balance",
                 "yaw_reward_name": "gated_yaw_tracking", "transition_reward_name": None,
                 "torso_contact_termination_name": "torso_contact", "minimum_base_height": MIN_BASE_HEIGHT,
@@ -146,7 +179,8 @@ class VQRWheelYawPosCurriculumCfg:
                 "balance_threshold": 0.75, "yaw_threshold": 0.65,
                 "min_evaluated_episodes": 2048, "required_success_rate": 0.85,
                 "required_consecutive_windows": 3, "min_clearance_stage_steps": 1000,
-                "min_yaw_stage_steps": 6000},
+                "min_yaw_stage_steps": 6000, "certify_behavior": True,
+                "behavior_pass_threshold": 0.90},
     )
 
 
@@ -158,6 +192,11 @@ class VQRWheelFlatEnvPOSCfg(VQRWheelFlatEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+        # Keep all 16 velocity components in their existing order and retain
+        # the leg noise distribution; only wheel velocity noise is reduced.
+        self.observations.policy.joint_vel.noise = YawPosJointVelocityNoiseCfg(
+            joint_names=tuple(self.joint_names), leg_noise=3.0, wheel_noise=0.5,
+        )
         self.observations.critic.rolling_lateral_contact_velocity.func = (
             wheel_contact_kinematics.rolling_lateral_contact_velocity
         )

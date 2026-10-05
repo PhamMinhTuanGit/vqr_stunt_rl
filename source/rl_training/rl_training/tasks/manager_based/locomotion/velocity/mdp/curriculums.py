@@ -194,12 +194,18 @@ def yaw_task_levels(
     min_yaw_stage_steps: int,
     transition_reward_name: str | None = None,
     active_only: bool = False,
+    certification_metrics: dict[str, tuple[torch.Tensor, torch.Tensor, float]] | None = None,
+    episode_success_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Learn the two-wheel pose first, then jointly increase yaw and online DR.
 
     Clearance and yaw use independent stage indices. Once the final clearance
     is stable, each yaw promotion also increases reset/interval DR. Startup-only
     material, mass, inertia and CoM randomization is intentionally unaffected.
+
+    Optional certification metrics contain per-environment passing-sample sums,
+    sample counts and required window rates. They include neutral-only episodes;
+    the optional success mask separately qualifies active episodes.
     """
     validate_yaw_curriculum_levels(
         clearance_levels,
@@ -287,6 +293,20 @@ def yaw_task_levels(
 
     episode_steps = env.episode_length_buf[selected_env_ids]
     valid = episode_steps > 0
+    certification_metrics = certification_metrics or {}
+    for metric, (passed, samples, threshold) in certification_metrics.items():
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("Certification thresholds must be in [0, 1].")
+        prefix = f"_yaw_task_curriculum_certification_{metric}"
+        for suffix in ("passed", "samples", "last_rate"):
+            if not hasattr(env, f"{prefix}_{suffix}"):
+                setattr(env, f"{prefix}_{suffix}", 0.0)
+        # Neutral-only episodes still supply evidence about standing skill.
+        completed = selected_env_ids[valid]
+        setattr(env, f"{prefix}_passed", getattr(env, f"{prefix}_passed") + float(passed[completed].sum().item()))
+        setattr(env, f"{prefix}_samples", getattr(env, f"{prefix}_samples") + int(samples[completed].sum().item()))
+    if certification_metrics:
+        env._yaw_task_curriculum_behavior_version = 1
     if active_only:
         # A neutral-only episode contains no evidence about two-wheel yaw skill.
         if hasattr(env, "_yaw_tracking_metric_samples"):
@@ -375,6 +395,8 @@ def yaw_task_levels(
             & (minimum_episode_height >= minimum_base_height)
             & ~torso_contact
         )
+        if episode_success_mask is not None:
+            successful &= episode_success_mask[completed_env_ids]
 
         env._yaw_task_curriculum_last_support_score = float(support_score.mean().item())
         env._yaw_task_curriculum_last_lift_progress = float(lift_progress_score.mean().item())
@@ -503,6 +525,13 @@ def yaw_task_levels(
             window_passed = success_rate >= required_success_rate
             required_stage_steps = min_clearance_stage_steps
 
+        for metric, (_, _, threshold) in certification_metrics.items():
+            prefix = f"_yaw_task_curriculum_certification_{metric}"
+            samples = getattr(env, f"{prefix}_samples")
+            rate = getattr(env, f"{prefix}_passed") / max(samples, 1)
+            setattr(env, f"{prefix}_last_rate", rate)
+            window_passed = window_passed and samples > 0 and rate >= threshold
+
         env._yaw_task_curriculum_last_window_passed = float(window_passed)
         if window_passed:
             env._yaw_task_curriculum_consecutive_passes = min(
@@ -537,6 +566,10 @@ def yaw_task_levels(
         env._yaw_task_curriculum_edge_command_abs_sum = 0.0
         env._yaw_task_curriculum_edge_yaw_abs_error_sum = 0.0
         env._yaw_task_curriculum_edge_tracking_samples = 0
+        for metric in certification_metrics:
+            prefix = f"_yaw_task_curriculum_certification_{metric}"
+            setattr(env, f"{prefix}_passed", 0.0)
+            setattr(env, f"{prefix}_samples", 0)
 
     clearance_stage = env._yaw_task_curriculum_stage
     yaw_stage = env._yaw_task_curriculum_yaw_stage
@@ -672,6 +705,11 @@ def yaw_task_levels(
         "minimum_base_height": log_scalar(minimum_base_height),
         "required_success_rate": log_scalar(required_success_rate),
         "required_consecutive_windows": log_scalar(required_consecutive_windows),
+        **{
+            f"certification/{metric}_rate": log_scalar(
+                getattr(env, f"_yaw_task_curriculum_certification_{metric}_last_rate")
+            ) for metric in certification_metrics
+        },
     }
 
 

@@ -134,9 +134,13 @@ def test_stage_tables_must_be_aligned_and_monotonic(monkeypatch: pytest.MonkeyPa
 
 def test_config_supplies_every_required_curriculum_parameter(monkeypatch: pytest.MonkeyPatch):
     curriculum = _load_curriculums_module(monkeypatch)
-    required = set(inspect.signature(curriculum.yaw_task_levels).parameters) - {"env", "env_ids"}
+    required = set(inspect.signature(curriculum.yaw_task_levels).parameters) - {
+        "env", "env_ids", "certification_metrics", "episode_success_mask",
+    }
 
     assert _curriculum_param_keys_from_config() == required
+    assert inspect.signature(curriculum.yaw_task_levels).parameters["certification_metrics"].default is None
+    assert inspect.signature(curriculum.yaw_task_levels).parameters["episode_success_mask"].default is None
 
 
 def test_config_reaches_one_rad_per_second_and_full_online_dr():

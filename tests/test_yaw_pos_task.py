@@ -315,7 +315,9 @@ def test_new_registration_runner_and_existing_config_are_isolated():
                             "lift_clearance", "com_inside_segment",
                             "heading_support",
                             "gated_yaw_tracking", "lifted_wheel_spin", "neutral_landing_progress",
-                            "four_stand_pose", "four_wheel_contact"}
+                            "four_stand_pose", "four_wheel_contact", "signed_ground_participation",
+                            "rolling_tracking", "active_com_stationary",
+                            "neutral_velocity", "neutral_position"}
 
 
 def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch):
@@ -338,6 +340,7 @@ def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch
         pos_rewards=reward, wheel_contact_kinematics=helper,
         POS_SUPPORT_WHEELS=["FL_WHEEL", "HR_WHEEL"], POS_LIFTED_WHEELS=["FR_WHEEL", "HL_WHEEL"],
         ALL_WHEELS=["FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL"], LEG_JOINT_NAMES=[".*"],
+        YawPosJointVelocityNoiseCfg=SimpleNamespace,
         LIFT_CLEARANCE_LEVELS=(0.05,), YAW_RATE_LEVELS=(0.25,), WHEEL_RADIUS=0.091, YAW_REF=1.,
     )
     tree = ast.parse((CONFIG / "yaw_env_pos_cfg.py").read_text())
@@ -368,12 +371,16 @@ def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch
     assert baseline_rolling.func is not cfg.rolling_slip.func
     env_cfg = namespace["VQRWheelFlatEnvPOSCfg"]()
     obs_cfg = SimpleNamespace(func=object(), params={"wheel_radius": 0.091}, scale=1.)
-    env_cfg.observations = SimpleNamespace(critic=SimpleNamespace(rolling_lateral_contact_velocity=obs_cfg))
+    env_cfg.joint_names = ["FL_HipX_joint", "FL_WHEEL", "HR_WHEEL"]
+    env_cfg.observations = SimpleNamespace(critic=SimpleNamespace(rolling_lateral_contact_velocity=obs_cfg),
+                                         policy=SimpleNamespace(joint_vel=SimpleNamespace(noise=None)))
     env_cfg.commands = SimpleNamespace(yaw_rate_cmd=SimpleNamespace(yaw_rate_range=(-0.25, 0.25)))
     env_cfg.__post_init__()
     assert env_cfg.parent_initialized
     assert obs_cfg.func is helper.rolling_lateral_contact_velocity
     assert obs_cfg.params == {"wheel_radius": 0.091} and obs_cfg.scale == 1.
+    assert env_cfg.observations.policy.joint_vel.noise.wheel_noise == .5
+    assert env_cfg.observations.policy.joint_vel.noise.leg_noise == 3.
 
 
 def test_curriculum_uses_active_metrics_and_logs_neutral_separately(monkeypatch):
@@ -396,6 +403,9 @@ def test_curriculum_uses_active_metrics_and_logs_neutral_separately(monkeypatch)
     env = SimpleNamespace(
         num_envs=1, device="cpu", _yaw_tracking_metric_samples=torch.tensor([2]),
         _yaw_pos_neutral_samples=torch.tensor([2]),
+        _yaw_task_curriculum_yaw_stage=0,
+        event_manager=SimpleNamespace(get_term_cfg=lambda _: SimpleNamespace(params={}),
+                                      set_term_cfg=lambda *args: None),
         reward_manager=SimpleNamespace(
             get_term_cfg=lambda name: reward_configs[name],
             set_term_cfg=lambda name, cfg: reward_configs.__setitem__(name, cfg),
@@ -446,7 +456,10 @@ def test_new_diagnostics_normalize_active_samples_and_clear_only_reset_rows(monk
         "lift_clearance": SimpleNamespace(params={"target_clearance": 0.10}),
         "neutral_landing_progress": SimpleNamespace(params={"target_clearance": 0.10}),
     }
-    env = SimpleNamespace(num_envs=2, device="cpu", reward_manager=SimpleNamespace(
+    env = SimpleNamespace(num_envs=2, device="cpu", _yaw_task_curriculum_yaw_stage=0,
+                         event_manager=SimpleNamespace(get_term_cfg=lambda _: SimpleNamespace(params={}),
+                                                       set_term_cfg=lambda *args: None),
+                         reward_manager=SimpleNamespace(
         get_term_cfg=lambda name: reward_configs[name],
         set_term_cfg=lambda name, cfg: reward_configs.__setitem__(name, cfg),
     ))
@@ -613,7 +626,12 @@ def test_pos_resume_restores_and_installs_yaw_curriculum_checkpoint_hook():
     selection = next(node.value for node in main.body if isinstance(node, ast.Assign)
                      and any(isinstance(target, ast.Name) and target.id == "yaw_task_env"
                              for target in node.targets))
-    task_env = SimpleNamespace(_yaw_task_curriculum_stage=2, _yaw_task_curriculum_yaw_stage=1)
+    task_env = SimpleNamespace(
+        _yaw_task_curriculum_stage=2, _yaw_task_curriculum_yaw_stage=1,
+        common_step_counter=100, _yaw_task_curriculum_stage_start_step=0,
+        command_manager=SimpleNamespace(get_term=lambda _: SimpleNamespace(cfg=SimpleNamespace(yaw_rate_range=(0., .4)))),
+        cfg=SimpleNamespace(curriculum=SimpleNamespace(task_levels=SimpleNamespace(params={"dr_scale_levels": (.3, .4)}))),
+    )
     env = SimpleNamespace(unwrapped=task_env)
     task_name = "Flat-VQR-Wheel-Yaw-POS"
     selected = eval(compile(ast.Expression(selection), str(train), "eval"),
