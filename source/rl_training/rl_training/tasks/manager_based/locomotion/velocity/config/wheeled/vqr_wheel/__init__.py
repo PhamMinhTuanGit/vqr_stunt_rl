@@ -65,6 +65,15 @@ gym.register(
     },
 )
 gym.register(
+    id="Flat-VQR-Wheel-Yaw-POS-Skill",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.yaw_env_pos_skill_cfg:VQRWheelFlatEnvPOSSkillCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:VQRWheelYawFlatPOSSkillPPORunnerCfg",
+    },
+)
+gym.register(
     id="Flat-VQR-Wheel-Yaw-POS-Transfer",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

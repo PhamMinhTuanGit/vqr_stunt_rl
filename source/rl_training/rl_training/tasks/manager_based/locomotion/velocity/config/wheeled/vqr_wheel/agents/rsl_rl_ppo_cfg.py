@@ -102,6 +102,17 @@ class VQRWheelYawFlatPOSPPORunnerCfg(VQRWheelYawFlatPPORunnerCfg):
 
 
 @configclass
+class VQRWheelYawFlatPOSSkillPPORunnerCfg(VQRWheelYawFlatPOSPPORunnerCfg):
+    """Scratch POS experiment; train.py sets per-wheel log_std before rollout."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "vqr_wheel_yaw_flat_pos_skill"
+        self.resume = False
+        self.load_checkpoint = None
+
+
+@configclass
 class VQRWheelYawFlatFSMPPORunnerCfg(VQRWheelYawFlatPPORunnerCfg):
     """Runner settings with an isolated experiment directory for the FSM task."""
 
