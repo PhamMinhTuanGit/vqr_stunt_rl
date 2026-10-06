@@ -482,3 +482,45 @@ def yaw_pos_lifted_wheel_spin_l2(
     penalty = robot.data.joint_vel[:, asset_cfg.joint_ids].square().sum(dim=1)
     scale = _yaw_command_penalty_scale(env, command_name, yaw_reference)
     return torch.where(active, scale * penalty, 0.0)
+
+
+def yaw_pos_hipx_vertical(
+    env, asset_cfg: SceneEntityCfg, command_name: str, deadband: float,
+    std: float = 0.08,
+) -> torch.Tensor:
+    """Reward HipX joints of support legs staying near 0 (vertical) during active command.
+
+    HipX is the roll joint; at 0 rad the thigh is parallel to the vertical plane.
+    Default joint pos for HipX is 0.0, so measure absolute deviation from 0.
+    """
+    if std <= 0.0:
+        raise ValueError("hipx vertical std must be positive.")
+    _, active, _ = yaw_pos_masks(env, command_name, deadband)
+    robot = env.scene[asset_cfg.name]
+    hipx_pos = robot.data.joint_pos[:, asset_cfg.joint_ids]
+    error = hipx_pos.square().mean(dim=1)
+    _accumulate(env, "_yaw_pos_hipx_deviation", error, active)
+    return torch.where(active, torch.exp(-error / std**2), 0.0)
+
+
+def yaw_pos_active_base_height(
+    env, command_name: str, deadband: float,
+    target_height: float = 0.45, error_scale: float = 0.08,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Track base height with Huber shaping, gated to active command.
+
+    Active-mode only: stabilizes TORSO height during yaw rotation in POS stance.
+    """
+    if error_scale <= 0.0:
+        raise ValueError("error_scale must be positive.")
+    _, active, _ = yaw_pos_masks(env, command_name, deadband)
+    asset = env.scene[asset_cfg.name]
+    base_height = asset.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    normalized_error = torch.abs(base_height - target_height) / error_scale
+    huber = torch.where(
+        normalized_error <= 1.0,
+        0.5 * normalized_error.square(),
+        normalized_error - 0.5,
+    )
+    return torch.where(active, 1.0 - huber, 0.0)

@@ -128,6 +128,23 @@ class VQRWheelYawPosRewardsCfg(VQRWheelRewardsCfg):
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=ALL_WHEELS, preserve_order=True),
                 "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND, "threshold": 1.0},
     )
+    hipx_vertical = RewTerm(
+        func=pos_rewards.yaw_pos_hipx_vertical, weight=4.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot",
+                joint_names=["FL_HipX_joint", "HR_HipX_joint"],
+                preserve_order=True),
+            "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND,
+            "std": 0.08,
+        },
+    )
+    active_base_height = RewTerm(
+        func=pos_rewards.yaw_pos_active_base_height, weight=4.0,
+        params={
+            "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND,
+            "target_height": 0.45, "error_scale": 0.08,
+        },
+    )
     signed_ground_participation = RewTerm(
         func=pos_rewards.yaw_pos_signed_ground_participation, weight=2.0,
         params={"support_asset_cfg": SceneEntityCfg("robot", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
@@ -162,6 +179,9 @@ class VQRWheelYawPosRewardsCfg(VQRWheelRewardsCfg):
         # threshold and command relief; replace only its kinematics.
         self.rolling_slip.func = pos_rewards.yaw_pos_rolling_wheel_slip
         self.rolling_slip.params["deadband"] = YAW_DEADBAND
+        # Increase base height tracking weight and lower target for POS stance.
+        self.base_height.weight = 4.0
+        self.base_height.params["target_height"] = 0.45
 
 
 @configclass
