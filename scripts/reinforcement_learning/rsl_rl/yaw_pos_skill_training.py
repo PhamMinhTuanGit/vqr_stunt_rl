@@ -1,4 +1,4 @@
-"""Scratch-only runner hooks for the isolated POS skill experiment."""
+"""Runner hooks for fresh POS skill training and exact checkpoint resumes."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_skill_state import (
-    CHECKPOINT_KEY, EPISODE_GATES, WINDOW_GATES, SkillSettings, SkillState,
+    CHECKPOINT_KEY, EPISODE_GATES, WINDOW_GATES, SkillSettings, SkillState, empty_window,
 )
 
 
@@ -52,7 +52,7 @@ def export_skill_state(task_env):
 
 
 def restore_skill_state(task_env, payload):
-    """Explicit utility for checkpoint validation; fresh training never calls it."""
+    """Validate and restore curriculum stages and relative stage timing."""
     from rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_skill_curriculums import apply_difficulty
     next_state = SkillState.restore(payload, SkillSettings(), int(task_env.common_step_counter))
     task_env._yaw_pos_skill_state = next_state
@@ -60,22 +60,85 @@ def restore_skill_state(task_env, payload):
     return next_state
 
 
-def install_skill_hooks(runner, task_env, log_dir):
+def verify_skill_resume(runner, checkpoint_path):
+    """Verify model/optimizer fidelity and recover the adaptive scheduler's LR."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+
+    def equal(actual, expected, location):
+        if isinstance(expected, torch.Tensor):
+            matches = (isinstance(actual, torch.Tensor) and actual.dtype == expected.dtype
+                       and torch.equal(actual.detach().cpu(), expected))
+        elif isinstance(expected, dict):
+            matches = isinstance(actual, dict) and actual.keys() == expected.keys()
+            if matches:
+                for key in expected:
+                    equal(actual[key], expected[key], f"{location}.{key}")
+        elif isinstance(expected, (list, tuple)):
+            matches = isinstance(actual, type(expected)) and len(actual) == len(expected)
+            if matches:
+                for index, value in enumerate(expected):
+                    equal(actual[index], value, f"{location}[{index}]")
+        else:
+            matches = actual == expected
+        if not matches:
+            raise RuntimeError(f"Skill resume changed checkpoint state at {location}.")
+
+    equal(runner.alg.policy.state_dict(), checkpoint["model_state_dict"], "model")
+    equal(runner.alg.optimizer.state_dict(), checkpoint["optimizer_state_dict"], "optimizer")
+    equal(runner.current_learning_iteration, checkpoint["iter"], "iteration")
+    learning_rates = {float(group["lr"]) for group in runner.alg.optimizer.param_groups}
+    if len(learning_rates) != 1:
+        raise RuntimeError("Skill resume requires one shared optimizer learning rate.")
+    learning_rate = learning_rates.pop()
+    if not math.isfinite(learning_rate) or learning_rate <= 0:
+        raise RuntimeError("Invalid checkpoint learning rate.")
+    # RSL-RL load() restores optimizer groups but not this scheduler scalar.
+    runner.alg.learning_rate = learning_rate
+    return {"checkpoint": str(Path(checkpoint_path).resolve()),
+            "model_preserved": True, "optimizer_preserved": True,
+            "optimizer_learning_rate": learning_rate}
+
+
+def install_skill_hooks(runner, task_env, log_dir, checkpoint_path=None, checkpoint_infos=None):
     from rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_skill_curriculums import get_state, apply_difficulty
-    state = get_state(task_env)
-    apply_difficulty(task_env)
-    if runner.current_learning_iteration != 0:
-        raise RuntimeError("POS skill experiment must start at iteration zero.")
+    audit = None
+    if checkpoint_path is not None:
+        if not isinstance(checkpoint_infos, dict) or CHECKPOINT_KEY not in checkpoint_infos:
+            raise RuntimeError("Skill resume checkpoint has no skill curriculum state.")
+        audit = verify_skill_resume(runner, checkpoint_path)
+        state = restore_skill_state(task_env, checkpoint_infos[CHECKPOINT_KEY])
+        # The simulator starts fresh, and old/new settle samples must not share
+        # a certificate window. Preserve stages and elapsed stage duration.
+        state.window = empty_window()
+        state.last = {}
+        state.consecutive_passes = 0
+        task_env.reset()
+    else:
+        state = get_state(task_env)
+        apply_difficulty(task_env)
+        if runner.current_learning_iteration != 0:
+            raise RuntimeError("Fresh POS skill training must start at iteration zero.")
     dimensions = {name: list(shape) for name, shape in task_env.observation_manager.group_obs_dim.items()}
     if dimensions != {"policy": [55], "critic": [83]}:
         raise RuntimeError(f"POS skill observation dimensions changed: {dimensions}")
-    std = initialize_wheel_std(runner.alg.policy, task_env)
+    if checkpoint_path is None:
+        std = initialize_wheel_std(runner.alg.policy, task_env)
+    else:
+        names = action_names(task_env)
+        std = dict(zip(names, runner.alg.policy.log_std.detach().exp().cpu().tolist()))
     initial = {
-        "task": "Flat-VQR-Wheel-Yaw-POS-Skill", "starting_iteration": 0,
+        "task": "Flat-VQR-Wheel-Yaw-POS-Skill",
+        "starting_iteration": int(runner.current_learning_iteration), "resume": audit,
         "phase": state.phase, "clearance_stage": 0, "yaw_stage": state.yaw_stage,
         "yaw_limit": state.settings.yaw_levels[state.yaw_stage], "robustness_scale": state.dr_scale,
         "action_std": std, "observations": dimensions,
         "gate_enabled": state.enabled(), "gate_threshold": state.thresholds(),
+        "settle_time": task_env.reward_manager.get_term_cfg("rolling_tracking").params["settle_time"],
+        "settle_reset_on_active_command_change": True,
+        "paired_legacy_certificate": True,
+        "normalized_residual_excess": task_env.reward_manager.get_term_cfg("rolling_slip").params.get(
+            "normalized_excess", False
+        ),
     }
     Path(log_dir).mkdir(parents=True, exist_ok=True)
     (Path(log_dir) / "skill_prestart.json").write_text(json.dumps(initial, indent=2) + "\n")
@@ -139,7 +202,11 @@ def install_skill_hooks(runner, task_env, log_dir):
                      "tracking", "edge_tracking",
                      "differential", "neutral", "four_contact", "anchor_coverage",
                      "differential_fl_signed_ratio", "differential_hr_signed_ratio",
-                     "differential_any_wrong_sign_pct", "neutral_position_drift", "neutral_planar_speed"):
+                     "differential_any_wrong_sign_pct", "neutral_position_drift", "neutral_planar_speed",
+                     "differential_legacy", "differential_fixed_episode", "differential_legacy_episode",
+                     "differential_settled", "differential_legacy_settled", "active_command_change",
+                     "differential_fail_invalid", "differential_fail_contact", "differential_fail_sign",
+                     "differential_fail_ground_speed", "differential_fail_motor_speed", "differential_fail_residual"):
             scalar(f"Curriculum/skill/metric/{name}",
                    gate_rates.get(name, rates.get(name, 0.0)), step)
         current_std = runner.alg.policy.log_std.detach().exp().cpu().tolist()

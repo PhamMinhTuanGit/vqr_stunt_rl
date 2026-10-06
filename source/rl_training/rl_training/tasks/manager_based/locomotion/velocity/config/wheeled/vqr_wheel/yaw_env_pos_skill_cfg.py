@@ -1,4 +1,4 @@
-"""Isolated, scratch-only POS curriculum with phase-gated skill acquisition."""
+"""Isolated POS curriculum with phase-gated skill acquisition and faithful resumes."""
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -22,6 +22,8 @@ class VQRWheelYawPosSkillRewardsCfg(VQRWheelYawPosRewardsCfg):
         super().__post_init__()
         # The wrapper only records anchor coverage and returns the original reward.
         self.neutral_position.func = telemetry.skill_neutral_position
+        # Opt in for a separate residual experiment after the settle-only control.
+        self.rolling_slip.params["normalized_excess"] = False
 
 
 @configclass

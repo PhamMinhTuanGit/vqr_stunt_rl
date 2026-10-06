@@ -129,12 +129,39 @@ def yaw_pos_rolling_tracking(
     ).all(dim=1)
     if not hasattr(env, "_yaw_pos_active_age"):
         env._yaw_pos_active_age = torch.zeros_like(command)
-    env._yaw_pos_active_age[env.episode_length_buf <= 1] = 0.
+    if not hasattr(env, "_yaw_pos_previous_command"):
+        # Clone: the command manager updates its buffer in place.
+        env._yaw_pos_previous_command = command.clone()
+        env._yaw_pos_legacy_active_age = torch.zeros_like(command)
+    reset = env.episode_length_buf <= 1
+    command_changed = active & (command != env._yaw_pos_previous_command) & ~reset
+    env._yaw_pos_active_age[reset | command_changed] = 0.
     env._yaw_pos_active_age = torch.where(
         active, env._yaw_pos_active_age + env.step_dt, 0.
     )
+    # Shadow the previous certificate on the same trajectory for a paired
+    # settle-only control. This timer never influences rewards or promotion.
+    env._yaw_pos_legacy_active_age[reset] = 0.
+    env._yaw_pos_legacy_active_age = torch.where(
+        active, env._yaw_pos_legacy_active_age + env.step_dt, 0.
+    )
+    env._yaw_pos_previous_command.copy_(command)
     settled = active & (env._yaw_pos_active_age + 1.0e-6 >= settle_time)
+    legacy_settled = active & (env._yaw_pos_legacy_active_age + 1.0e-6 >= settle_time)
     _accumulate(env, "_yaw_pos_differential_pass", passing.float(), settled)
+    _accumulate(env, "_yaw_pos_differential_legacy", passing.float(), legacy_settled)
+    _accumulate(env, "_yaw_pos_differential_settled", settled.float(), active)
+    _accumulate(env, "_yaw_pos_differential_legacy_settled", legacy_settled.float(), active)
+    _accumulate(env, "_yaw_pos_active_command_change", command_changed.float(), active)
+    for name, failed in {
+        "invalid": ~valid.all(1),
+        "contact": ~contacts.all(1),
+        "sign": ~(measured * target > 0.).all(1),
+        "ground_speed": ~(measured.abs() >= minimum_speed_fraction * target.abs()).all(1),
+        "motor_speed": ~(motor_fraction >= minimum_speed_fraction).all(1),
+        "residual": ~(residual[..., 0].abs() <= scale).all(1),
+    }.items():
+        _accumulate(env, f"_yaw_pos_differential_fail_{name}", failed.float(), settled)
     ratio = signed_ground_ratio(target, measured)
     wrong_sign = (measured * target < 0.0) & valid
     overspeed = (ratio - 1.0).clamp_min(0.0)
@@ -159,6 +186,8 @@ def yaw_pos_rolling_tracking(
         _accumulate(env, f"_yaw_pos_{name}", value, active)
     env._yaw_pos_differential_metrics_current = {name: value.detach().clone() for name, value in metrics.items()}
     env._yaw_pos_differential_metrics_current["differential_pass"] = (settled & passing).detach().clone()
+    env._yaw_pos_differential_metrics_current["settled"] = settled.detach().clone()
+    env._yaw_pos_differential_metrics_current["legacy_settled"] = legacy_settled.detach().clone()
     return torch.where(active, score, 0.)
 
 
@@ -350,8 +379,9 @@ def yaw_pos_body_angular_xy_l2(
 def yaw_pos_rolling_wheel_slip(
     env, sensor_cfg: SceneEntityCfg, body_asset_cfg: SceneEntityCfg, joint_asset_cfg: SceneEntityCfg,
     wheel_radius: float, command_name: str, yaw_reference: float, deadband: float, threshold: float = 1.0,
+    normalized_excess: bool = False,
 ) -> torch.Tensor:
-    """Phase-invariant rolling penalty with unchanged contact and command scaling."""
+    """Raw rolling cost, optionally replaced by certificate-normalized POS excess."""
     velocities, in_contact = contacted_wheel_velocities(
         env, sensor_cfg, body_asset_cfg, joint_asset_cfg, wheel_radius, threshold
     )
@@ -361,6 +391,37 @@ def yaw_pos_rolling_wheel_slip(
     contact_count = in_contact.sum(dim=1)
     mean_error = (in_contact * rolling.abs()).sum(dim=1) / contact_count.clamp_min(1)
     _accumulate(env, "_yaw_pos_rolling_error", mean_error, active & (contact_count > 0))
+    if normalized_excess:
+        # Use the certificate's resolved support order and current tolerances.
+        # The default path and the neutral penalty keep their original formula.
+        params = env.reward_manager.get_term_cfg("rolling_tracking").params
+        support_asset = params["support_asset_cfg"]
+        robot = env.scene[support_asset.name]
+        data = robot.data
+        command = env.command_manager.get_command(params["command_name"])[:, 0]
+        target, _, valid = differential_rolling_kinematics(
+            data.body_quat_w[:, support_asset.body_ids],
+            data.body_pos_w[:, support_asset.body_ids],
+            data.body_link_lin_vel_w[:, support_asset.body_ids],
+            _yaw_whole_body_com_xy(robot), command,
+        )
+        residual, contacts = contacted_wheel_velocities(
+            env, params["support_sensor_cfg"], support_asset, params["support_joint_cfg"],
+            params["wheel_radius"], params.get("contact_threshold", 1.0),
+        )
+        if target.shape[1] != 2 or residual.shape[:2] != target.shape:
+            raise ValueError("Normalized residual requires two ordered support wheels.")
+        tolerance = (params.get("relative_std", .25) * target.abs()).clamp_min(
+            params.get("speed_std", .05)
+        )
+        excess = (residual[..., 0].abs() / tolerance - 1.0).clamp_min(0.0)
+        # Huber on dimensionless excess: zero inside tolerance, quadratic near
+        # its boundary, linear for large outliers. The worse support wheel wins.
+        cost = torch.where(excess <= 1.0, .5 * excess.square(), excess - .5)
+        _, _, heading_valid = ground_heading_axes(data.root_quat_w)
+        qualified = valid & heading_valid[:, None] & (target.abs() > 1.0e-4) & contacts
+        support_cost = torch.where(qualified, cost, 0.0).amax(dim=1)
+        penalty = torch.where(active, support_cost, penalty)
     return _yaw_command_penalty_scale(env, command_name, yaw_reference) * penalty
 
 

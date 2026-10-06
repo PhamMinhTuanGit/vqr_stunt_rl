@@ -100,8 +100,22 @@ def _values(env, ids):
         "four_contact": (sample("_yaw_pos_neutral_four_contact_sum"), sample("_yaw_pos_neutral_samples")),
         "anchor_coverage": (sample("_yaw_pos_skill_anchor_sum"), sample("_yaw_pos_skill_neutral_samples")),
     }
+    legacy_count = sample("_yaw_pos_differential_legacy_samples")
+    eligible_pair = (diff_samples > 0) & (legacy_count > 0)
+    legacy_diff = sample("_yaw_pos_differential_legacy_sum") / legacy_count.clamp_min(1)
+    certificate = get_state(env).settings.certificate
+    metrics["differential_fixed_episode"] = (
+        ((diff >= certificate) & eligible_pair).float(), eligible_pair.long()
+    )
+    metrics["differential_legacy_episode"] = (
+        ((legacy_diff >= certificate) & eligible_pair).float(), eligible_pair.long()
+    )
     for metric in ("differential_fl_signed_ratio", "differential_hr_signed_ratio",
-                   "differential_any_wrong_sign_pct", "neutral_position_drift", "neutral_planar_speed"):
+                   "differential_any_wrong_sign_pct", "neutral_position_drift", "neutral_planar_speed",
+                   "differential_legacy", "differential_settled", "differential_legacy_settled",
+                   "active_command_change", "differential_fail_invalid", "differential_fail_contact",
+                   "differential_fail_sign", "differential_fail_ground_speed",
+                   "differential_fail_motor_speed", "differential_fail_residual"):
         metrics[metric] = (sample(f"_yaw_pos_{metric}_sum"), sample(f"_yaw_pos_{metric}_samples"))
     return values, metrics, sample("_yaw_tracking_metric_samples") > 0
 
@@ -113,7 +127,7 @@ def _clear_episode_buffers(env, ids):
             value[ids] = 0
     if hasattr(env, "_yaw_base_height_min"):
         env._yaw_base_height_min[ids] = torch.inf
-    for name in ("_yaw_pos_active_age", "_yaw_pos_neutral_contact_age",
+    for name in ("_yaw_pos_active_age", "_yaw_pos_legacy_active_age", "_yaw_pos_neutral_contact_age",
                  "_yaw_pos_neutral_anchored", "_yaw_pos_neutral_anchor"):
         if hasattr(env, name):
             getattr(env, name)[ids] = 0

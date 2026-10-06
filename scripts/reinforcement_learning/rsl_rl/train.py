@@ -609,17 +609,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     task_name = args_cli.task.split(":")[-1]
     skill_task = task_name == "Flat-VQR-Wheel-Yaw-POS-Skill"
-    if skill_task and (agent_cfg.resume or args_cli.resume or args_cli.load_run is not None
-                       or args_cli.checkpoint is not None or args_cli.pos_adaptation_checkpoint
+    if skill_task and (args_cli.pos_adaptation_checkpoint
                        or args_cli.transfer_checkpoint or args_cli.pos_leg_std_override is not None
                        or args_cli.pos_support_wheel_std_override is not None
-                       or args_cli.distributed or agent_cfg.algorithm.class_name == "Distillation"):
-        raise ValueError("Flat-VQR-Wheel-Yaw-POS-Skill only supports independent fresh PPO training.")
+                       or args_cli.distributed or agent_cfg.algorithm.class_name != "PPO"
+                       or args_cli.critic_warmup_iterations not in (None, 0)):
+        raise ValueError("POS skill supports fresh PPO or exact resume without policy/optimizer overrides.")
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
-    if skill_task and (agent_cfg.experiment_name != "vqr_wheel_yaw_flat_pos_skill"
-                       or agent_cfg.load_checkpoint is not None):
-        raise ValueError("POS skill experiment requires its own runner config and no load checkpoint.")
+    if skill_task and agent_cfg.experiment_name != "vqr_wheel_yaw_flat_pos_skill":
+        raise ValueError("POS skill experiment requires its own runner config.")
+    if skill_task and not agent_cfg.resume and (
+        args_cli.load_run is not None or agent_cfg.load_checkpoint is not None
+    ):
+        raise ValueError("POS skill checkpoint input requires --resume.")
     if args_cli.pos_support_wheel_std_override is not None:
         if task_name != "Flat-VQR-Wheel-Yaw-POS" or not agent_cfg.resume:
             raise ValueError("--pos_support_wheel_std_override requires a Flat-VQR-Wheel-Yaw-POS resume.")
@@ -716,8 +719,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # convert config to dict and create runner
     train_cfg = agent_cfg.to_dict()
     runner = OnPolicyRunner(env, train_cfg, log_dir=log_dir, device=agent_cfg.device)
-    if skill_task:
-        install_skill_hooks(runner, env.unwrapped, log_dir)
     
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
@@ -745,6 +746,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     runner, env.unwrapped, resume_path, agent_cfg.max_iterations, agent_cfg.save_interval,
                     support_wheel_std=args_cli.pos_support_wheel_std_override,
                 )
+
+    if skill_task:
+        install_skill_hooks(
+            runner, env.unwrapped, log_dir,
+            checkpoint_path=resume_path if agent_cfg.resume else None,
+            checkpoint_infos=checkpoint_infos,
+        )
 
     if yaw_task_env is not None:
         restored = False if adaptation_report is not None else _restore_yaw_curriculum_state(yaw_task_env, checkpoint_infos)
