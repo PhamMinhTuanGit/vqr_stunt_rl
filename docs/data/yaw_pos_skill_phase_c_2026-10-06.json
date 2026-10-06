@@ -1,0 +1,1067 @@
+{
+  "snapshot": {
+    "snapshot_time": "2026-10-06T09:38:58.975902+07:00",
+    "checkpoint": "/home/robotics/tuanpm48/vqr/rl_training/logs/rsl_rl/vqr_wheel_yaw_flat_pos_skill/2026-10-06_00-48-36_settle_normalized_residual/model_8150.pt",
+    "iteration": 8150,
+    "checkpoint_mtime": "2026-10-06T09:32:41.310016+07:00",
+    "stage_elapsed_steps": 156646,
+    "phase": 2,
+    "yaw_stage": 0,
+    "robustness_stage": 0,
+    "consecutive_passes": 0,
+    "last": {
+      "phase": 2,
+      "yaw_stage": 0,
+      "robustness_stage": 0,
+      "enabled": {
+        "support": true,
+        "lift": true,
+        "balance": true,
+        "height": true,
+        "safe": true,
+        "yaw": true,
+        "differential_episode": true,
+        "tracking": true,
+        "edge_tracking": true,
+        "differential": true,
+        "neutral": false,
+        "four_contact": false,
+        "anchor_coverage": false
+      },
+      "thresholds": {
+        "support": 0.85,
+        "lift": 0.8,
+        "balance": 0.75,
+        "height": 0.35,
+        "safe": 1.0,
+        "yaw": 0.65,
+        "differential_episode": 0.9,
+        "tracking": 0.3,
+        "edge_tracking": 0.2,
+        "differential": 0.9,
+        "neutral": 0.9,
+        "four_contact": 0.9,
+        "anchor_coverage": 0.9
+      },
+      "rates": {
+        "command": 0.17458319128708405,
+        "error": 0.05279349997144221,
+        "edge_command": 0.22470869304584432,
+        "edge_error": 0.05131041058187616,
+        "differential": 0.8154726767232316,
+        "neutral": 0.892213683264699,
+        "four_contact": 0.9329329427482319,
+        "anchor_coverage": 0.9030286687830169,
+        "differential_fixed_episode": 0.12130905511811024,
+        "differential_legacy_episode": 0.11368110236220473,
+        "differential_fl_signed_ratio": 2.074613696623097,
+        "differential_hr_signed_ratio": 1.6870359485520214,
+        "differential_any_wrong_sign_pct": 4.673812188935639,
+        "neutral_position_drift": 0.01885469582592102,
+        "neutral_planar_speed": 0.020777787558134243,
+        "differential_legacy": 0.8157027925570832,
+        "differential_settled": 0.8941384550840037,
+        "differential_legacy_settled": 0.9517292523662216,
+        "active_command_change": 0.0034851394142807156,
+        "differential_fail_invalid": 0.0,
+        "differential_fail_contact": 0.0002745177443597312,
+        "differential_fail_sign": 0.04832991970842711,
+        "differential_fail_ground_speed": 0.1138555530461735,
+        "differential_fail_motor_speed": 0.13791031641577173,
+        "differential_fail_residual": 0.006828677564307242,
+        "support_score": 0.9909536596776343,
+        "lift_score": 0.9869005893229735,
+        "balance_score": 0.9587445316459867,
+        "height_score": 0.4284910222192142,
+        "yaw_score": 0.9331101352859138,
+        "tracking": 0.6976026180857884,
+        "edge_tracking": 0.7716580970394057,
+        "success_rate": 0.12079548244537196
+      },
+      "gate_rates": {
+        "support": 0.9990179229069482,
+        "lift": 0.9980358458138964,
+        "balance": 1.0,
+        "height": 1.0,
+        "safe": 1.0,
+        "yaw": 0.9977903265406335,
+        "differential_episode": 0.12079548244537196
+      },
+      "counts": {
+        "tracking": 2872195,
+        "edge_tracking": 948971,
+        "differential": 2568140,
+        "neutral": 1105131,
+        "four_contact": 1223805,
+        "anchor_coverage": 1223805
+      },
+      "episodes": 4073,
+      "passed": false,
+      "blockers": [
+        "differential_episode",
+        "joint_episode_success",
+        "differential"
+      ]
+    },
+    "partial_window": {
+      "episodes": 60,
+      "successes": 5,
+      "passes": {
+        "support": 60,
+        "lift": 60,
+        "balance": 60,
+        "height": 60,
+        "safe": 60,
+        "yaw": 60,
+        "differential_episode": 5
+      },
+      "metrics": {
+        "command": [
+          7772.936382293701,
+          43054
+        ],
+        "error": [
+          2325.6818103790283,
+          43054
+        ],
+        "edge_command": [
+          3680.8117756843567,
+          16287
+        ],
+        "edge_error": [
+          821.754997074604,
+          16287
+        ],
+        "differential": [
+          31640.0,
+          38444
+        ],
+        "neutral": [
+          14276.0,
+          16157
+        ],
+        "four_contact": [
+          16723.0,
+          17946
+        ],
+        "anchor_coverage": [
+          16157.0,
+          17946
+        ],
+        "differential_fixed_episode": [
+          5.0,
+          60
+        ],
+        "differential_legacy_episode": [
+          5.0,
+          60
+        ],
+        "differential_fl_signed_ratio": [
+          88213.08172607422,
+          43054
+        ],
+        "differential_hr_signed_ratio": [
+          73020.31149291992,
+          43054
+        ],
+        "differential_any_wrong_sign_pct": [
+          187600.0,
+          43054
+        ],
+        "neutral_position_drift": [
+          306.77397952321917,
+          16157
+        ],
+        "neutral_planar_speed": [
+          363.7281405925751,
+          17946
+        ],
+        "differential_legacy": [
+          33672.0,
+          40902
+        ],
+        "differential_settled": [
+          38444.0,
+          43054
+        ],
+        "differential_legacy_settled": [
+          40902.0,
+          43054
+        ],
+        "active_command_change": [
+          150.0,
+          43054
+        ],
+        "differential_fail_invalid": [
+          0.0,
+          38444
+        ],
+        "differential_fail_contact": [
+          14.0,
+          38444
+        ],
+        "differential_fail_sign": [
+          1720.0,
+          38444
+        ],
+        "differential_fail_ground_speed": [
+          4139.0,
+          38444
+        ],
+        "differential_fail_motor_speed": [
+          5125.0,
+          38444
+        ],
+        "differential_fail_residual": [
+          259.0,
+          38444
+        ],
+        "support_score": [
+          59.47079682350159,
+          60
+        ],
+        "lift_score": [
+          59.26541793346405,
+          60
+        ],
+        "balance_score": [
+          57.415344178676605,
+          60
+        ],
+        "height_score": [
+          25.700762927532196,
+          60
+        ],
+        "yaw_score": [
+          55.95067769289017,
+          60
+        ]
+      }
+    },
+    "action_std": [
+      0.09787638485431671,
+      0.06283880025148392,
+      0.19003291428089142,
+      0.09262897819280624,
+      0.04198369011282921,
+      0.17097195982933044,
+      0.12000057101249695,
+      0.04887333884835243,
+      0.07657933980226517,
+      0.11331600695848465,
+      0.05460134893655777,
+      0.18642853200435638,
+      0.13260319828987122,
+      0.2392200529575348,
+      0.22256770730018616,
+      0.12579643726348877
+    ],
+    "optimizer_lr": 1.5000000000000004e-05,
+    "settings": {
+      "clearance": 0.05,
+      "yaw_levels": [
+        0.25,
+        0.4,
+        0.55,
+        0.7,
+        0.85,
+        1.0,
+        1.25,
+        1.5,
+        1.75,
+        2.0,
+        2.5,
+        3.0
+      ],
+      "tracking_thresholds": [
+        0.3,
+        0.35,
+        0.4,
+        0.45,
+        0.5,
+        0.55,
+        0.55,
+        0.55,
+        0.55,
+        0.55,
+        0.55,
+        0.55
+      ],
+      "edge_thresholds": [
+        0.2,
+        0.25,
+        0.3,
+        0.35,
+        0.4,
+        0.45,
+        0.45,
+        0.45,
+        0.45,
+        0.45,
+        0.45,
+        0.45
+      ],
+      "robustness_scales": [
+        0.0,
+        0.1,
+        0.25,
+        0.5,
+        0.75,
+        1.0
+      ],
+      "support": 0.85,
+      "lift": 0.8,
+      "balance": 0.75,
+      "height": 0.35,
+      "yaw": 0.65,
+      "certificate": 0.9,
+      "coverage": 0.9,
+      "success_rate": 0.85,
+      "min_episodes": 2048,
+      "required_windows": 3,
+      "pose_steps": 1000,
+      "skill_steps": 6000
+    },
+    "reward_config": {
+      "balance": {
+        "func": "rl_training.tasks.manager_based.locomotion.velocity.mdp.rewards:yaw_balance",
+        "params": {
+          "nominal_roll": "0.0",
+          "nominal_pitch": "0.0",
+          "std": "0.25"
+        },
+        "weight": "2.0"
+      },
+      "base_height": {
+        "func": "rl_training.tasks.manager_based.locomotion.velocity.mdp.rewards:yaw_base_height_tracking",
+        "params": {
+          "asset_cfg": {
+            "name": "robot",
+            "joint_names": "null",
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": "null",
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "false"
+          },
+          "target_height": "0.49",
+          "error_scale": "0.1"
+        },
+        "weight": "2.0"
+      },
+      "gated_yaw_tracking": {
+        "func": "rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_rewards:yaw_pos_gated_tracking",
+        "params": {
+          "command_name": "yaw_rate_cmd",
+          "support_sensor_cfg": {
+            "name": "contact_forces",
+            "joint_names": "null",
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": [
+              "FL_WHEEL",
+              "HR_WHEEL"
+            ],
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "true"
+          },
+          "lifted_asset_cfg": {
+            "name": "robot",
+            "joint_names": "null",
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": [
+              "FR_WHEEL",
+              "HL_WHEEL"
+            ],
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "true"
+          },
+          "wheel_radius": "0.091",
+          "target_clearance": "0.05",
+          "std": "0.2",
+          "neutral_std": "0.3",
+          "deadband": "0.1",
+          "contact_threshold": "1.0",
+          "support_asset_cfg": {
+            "name": "robot",
+            "joint_names": "null",
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": [
+              "FL_WHEEL",
+              "HR_WHEEL"
+            ],
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "true"
+          },
+          "support_joint_cfg": {
+            "name": "robot",
+            "joint_names": [
+              "FL_WHEEL",
+              "HR_WHEEL"
+            ],
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": "null",
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "true"
+          },
+          "clearance_gate_floor": "0.25",
+          "edge_command_fraction": "0.8"
+        },
+        "weight": "8.0"
+      },
+      "rolling_tracking": {
+        "func": "rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_rewards:yaw_pos_rolling_tracking",
+        "params": {
+          "support_asset_cfg": {
+            "name": "robot",
+            "joint_names": "null",
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": [
+              "FL_WHEEL",
+              "HR_WHEEL"
+            ],
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "true"
+          },
+          "support_joint_cfg": {
+            "name": "robot",
+            "joint_names": [
+              "FL_WHEEL",
+              "HR_WHEEL"
+            ],
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": "null",
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "true"
+          },
+          "support_sensor_cfg": {
+            "name": "contact_forces",
+            "joint_names": "null",
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": [
+              "FL_WHEEL",
+              "HR_WHEEL"
+            ],
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "true"
+          },
+          "command_name": "yaw_rate_cmd",
+          "deadband": "0.1",
+          "wheel_radius": "0.091",
+          "relative_std": "0.25",
+          "speed_std": "0.05",
+          "minimum_speed_fraction": "0.5",
+          "settle_time": "0.5"
+        },
+        "weight": "2.0"
+      },
+      "rolling_slip": {
+        "func": "rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_rewards:yaw_pos_rolling_wheel_slip",
+        "params": {
+          "sensor_cfg": {
+            "name": "contact_forces",
+            "joint_names": "null",
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": [
+              "FL_WHEEL",
+              "FR_WHEEL",
+              "HL_WHEEL",
+              "HR_WHEEL"
+            ],
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "true"
+          },
+          "body_asset_cfg": {
+            "name": "robot",
+            "joint_names": "null",
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": [
+              "FL_WHEEL",
+              "FR_WHEEL",
+              "HL_WHEEL",
+              "HR_WHEEL"
+            ],
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "true"
+          },
+          "joint_asset_cfg": {
+            "name": "robot",
+            "joint_names": [
+              "FL_WHEEL",
+              "FR_WHEEL",
+              "HL_WHEEL",
+              "HR_WHEEL"
+            ],
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": "null",
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "true"
+          },
+          "wheel_radius": "0.091",
+          "command_name": "yaw_rate_cmd",
+          "yaw_reference": "1.0",
+          "threshold": "1.0",
+          "deadband": "0.1",
+          "normalized_excess": "true"
+        },
+        "weight": "-0.5"
+      },
+      "neutral_position": {
+        "func": "rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_skill_rewards:skill_neutral_position",
+        "params": {
+          "sensor_cfg": {
+            "name": "contact_forces",
+            "joint_names": "null",
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": [
+              "FL_WHEEL",
+              "FR_WHEEL",
+              "HL_WHEEL",
+              "HR_WHEEL"
+            ],
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "true"
+          },
+          "command_name": "yaw_rate_cmd",
+          "deadband": "0.1",
+          "std": "0.05",
+          "contact_dwell": "0.2",
+          "speed_threshold": "0.03",
+          "drift_threshold": "0.05"
+        },
+        "weight": "2.0"
+      },
+      "signed_ground_participation": {
+        "func": "rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_rewards:yaw_pos_signed_ground_participation",
+        "params": {
+          "support_asset_cfg": {
+            "name": "robot",
+            "joint_names": "null",
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": [
+              "FL_WHEEL",
+              "HR_WHEEL"
+            ],
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "true"
+          },
+          "support_sensor_cfg": {
+            "name": "contact_forces",
+            "joint_names": "null",
+            "joint_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "fixed_tendon_names": "null",
+            "fixed_tendon_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "body_names": [
+              "FL_WHEEL",
+              "HR_WHEEL"
+            ],
+            "body_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "object_collection_names": "null",
+            "object_collection_ids": [
+              "null",
+              "null",
+              "null"
+            ],
+            "preserve_order": "true"
+          },
+          "command_name": "yaw_rate_cmd",
+          "deadband": "0.1"
+        },
+        "weight": "2.0"
+      },
+      "active_com_stationary": {
+        "func": "rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_rewards:yaw_pos_active_com_stationary",
+        "params": {
+          "command_name": "yaw_rate_cmd",
+          "deadband": "0.1",
+          "std": "0.05"
+        },
+        "weight": "3.0"
+      }
+    }
+  },
+  "analysis": {
+    "code_commit": "1507d2e9035afd00ed8133a439a21f0e6cdeaf71",
+    "episode_certificate_count": 492,
+    "required_episode_certificate_count": 3463,
+    "mean_settled_samples_per_eligible_episode": 630.5278664375154,
+    "total_sample_failure_rate": 0.18452732327676835,
+    "upper_bound_certificate_from_motor_gate": 0.8620896835842282,
+    "upper_bound_certificate_from_ground_gate": 0.8861444469538265,
+    "upper_bound_certificate_fixing_residual_only_on_same_trajectory": 0.8223013542875389,
+    "lower_bound_both_motor_and_ground_failure": 0.06723854618517688,
+    "motor_failure_fraction_of_failed_samples": 0.7473707089379017,
+    "float32_boundary_example": {
+      "true_fraction": "9/10",
+      "float32_fraction": 0.8999999761581421,
+      "torch_ge_0_90": true,
+      "python_ge_0_90": false,
+      "actual_skill_state_record_pass_count": 0
+    }
+  },
+  "checkpoint_window_trend": [
+    {
+      "iteration": 4500,
+      "episodes": 4073,
+      "phase": 2,
+      "differential": 0.7369021356138578,
+      "episode_certificate_rate": 0.004173827645470169,
+      "joint_success_rate": 0.0029462312791554137,
+      "tracking": 0.6750564926976474,
+      "edge_tracking": 0.7431576092242331,
+      "motor_fail": 0.20261507266951143,
+      "ground_fail": 0.17847587986921493,
+      "sign_fail": 0.049128119145062724,
+      "residual_fail": 0.019927470014663995,
+      "contact_fail": 0.0004248667722348582,
+      "streak": 0
+    },
+    {
+      "iteration": 5000,
+      "episodes": 4077,
+      "phase": 2,
+      "differential": 0.7780063151705244,
+      "episode_certificate_rate": 0.008830022075055188,
+      "joint_success_rate": 0.007603630120186411,
+      "tracking": 0.688436229011246,
+      "edge_tracking": 0.7596647805245343,
+      "motor_fail": 0.17624262170818422,
+      "ground_fail": 0.14517210750294976,
+      "sign_fail": 0.03244771735985632,
+      "residual_fail": 0.019756548538612768,
+      "contact_fail": 0.0003805634991254058,
+      "streak": 0
+    },
+    {
+      "iteration": 5500,
+      "episodes": 4074,
+      "phase": 2,
+      "differential": 0.8236730295590492,
+      "episode_certificate_rate": 0.060382916053019146,
+      "joint_success_rate": 0.05964653902798233,
+      "tracking": 0.6941563616705255,
+      "edge_tracking": 0.7656356027971449,
+      "motor_fail": 0.14471989534302973,
+      "ground_fail": 0.11945831135448653,
+      "sign_fail": 0.02196339343525285,
+      "residual_fail": 0.009479668170708047,
+      "contact_fail": 0.0002606295157277641,
+      "streak": 0
+    },
+    {
+      "iteration": 6000,
+      "episodes": 4070,
+      "phase": 2,
+      "differential": 0.8214330612605985,
+      "episode_certificate_rate": 0.10466830466830467,
+      "joint_success_rate": 0.10368550368550368,
+      "tracking": 0.6886431695483353,
+      "edge_tracking": 0.7550296002965369,
+      "motor_fail": 0.14052564514451826,
+      "ground_fail": 0.1284224437501649,
+      "sign_fail": 0.028799279232298587,
+      "residual_fail": 0.006702099755863998,
+      "contact_fail": 0.0004248711418208231,
+      "streak": 0
+    },
+    {
+      "iteration": 6500,
+      "episodes": 4073,
+      "phase": 2,
+      "differential": 0.8371502421208158,
+      "episode_certificate_rate": 0.14141910139945985,
+      "joint_success_rate": 0.14043702430640806,
+      "tracking": 0.6912863973166656,
+      "edge_tracking": 0.7649639608713346,
+      "motor_fail": 0.1340964140676258,
+      "ground_fail": 0.10975947329839109,
+      "sign_fail": 0.022632102397100125,
+      "residual_fail": 0.005935130546565214,
+      "contact_fail": 0.00036122784485578173,
+      "streak": 0
+    },
+    {
+      "iteration": 7000,
+      "episodes": 4067,
+      "phase": 2,
+      "differential": 0.8226222009169807,
+      "episode_certificate_rate": 0.10007376444553726,
+      "joint_success_rate": 0.09933611999016474,
+      "tracking": 0.7166190808404723,
+      "edge_tracking": 0.7827239349174341,
+      "motor_fail": 0.14829731075755295,
+      "ground_fail": 0.11927475091723341,
+      "sign_fail": 0.027565405730721186,
+      "residual_fail": 0.006941309891347156,
+      "contact_fail": 0.00036040070960450393,
+      "streak": 0
+    },
+    {
+      "iteration": 7500,
+      "episodes": 4072,
+      "phase": 2,
+      "differential": 0.841060954639321,
+      "episode_certificate_rate": 0.21856581532416502,
+      "joint_success_rate": 0.21832023575638507,
+      "tracking": 0.7090202305248077,
+      "edge_tracking": 0.7724373265106678,
+      "motor_fail": 0.13096021420102547,
+      "ground_fail": 0.10788413671804455,
+      "sign_fail": 0.02521965812636918,
+      "residual_fail": 0.006164953634272164,
+      "contact_fail": 0.00037532291118666424,
+      "streak": 0
+    },
+    {
+      "iteration": 7900,
+      "episodes": 4080,
+      "phase": 2,
+      "differential": 0.8464093960790751,
+      "episode_certificate_rate": 0.20269607843137255,
+      "joint_success_rate": 0.20269607843137255,
+      "tracking": 0.7059213731666218,
+      "edge_tracking": 0.7739712342346161,
+      "motor_fail": 0.12539100352573915,
+      "ground_fail": 0.10002588277627496,
+      "sign_fail": 0.026431996161773663,
+      "residual_fail": 0.0054361721267751,
+      "contact_fail": 0.00018780794980003976,
+      "streak": 0
+    },
+    {
+      "iteration": 8000,
+      "episodes": 4071,
+      "phase": 2,
+      "differential": 0.8251604482987347,
+      "episode_certificate_rate": 0.12060918693195775,
+      "joint_success_rate": 0.12011790714812086,
+      "tracking": 0.706390784931161,
+      "edge_tracking": 0.7805392870592736,
+      "motor_fail": 0.14089857293833843,
+      "ground_fail": 0.11237607933421227,
+      "sign_fail": 0.0347655223651596,
+      "residual_fail": 0.0062492753034746,
+      "contact_fail": 0.00024790965313340233,
+      "streak": 0
+    },
+    {
+      "iteration": 8150,
+      "episodes": 4073,
+      "phase": 2,
+      "differential": 0.8154726767232316,
+      "episode_certificate_rate": 0.12079548244537196,
+      "joint_success_rate": 0.12079548244537196,
+      "tracking": 0.6976026180857884,
+      "edge_tracking": 0.7716580970394057,
+      "motor_fail": 0.13791031641577173,
+      "ground_fail": 0.1138555530461735,
+      "sign_fail": 0.04832991970842711,
+      "residual_fail": 0.006828677564307242,
+      "contact_fail": 0.0002745177443597312,
+      "streak": 0
+    }
+  ],
+  "iid_illustration_not_fitted_to_run": {
+    "assumption": "Independent equal-probability settled samples, illustration only; not a fitted model of the run",
+    "samples_per_episode": 630,
+    "episode_threshold": 0.9,
+    "required_episode_fraction": 0.85,
+    "sample_probability_for_expected_episode_fraction_085": 0.9109748814185517,
+    "table": [
+      {
+        "sample_probability": 0.8155,
+        "episode_certificate_probability": 3.0849918378652967e-09
+      },
+      {
+        "sample_probability": 0.85,
+        "episode_certificate_probability": 0.0001424528033059329
+      },
+      {
+        "sample_probability": 0.9,
+        "episode_certificate_probability": 0.5334865825743567
+      },
+      {
+        "sample_probability": 0.91,
+        "episode_certificate_probability": 0.8287043795835065
+      },
+      {
+        "sample_probability": 0.92,
+        "episode_certificate_probability": 0.9695876532932837
+      },
+      {
+        "sample_probability": 0.95,
+        "episode_certificate_probability": 0.9999998994337792
+      }
+    ]
+  }
+}

@@ -2,6 +2,8 @@
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
@@ -13,11 +15,30 @@ from rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_skill_noise
 from rl_training.tasks.manager_based.locomotion.velocity.velocity_yaw_env_cfg import EventCfg
 
 from .yaw_env_cfg import VQRWheelYawTerminationsCfg
-from .yaw_env_pos_cfg import VQRWheelFlatEnvPOSCfg, VQRWheelYawPosRewardsCfg
+from .yaw_env_pos_cfg import VQRWheelFlatEnvPOSCfg, VQRWheelYawPosRewardsCfg, POS_SUPPORT_WHEELS, YAW_DEADBAND
 
 
 @configclass
 class VQRWheelYawPosSkillRewardsCfg(VQRWheelYawPosRewardsCfg):
+    motor_participation = RewTerm(
+        func=telemetry.skill_motor_participation, weight=1.0,
+        params={
+            "support_asset_cfg": SceneEntityCfg("robot", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
+            "support_joint_cfg": SceneEntityCfg("robot", joint_names=POS_SUPPORT_WHEELS, preserve_order=True),
+            "support_sensor_cfg": SceneEntityCfg("contact_forces", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
+            "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND, "wheel_radius": 0.091,
+        },
+    )
+    ground_speed_coverage = RewTerm(
+        func=telemetry.skill_ground_speed_coverage, weight=1.0,
+        params={
+            "support_asset_cfg": SceneEntityCfg("robot", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
+            "support_joint_cfg": SceneEntityCfg("robot", joint_names=POS_SUPPORT_WHEELS, preserve_order=True),
+            "support_sensor_cfg": SceneEntityCfg("contact_forces", body_names=POS_SUPPORT_WHEELS, preserve_order=True),
+            "command_name": "yaw_rate_cmd", "deadband": YAW_DEADBAND,
+        },
+    )
+
     def __post_init__(self):
         super().__post_init__()
         # The wrapper only records anchor coverage and returns the original reward.

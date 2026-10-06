@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import asdict, dataclass, field
+from fractions import Fraction
 
 TASK_ID = "Flat-VQR-Wheel-Yaw-POS-Skill"
 CHECKPOINT_KEY = "yaw_pos_skill_curriculum"
@@ -65,6 +66,14 @@ def empty_window():
     return {"episodes": 0, "successes": 0, "passes": dict.fromkeys(EPISODE_GATES, 0), "metrics": {}}
 
 
+def differential_samples_pass(passed_samples, total_samples, threshold=0.90):
+    """Compare raw integer certificate counters without a float32 ratio."""
+    if not math.isfinite(passed_samples) or total_samples <= 0:
+        return False
+    fraction = Fraction(str(threshold))
+    return int(passed_samples) * fraction.denominator >= int(total_samples) * fraction.numerator
+
+
 @dataclass
 class SkillState:
     settings: SkillSettings = field(default_factory=SkillSettings)
@@ -101,8 +110,13 @@ class SkillState:
         if self.pending is not None or self.complete:
             return
         for name, (total, count) in samples.items():
-            row = self.window["metrics"].setdefault(name, [0.0, 0])
-            row[0] += float(total)
+            if name.endswith("_min") and count <= 0:
+                continue
+            row = self.window["metrics"].setdefault(name, [total if name.endswith("_min") else 0, 0])
+            if name.endswith("_min"):
+                row[0] = min(row[0], float(total))
+            else:
+                row[0] += int(total) if name == "differential" else float(total)
             row[1] += int(count)
         # Phase A tests pose acquisition for every completed episode; later
         # phases require active yaw samples before an episode is eligible.
@@ -110,7 +124,11 @@ class SkillState:
             return
         passed = {name: math.isfinite(values.get(name, float("nan")))
                   and values[name] >= threshold
-                  for name, threshold in self.thresholds().items() if name in EPISODE_GATES}
+                  for name, threshold in self.thresholds().items()
+                  if name in EPISODE_GATES and name != "differential_episode"}
+        passed["differential_episode"] = differential_samples_pass(
+            *samples.get("differential", (0, 0)), self.settings.certificate
+        )
         self.window["episodes"] += 1
         for name, value in passed.items():
             self.window["passes"][name] += int(value)
@@ -124,7 +142,8 @@ class SkillState:
 
     def rates(self):
         metrics = self.window["metrics"]
-        result = {k: v[0] / v[1] if v[1] > 0 else 0.0 for k, v in metrics.items()}
+        result = {k: (v[0] if k.endswith("_min") else v[0] / v[1]) if v[1] > 0 else 0.0
+                  for k, v in metrics.items()}
         for name, command, error in (("tracking", "command", "error"),
                                      ("edge_tracking", "edge_command", "edge_error")):
             cmd = metrics.get(command, [0, 0])[0]
@@ -149,7 +168,13 @@ class SkillState:
         counts["edge_tracking"] = self.window["metrics"].get("edge_command", [0, 0])[1]
         for name in WINDOW_GATES:
             value = rates.get(name, 0.0)
-            if enabled[name] and (counts[name] <= 0 or not math.isfinite(value) or value < thresholds[name]):
+            if name == "differential":
+                qualified = differential_samples_pass(
+                    *self.window["metrics"].get(name, (0, 0)), thresholds[name]
+                )
+            else:
+                qualified = counts[name] > 0 and math.isfinite(value) and value >= thresholds[name]
+            if enabled[name] and not qualified:
                 blockers.append(name)
         passed = not blockers
         self.consecutive_passes = min(self.consecutive_passes + 1, self.settings.required_windows) if passed else 0

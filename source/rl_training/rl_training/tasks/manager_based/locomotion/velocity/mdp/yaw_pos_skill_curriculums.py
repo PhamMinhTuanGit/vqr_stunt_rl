@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 
 import torch
 
 from .yaw_pos_skill_state import EPISODE_GATES, WINDOW_GATES, SkillSettings, SkillState
 from .yaw_pos_skill_noise import SkillNoiseModel
+from .yaw_pos_skill_rewards import SUPPORT_COVERAGE_METRICS
 
 
 def get_state(env) -> SkillState:
@@ -102,14 +104,24 @@ def _values(env, ids):
     }
     legacy_count = sample("_yaw_pos_differential_legacy_samples")
     eligible_pair = (diff_samples > 0) & (legacy_count > 0)
-    legacy_diff = sample("_yaw_pos_differential_legacy_sum") / legacy_count.clamp_min(1)
-    certificate = get_state(env).settings.certificate
+    certificate = Fraction(str(get_state(env).settings.certificate))
+    fixed_pass = (sample("_yaw_pos_differential_pass_sum").long() * certificate.denominator
+                  >= diff_samples.long() * certificate.numerator)
+    legacy_pass = (sample("_yaw_pos_differential_legacy_sum").long() * certificate.denominator
+                   >= legacy_count.long() * certificate.numerator)
     metrics["differential_fixed_episode"] = (
-        ((diff >= certificate) & eligible_pair).float(), eligible_pair.long()
+        (fixed_pass & eligible_pair).float(), eligible_pair.long()
     )
     metrics["differential_legacy_episode"] = (
-        ((legacy_diff >= certificate) & eligible_pair).float(), eligible_pair.long()
+        (legacy_pass & eligible_pair).float(), eligible_pair.long()
     )
+    for metric in SUPPORT_COVERAGE_METRICS:
+        base = f"_yaw_pos_skill_{metric}"
+        counts = sample(base + "_samples")
+        metrics[metric + "_mean"] = (sample(base + "_sum"), counts)
+        metrics[metric + "_min"] = (
+            torch.where(counts > 0, sample(base + "_min"), 0.), (counts > 0).long()
+        )
     for metric in ("differential_fl_signed_ratio", "differential_hr_signed_ratio",
                    "differential_any_wrong_sign_pct", "neutral_position_drift", "neutral_planar_speed",
                    "differential_legacy", "differential_settled", "differential_legacy_settled",
@@ -127,6 +139,10 @@ def _clear_episode_buffers(env, ids):
             value[ids] = 0
     if hasattr(env, "_yaw_base_height_min"):
         env._yaw_base_height_min[ids] = torch.inf
+    for metric in SUPPORT_COVERAGE_METRICS:
+        name = f"_yaw_pos_skill_{metric}_min"
+        if hasattr(env, name):
+            getattr(env, name)[ids] = torch.inf
     for name in ("_yaw_pos_active_age", "_yaw_pos_legacy_active_age", "_yaw_pos_neutral_contact_age",
                  "_yaw_pos_neutral_anchored", "_yaw_pos_neutral_anchor"):
         if hasattr(env, name):

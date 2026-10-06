@@ -31,7 +31,7 @@ def episode(yaw=1.0, differential=1.0, neutral=1.0, contact=1.0, anchor=1.0,
               "differential_episode": differential}
     samples = {"command": (0.25, 1), "error": (tracking_error, 1),
                "edge_command": (0.25, 1), "edge_error": (tracking_error, 1),
-               "differential": (differential, 1), "neutral": (neutral, 1),
+               "differential": (round(differential * 100), 100), "neutral": (neutral, 1),
                "four_contact": (contact, 1), "anchor_coverage": (anchor, 1)}
     return values, samples
 
