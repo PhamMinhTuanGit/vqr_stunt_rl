@@ -154,14 +154,17 @@ _YAW_FSM_CURRICULUM_PERSISTENT_FIELDS = (
 
 def _export_yaw_curriculum_state(task_env) -> dict:
     """Serialize scalar yaw-curriculum state without simulator tensors."""
+    term_params = task_env.cfg.curriculum.task_levels.params
+    persistent_fields = _YAW_CURRICULUM_PERSISTENT_FIELDS
+    if term_params.get("certify_behavior", False):
+        persistent_fields = tuple(name for name in vars(task_env) if name.startswith(_YAW_CURRICULUM_PREFIX))
     values = {
         name: getattr(task_env, name)
-        for name in _YAW_CURRICULUM_PERSISTENT_FIELDS
+        for name in persistent_fields
         if hasattr(task_env, name) and isinstance(getattr(task_env, name), (bool, int, float))
     }
     current_step = int(task_env.common_step_counter)
     stage_start_step = int(getattr(task_env, "_yaw_task_curriculum_stage_start_step", current_step))
-    term_params = task_env.cfg.curriculum.task_levels.params
     return {
         "version": 1,
         "values": values,
@@ -179,18 +182,33 @@ def _restore_yaw_curriculum_state(task_env, checkpoint_infos) -> bool:
     if not isinstance(payload, dict) or payload.get("version") != 1:
         return False
     term_params = task_env.cfg.curriculum.task_levels.params
-    if payload.get("yaw_rate_levels") != list(term_params["yaw_rate_levels"]) or payload.get(
-        "dr_scale_levels"
-    ) != list(term_params["dr_scale_levels"]):
+    compatible = True
+    for key in ("yaw_rate_levels", "dr_scale_levels"):
+        saved, current = payload.get(key), list(term_params[key])
+        matches = saved == current
+        if term_params.get("certify_behavior", False) and isinstance(saved, list) and saved:
+            matches = len(saved) <= len(current) and saved == current[:len(saved)]
+        compatible = compatible and matches
+    if not compatible or len(payload["yaw_rate_levels"]) != len(payload["dr_scale_levels"]):
         print("[WARN] Saved yaw curriculum stage table differs from the active config; ignoring saved state.")
         return False
 
     values = payload.get("values")
     if not isinstance(values, dict):
         return False
+    if term_params.get("certify_behavior", False):
+        yaw_stage = values.get("_yaw_task_curriculum_yaw_stage")
+        clearance_stage = values.get("_yaw_task_curriculum_stage")
+        if (type(yaw_stage) is not int or not 0 <= yaw_stage < len(payload["yaw_rate_levels"])
+                or type(clearance_stage) is not int or not 0 <= clearance_stage < len(term_params["clearance_levels"])):
+            return False
     for name, value in values.items():
         if name.startswith(_YAW_CURRICULUM_PREFIX) and isinstance(value, (bool, int, float)):
             setattr(task_env, name, value)
+    if term_params.get("certify_behavior", False) and values.get("_yaw_task_curriculum_behavior_version") != 1:
+        # Old windows did not certify differential motion or neutral holding.
+        # Preserve skill levels and elapsed time, but require fresh passing windows.
+        task_env._yaw_task_curriculum_consecutive_passes = 0
 
     elapsed_steps = max(0, int(payload.get("stage_elapsed_steps", 0)))
     task_env._yaw_task_curriculum_stage_start_step = int(task_env.common_step_counter) - elapsed_steps
@@ -672,7 +690,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(
                 f"[INFO] Restored {task_name} curriculum: "
                 f"clearance_stage={yaw_task_env._yaw_task_curriculum_stage}, "
-                f"yaw_stage={yaw_task_env._yaw_task_curriculum_yaw_stage}."
+                f"yaw_stage={yaw_task_env._yaw_task_curriculum_yaw_stage}, "
+                f"yaw_range={yaw_task_env.command_manager.get_term('yaw_rate_cmd').cfg.yaw_rate_range}, "
+                f"dr_scale={yaw_task_env.cfg.curriculum.task_levels.params['dr_scale_levels'][yaw_task_env._yaw_task_curriculum_yaw_stage]}, "
+                f"stage_elapsed_steps={yaw_task_env.common_step_counter - yaw_task_env._yaw_task_curriculum_stage_start_step}."
             )
         elif agent_cfg.resume:
             print("[WARN] Checkpoint has no yaw curriculum state; starting curriculum from stage zero.")

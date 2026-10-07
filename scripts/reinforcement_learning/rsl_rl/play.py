@@ -159,8 +159,11 @@ def _checkpoint_pos_yaw_limit(checkpoint_path: str, yaw_rate_levels) -> float:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     curriculum = (checkpoint.get("infos") or {}).get("yaw_curriculum") or {}
     stage = curriculum.get("values", {}).get("_yaw_task_curriculum_yaw_stage")
-    if curriculum.get("yaw_rate_levels") == levels and type(stage) is int and 0 <= stage < len(levels):
-        return levels[stage]
+    saved_levels = curriculum.get("yaw_rate_levels")
+    if (isinstance(saved_levels, list) and saved_levels and len(saved_levels) <= len(levels)
+            and saved_levels == levels[:len(saved_levels)]
+            and type(stage) is int and 0 <= stage < len(saved_levels)):
+        return float(saved_levels[stage])
     print("[WARN] POS checkpoint has no matching yaw curriculum stage; using the first training yaw limit.")
     return levels[0]
 

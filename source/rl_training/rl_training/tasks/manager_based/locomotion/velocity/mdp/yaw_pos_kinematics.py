@@ -18,6 +18,40 @@ POS_MOTION_METRICS = (
     "support_fl_rolling_direction_valid", "support_hr_rolling_direction_valid",
 )
 
+POS_DIFFERENTIAL_METRICS = (
+    "differential_fl_target", "differential_hr_target",
+    "differential_fl_measured", "differential_hr_measured",
+    "differential_fl_error", "differential_hr_error",
+    "differential_both_contact", "differential_one_motor_stopped",
+    "differential_valid", "active_com_planar_speed",
+    "differential_pass", "neutral_hold_pass", "neutral_position_drift",
+)
+
+
+def differential_rolling_kinematics(
+    wheel_quaternions: torch.Tensor, wheel_positions: torch.Tensor,
+    wheel_center_velocities: torch.Tensor, com_xy: torch.Tensor, yaw_command: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project desired ground-plane rotation and actual center motion onto each axle's tangent.
+
+    Local +Y is the physical wheel axle. Reversing its convention reverses
+    both signed projections, leaving error/reward unchanged. No motor-axis
+    sign or left/right speed convention is assumed.
+    """
+    axle = rotate_vector(wheel_quaternions, wheel_quaternions.new_tensor((0., 1., 0.)))
+    normal = axle.new_tensor((0., 0., 1.)).expand_as(axle)
+    tangent = torch.linalg.cross(axle, normal, dim=-1)
+    tangent_norm = torch.linalg.vector_norm(tangent, dim=-1)
+    tangent = tangent / tangent_norm.clamp_min(1.0e-6).unsqueeze(-1)
+    offset_xy = wheel_positions[..., :2] - com_xy.unsqueeze(1)
+    target_velocity = torch.stack(
+        (-offset_xy[..., 1], offset_xy[..., 0], torch.zeros_like(offset_xy[..., 0])), dim=-1
+    ) * yaw_command[:, None, None]
+    target = (target_velocity * tangent).sum(dim=-1)
+    measured = (wheel_center_velocities * tangent).sum(dim=-1)
+    valid = (tangent_norm > 1.0e-6) & torch.isfinite(target) & torch.isfinite(measured)
+    return torch.where(valid, target, 0.), torch.where(valid, measured, 0.), valid
+
 
 def _heading_projection(quaternion: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     body_x = rotate_vector(quaternion, quaternion.new_tensor((1., 0., 0.)))

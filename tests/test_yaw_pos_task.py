@@ -315,7 +315,8 @@ def test_new_registration_runner_and_existing_config_are_isolated():
                             "lift_clearance", "com_inside_segment",
                             "heading_support",
                             "gated_yaw_tracking", "lifted_wheel_spin", "neutral_landing_progress",
-                            "four_stand_pose", "four_wheel_contact"}
+                            "four_stand_pose", "four_wheel_contact", "differential_rolling",
+                            "neutral_velocity", "neutral_position", "base_height_deficit", "hipx_deviation"}
 
 
 def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch):
@@ -328,6 +329,8 @@ def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch
     })
     class BaseRewards:
         rolling_slip = baseline_rolling
+        base_height = SimpleNamespace(weight=2., params={"target_height": 0.49, "error_scale": 0.1})
+        lateral_slip = SimpleNamespace(weight=-2.)
         support_span_band = SimpleNamespace(weight=-1.)
     class BaseEnv:
         def __post_init__(self):
@@ -339,6 +342,7 @@ def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch
         POS_SUPPORT_WHEELS=["FL_WHEEL", "HR_WHEEL"], POS_LIFTED_WHEELS=["FR_WHEEL", "HL_WHEEL"],
         ALL_WHEELS=["FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL"], LEG_JOINT_NAMES=[".*"],
         LIFT_CLEARANCE_LEVELS=(0.05,), YAW_RATE_LEVELS=(0.25,), WHEEL_RADIUS=0.091, YAW_REF=1.,
+        TARGET_BASE_HEIGHT=0.49,
     )
     tree = ast.parse((CONFIG / "yaw_env_pos_cfg.py").read_text())
     nodes = [node for node in tree.body if isinstance(node, ast.Assign)
@@ -354,6 +358,8 @@ def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), "POS config", "exec"), namespace)
     cfg = namespace["VQRWheelYawPosRewardsCfg"]()
     cfg.rolling_slip = copy.deepcopy(baseline_rolling)
+    cfg.base_height = copy.deepcopy(BaseRewards.base_height)
+    cfg.lateral_slip = copy.deepcopy(BaseRewards.lateral_slip)
     cfg.__post_init__()
     assert cfg.support_span_band is None
     assert cfg.support_line.func is reward.yaw_pos_support_line
@@ -363,8 +369,13 @@ def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch
     assert cfg.body_angular_xy.weight == -0.1
     assert cfg.body_angular_xy.func is reward.yaw_pos_body_angular_xy_l2
     assert cfg.rolling_slip.func is reward.yaw_pos_rolling_wheel_slip
-    assert cfg.rolling_slip.weight == baseline_rolling.weight
-    assert cfg.rolling_slip.params == {**baseline_rolling.params, "deadband": 0.1}
+    assert cfg.rolling_slip.weight == -2.
+    assert cfg.rolling_slip.params == {**baseline_rolling.params, "deadband": 0.1, "minimum_scale": 0.25}
+    assert cfg.lateral_slip.weight == -4. and BaseRewards.lateral_slip.weight == -2.
+    assert cfg.base_height.weight == 4. and BaseRewards.base_height.weight == 2.
+    assert cfg.base_height.params["target_height"] == 0.49
+    assert cfg.base_height_deficit.weight < 0. and cfg.base_height_deficit.params["minimum_height"] == pytest.approx(0.46)
+    assert cfg.hipx_deviation.weight < 0. and cfg.hipx_deviation.params["asset_cfg"].joint_names == [".*_HipX_joint"]
     assert baseline_rolling.func is not cfg.rolling_slip.func
     env_cfg = namespace["VQRWheelFlatEnvPOSCfg"]()
     obs_cfg = SimpleNamespace(func=object(), params={"wheel_radius": 0.091}, scale=1.)
@@ -450,7 +461,8 @@ def test_new_diagnostics_normalize_active_samples_and_clear_only_reset_rows(monk
         get_term_cfg=lambda name: reward_configs[name],
         set_term_cfg=lambda name, cfg: reward_configs.__setitem__(name, cfg),
     ))
-    metrics = ("support_line_error", "wheel1_line_error", "wheel2_line_error", "support_y_separation", "rolling_error")
+    metrics = ("support_line_error", "wheel1_line_error", "wheel2_line_error", "support_y_separation", "rolling_error",
+               "base_height", "low_speed_base_height", "low_speed_height_deficit", "hipx_abs_error")
     for index, metric in enumerate(metrics, 1):
         setattr(env, f"_yaw_pos_{metric}_sum", torch.tensor([index * 0.2, 9.]))
         setattr(env, f"_yaw_pos_{metric}_samples", torch.tensor([2, 3]))
@@ -613,7 +625,12 @@ def test_pos_resume_restores_and_installs_yaw_curriculum_checkpoint_hook():
     selection = next(node.value for node in main.body if isinstance(node, ast.Assign)
                      and any(isinstance(target, ast.Name) and target.id == "yaw_task_env"
                              for target in node.targets))
-    task_env = SimpleNamespace(_yaw_task_curriculum_stage=2, _yaw_task_curriculum_yaw_stage=1)
+    task_env = SimpleNamespace(
+        _yaw_task_curriculum_stage=2, _yaw_task_curriculum_yaw_stage=1,
+        common_step_counter=100, _yaw_task_curriculum_stage_start_step=0,
+        command_manager=SimpleNamespace(get_term=lambda _: SimpleNamespace(cfg=SimpleNamespace(yaw_rate_range=(0., .4)))),
+        cfg=SimpleNamespace(curriculum=SimpleNamespace(task_levels=SimpleNamespace(params={"dr_scale_levels": (.3, .4)}))),
+    )
     env = SimpleNamespace(unwrapped=task_env)
     task_name = "Flat-VQR-Wheel-Yaw-POS"
     selected = eval(compile(ast.Expression(selection), str(train), "eval"),
