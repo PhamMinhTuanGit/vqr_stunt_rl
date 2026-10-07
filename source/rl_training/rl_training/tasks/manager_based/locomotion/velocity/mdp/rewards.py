@@ -20,6 +20,7 @@ from isaaclab.utils.math import euler_xyz_from_quat, quat_apply_inverse, yaw_qua
 
 from .fsm_gates import fsm_gates
 from .fsm import select_swing_wheel_contact
+from .wheel_contact_kinematics import wheel_center_positions, wheel_ground_clearance
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -212,7 +213,7 @@ def _yaw_support_geometry(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return CoM distance to the support line, projection coordinate, and segment length."""
     asset: Articulation = env.scene[asset_cfg.name]
-    support_xy = asset.data.body_pos_w[:, asset_cfg.body_ids, :2]
+    support_xy = wheel_center_positions(asset, asset_cfg.body_ids)[..., :2]
     if support_xy.shape[1] != 2:
         raise ValueError("Yaw support rewards require exactly two ordered support wheel bodies.")
 
@@ -439,9 +440,8 @@ def _yaw_lift_progress(
         raise ValueError("target_clearance must be positive.")
 
     asset: Articulation = env.scene[asset_cfg.name]
-    wheel_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
     ground_height = env.scene.env_origins[:, 2].unsqueeze(-1)
-    clearance = wheel_height - ground_height - wheel_radius
+    clearance = wheel_ground_clearance(asset, asset_cfg.body_ids, wheel_radius, ground_height)
     return torch.clamp(clearance / target_clearance, min=0.0, max=1.0)
 
 

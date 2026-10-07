@@ -14,6 +14,36 @@ def rotate_vector(quaternion: torch.Tensor, vector: torch.Tensor) -> torch.Tenso
     )
 
 
+def wheel_center_positions(asset, body_ids) -> torch.Tensor:
+    """Collision-center positions; legacy assets without POS geometry use link origins."""
+    positions = asset.data.body_pos_w[:, body_ids]
+    offsets = getattr(asset, "_yaw_pos_wheel_center_offsets", None)
+    if offsets is None:
+        return positions
+    return positions + rotate_vector(asset.data.body_quat_w[:, body_ids], offsets[body_ids])
+
+
+def wheel_center_velocities(asset, body_ids) -> torch.Tensor:
+    velocities = asset.data.body_link_lin_vel_w[:, body_ids]
+    offsets = getattr(asset, "_yaw_pos_wheel_center_offsets", None)
+    if offsets is None:
+        return velocities
+    offset_w = rotate_vector(asset.data.body_quat_w[:, body_ids], offsets[body_ids])
+    return velocities + torch.linalg.cross(asset.data.body_ang_vel_w[:, body_ids], offset_w, dim=-1)
+
+
+def wheel_ground_clearance(asset, body_ids, wheel_radius: float, ground_height) -> torch.Tensor:
+    """Vertical tire extent includes axle tilt and finite cylinder width for POS assets."""
+    centers = wheel_center_positions(asset, body_ids)
+    widths = getattr(asset, "_yaw_pos_wheel_half_widths", None)
+    extent = wheel_radius
+    if widths is not None:
+        axle = rotate_vector(asset.data.body_quat_w[:, body_ids], centers.new_tensor((0., 1., 0.)))
+        axial_z = axle[..., 2].abs().clamp_max(1.)
+        extent = wheel_radius * (1. - axial_z.square()).clamp_min(0.).sqrt() + widths[body_ids] * axial_z
+    return centers[..., 2] - ground_height - extent
+
+
 def wheel_contact_velocities(
     orientation_w: torch.Tensor,
     center_velocity_w: torch.Tensor,
@@ -58,16 +88,17 @@ def contacted_wheel_velocities(
 
     Keep the joint selection for configuration compatibility and order-length
     validation; actual wheel angular velocity is read from the rigid body.
-    The wheel link origin is its geometric center, so use link velocity rather
-    than CoM velocity (Isaac Lab's body_lin_vel_w aliases CoM velocity).
+    Start from link velocity rather than CoM velocity and add the POS collider
+    offset contribution (Isaac Lab's body_lin_vel_w aliases CoM velocity).
     """
     if len({len(body_asset_cfg.body_ids), len(joint_asset_cfg.joint_ids), len(sensor_cfg.body_ids)}) != 1:
         raise ValueError("Wheel body, joint, and contact-sensor selections must have equal length.")
-    data = env.scene[body_asset_cfg.name].data
+    asset = env.scene[body_asset_cfg.name]
+    data = asset.data
     sensor = env.scene.sensors[sensor_cfg.name]
     velocities = wheel_contact_velocities(
         data.body_quat_w[:, body_asset_cfg.body_ids],
-        data.body_link_lin_vel_w[:, body_asset_cfg.body_ids],
+        wheel_center_velocities(asset, body_asset_cfg.body_ids),
         data.body_ang_vel_w[:, body_asset_cfg.body_ids],
         wheel_radius,
     )

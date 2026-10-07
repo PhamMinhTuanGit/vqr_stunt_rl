@@ -23,7 +23,7 @@ class EntityCfg:
     def __init__(self, name, body_names=None, joint_names=None, **_):
         self.name = name
         self.body_names = body_names
-        wheel_index = {"FL_WHEEL": 0, "FR_WHEEL": 1, "HL_WHEEL": 2, "HR_WHEEL": 3}
+        wheel_index = {"FL_WHEEL": 0, "FR_WHEEL": 1, "HL_WHEEL": 2, "HR_WHEEL": 3, "FL_SHANK": 4, "HR_SHANK": 5}
         self.body_ids = [wheel_index[body] for body in body_names] if isinstance(body_names, list) else []
         self.joint_names = joint_names
         self.joint_ids = list(range(12)) if joint_names else []
@@ -112,7 +112,8 @@ def test_diagonal_line_through_com_does_not_enforce_body_y_alignment(monkeypatch
     baseline_path = MDP / "rewards.py"
     geometry_node = next(node for node in ast.parse(baseline_path.read_text()).body
                          if isinstance(node, ast.FunctionDef) and node.name == "_yaw_support_geometry")
-    geometry_namespace = {"torch": torch, "_yaw_whole_body_com_xy": lambda asset: asset.data.whole_body_com_xy}
+    geometry_namespace = {"torch": torch, "_yaw_whole_body_com_xy": lambda asset: asset.data.whole_body_com_xy,
+                          "wheel_center_positions": reward.wheel_center_positions}
     future_annotations = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     geometry_module = ast.fix_missing_locations(ast.Module(body=[future_annotations, geometry_node], type_ignores=[]))
     exec(compile(geometry_module, str(baseline_path), "exec"),
@@ -316,7 +317,7 @@ def test_new_registration_runner_and_existing_config_are_isolated():
                             "heading_support",
                             "gated_yaw_tracking", "lifted_wheel_spin", "neutral_landing_progress",
                             "four_stand_pose", "four_wheel_contact", "differential_rolling",
-                            "neutral_velocity", "neutral_position", "base_height_deficit", "hipx_deviation"}
+                            "neutral_velocity", "neutral_position", "base_height_deficit", "hipx_deviation", "planar_velocity"}
 
 
 def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch):
@@ -332,6 +333,7 @@ def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch
         base_height = SimpleNamespace(weight=2., params={"target_height": 0.49, "error_scale": 0.1})
         lateral_slip = SimpleNamespace(weight=-2.)
         support_span_band = SimpleNamespace(weight=-1.)
+        action_rate = SimpleNamespace(func=object())
     class BaseEnv:
         def __post_init__(self):
             self.parent_initialized = True
@@ -339,6 +341,8 @@ def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch
         RewTerm=SimpleNamespace, SceneEntityCfg=EntityCfg,
         VQRWheelRewardsCfg=BaseRewards, VQRWheelFlatEnvCfg=BaseEnv,
         pos_rewards=reward, wheel_contact_kinematics=helper,
+        pos_actions=SimpleNamespace(applied_target_rate_l2=object()),
+        configure_pos_asset=lambda cfg: None,
         POS_SUPPORT_WHEELS=["FL_WHEEL", "HR_WHEEL"], POS_LIFTED_WHEELS=["FR_WHEEL", "HL_WHEEL"],
         ALL_WHEELS=["FL_WHEEL", "FR_WHEEL", "HL_WHEEL", "HR_WHEEL"], LEG_JOINT_NAMES=[".*"],
         LIFT_CLEARANCE_LEVELS=(0.05,), YAW_RATE_LEVELS=(0.25,), WHEEL_RADIUS=0.091, YAW_REF=1.,
@@ -346,7 +350,7 @@ def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch
     )
     tree = ast.parse((CONFIG / "yaw_env_pos_cfg.py").read_text())
     nodes = [node for node in tree.body if isinstance(node, ast.Assign)
-             and node.targets[0].id in ("YAW_DEADBAND", "SUPPORT_LINE_SIGMA", "SUPPORT_Y_MIN_SEPARATION", "SUPPORT_Y_COLLAPSE_SCALE")]
+             and node.targets[0].id in ("YAW_DEADBAND", "POS_YAW_HEIGHT", "SUPPORT_LINE_SIGMA", "SUPPORT_Y_MIN_SEPARATION", "SUPPORT_Y_COLLAPSE_SCALE")]
     for name in ("VQRWheelYawPosRewardsCfg", "VQRWheelFlatEnvPOSCfg"):
         node = copy.deepcopy(next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name))
         node.decorator_list = []
@@ -360,11 +364,12 @@ def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch
     cfg.rolling_slip = copy.deepcopy(baseline_rolling)
     cfg.base_height = copy.deepcopy(BaseRewards.base_height)
     cfg.lateral_slip = copy.deepcopy(BaseRewards.lateral_slip)
+    cfg.action_rate = copy.deepcopy(BaseRewards.action_rate)
     cfg.__post_init__()
     assert cfg.support_span_band is None
     assert cfg.support_line.func is reward.yaw_pos_support_line
     assert cfg.support_line.weight == 1. and cfg.support_line.params["sigma"] == 0.20
-    assert cfg.support_y_collapse.weight == -0.25 and cfg.support_y_collapse.params["minimum_separation"] == 0.45
+    assert cfg.support_y_collapse.weight == -0.25 and cfg.support_y_collapse.params["minimum_separation"] == 0.20
     assert cfg.support_y_collapse.params["separation_scale"] == 0.05
     assert cfg.body_angular_xy.weight == -0.1
     assert cfg.body_angular_xy.func is reward.yaw_pos_body_angular_xy_l2
@@ -372,7 +377,11 @@ def test_pos_config_disables_inherited_span_and_wires_shared_rolling(monkeypatch
     assert cfg.rolling_slip.weight == -2.
     assert cfg.rolling_slip.params == {**baseline_rolling.params, "deadband": 0.1, "minimum_scale": 0.25}
     assert cfg.lateral_slip.weight == -4. and BaseRewards.lateral_slip.weight == -2.
-    assert cfg.base_height.weight == 4. and BaseRewards.base_height.weight == 2.
+    assert cfg.base_height.weight == 6. and BaseRewards.base_height.weight == 2.
+    assert cfg.base_height.params["active_target_height"] == 0.455
+    assert cfg.base_height_deficit.params["active_minimum_height"] == pytest.approx(0.44)
+    assert cfg.differential_rolling.params["speed_std"] == 0.015
+    assert cfg.differential_rolling.params["certification_speed_std"] == 0.05
     assert cfg.base_height.params["target_height"] == 0.49
     assert cfg.base_height_deficit.weight < 0. and cfg.base_height_deficit.params["minimum_height"] == pytest.approx(0.46)
     assert cfg.hipx_deviation.weight < 0. and cfg.hipx_deviation.params["asset_cfg"].joint_names == [".*_HipX_joint"]

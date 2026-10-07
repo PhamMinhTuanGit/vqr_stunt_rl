@@ -105,7 +105,8 @@ def yaw_pos_task_levels(
                 getattr(env, name)[selected] = 0
     # Episode-local dwell and position anchors never survive an environment reset.
     for name in ("_yaw_pos_active_age", "_yaw_pos_neutral_contact_age",
-                 "_yaw_pos_neutral_anchored", "_yaw_pos_neutral_anchor"):
+                 "_yaw_pos_neutral_anchored", "_yaw_pos_neutral_anchor",
+                 "_yaw_pos_active_anchored", "_yaw_pos_active_anchor"):
         if hasattr(env, name):
             getattr(env, name)[selected] = 0
     result.update(diagnostics)

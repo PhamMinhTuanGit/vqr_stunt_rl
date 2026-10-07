@@ -6,7 +6,7 @@ are in world coordinates. These helpers do not depend on Isaac Sim.
 
 import torch
 
-from .wheel_contact_kinematics import rotate_vector
+from .wheel_contact_kinematics import rotate_vector, wheel_center_velocities
 
 
 POS_MOTION_METRICS = (
@@ -25,6 +25,8 @@ POS_DIFFERENTIAL_METRICS = (
     "differential_both_contact", "differential_one_motor_stopped",
     "differential_valid", "active_com_planar_speed",
     "differential_pass", "neutral_hold_pass", "neutral_position_drift",
+    "differential_fl_motor_error", "differential_hr_motor_error",
+    "active_com_position_drift", "active_base_height_deficit", "active_yaw_tracking_error",
 )
 
 
@@ -116,7 +118,7 @@ def yaw_pos_motion_telemetry(robot, support_body_ids, support_joint_ids) -> dict
     tangent_norm = torch.linalg.vector_norm(tangent, dim=-1)
     tangent = tangent / tangent_norm.clamp_min(1.0e-6).unsqueeze(-1)
     rolling_valid = tangent_norm > 1.0e-6
-    ground_speeds = (data.body_link_lin_vel_w[:, support_body_ids] * tangent).sum(dim=-1)
+    ground_speeds = (wheel_center_velocities(robot, support_body_ids) * tangent).sum(dim=-1)
     ground_speeds = torch.where(rolling_valid, ground_speeds, 0.)
     return {
         "true_heading_rate": heading_rate, "heading_rate_valid": valid.float(),

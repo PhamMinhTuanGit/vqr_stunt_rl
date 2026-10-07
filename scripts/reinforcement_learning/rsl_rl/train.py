@@ -105,6 +105,7 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 """Rest everything follows."""
 
 import gymnasium as gym
+import json
 import torch
 from datetime import datetime
 
@@ -125,6 +126,9 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import rl_training.tasks  # noqa: F401
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.fsm import YawFSMCommand
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_contract import (
+    initialize_pos_exploration, validate_pos_checkpoint,
+)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -233,6 +237,9 @@ def _install_yaw_curriculum_checkpointing(runner: OnPolicyRunner, task_env) -> N
         if infos is not None and not isinstance(infos, dict):
             checkpoint_infos["runner_infos"] = infos
         checkpoint_infos[_YAW_CURRICULUM_CHECKPOINT_KEY] = _export_yaw_curriculum_state(task_env)
+        contract = getattr(getattr(task_env, "cfg", None), "yaw_pos_contract", None)
+        if contract is not None:
+            checkpoint_infos["yaw_pos_contract"] = contract
         original_save(path, checkpoint_infos)
 
     runner.save = save_with_yaw_curriculum
@@ -661,6 +668,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # convert config to dict and create runner
     train_cfg = agent_cfg.to_dict()
     runner = OnPolicyRunner(env, train_cfg, log_dir=log_dir, device=agent_cfg.device)
+    pos_contract = getattr(env_cfg, "yaw_pos_contract", None)
+    if pos_contract is not None:
+        if args_cli.pos_adaptation_checkpoint:
+            validate_pos_checkpoint(args_cli.pos_adaptation_checkpoint, pos_contract)
+        elif agent_cfg.resume:
+            validate_pos_checkpoint(resume_path, pos_contract)
+        else:
+            initialize_pos_exploration(runner.alg.policy, agent_cfg.initial_leg_std, agent_cfg.initial_wheel_std)
     
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
@@ -736,6 +751,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+    if pos_contract is not None:
+        with open(os.path.join(log_dir, "params", "yaw_pos_contract.json"), "w", encoding="utf-8") as stream:
+            json.dump(pos_contract, stream, indent=2)
     
     # run training
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)

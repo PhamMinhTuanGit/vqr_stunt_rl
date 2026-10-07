@@ -14,7 +14,7 @@ from .rewards import (
     _yaw_wheel_contacts,
     yaw_support_contact,
 )
-from .wheel_contact_kinematics import contacted_wheel_velocities
+from .wheel_contact_kinematics import contacted_wheel_velocities, rotate_vector, wheel_center_positions, wheel_center_velocities
 from .yaw_pos_kinematics import (
     differential_rolling_kinematics, ground_heading_axes, ground_heading_yaw_rate, yaw_pos_motion_telemetry,
 )
@@ -40,11 +40,12 @@ def yaw_pos_base_height_deficit_l2(
     env, command_name: str, minimum_height: float, error_scale: float = 0.05,
     low_speed_yaw: float = 0.5, low_speed_multiplier: float = 2.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    active_minimum_height: float | None = None, deadband: float = 0.1,
 ) -> torch.Tensor:
-    """Penalize crouching before the safety floor, with extra cost at low requested yaw.
+    """Penalize crouching above the safety floor, with optional mode-specific minima.
 
-    Use command speed so the policy cannot reduce this cost by spinning faster.
-    Neutral and active commands share a continuous cost across the deadband.
+    The POS configuration uses a constant multiplier at every commanded speed.
+    Legacy callers retain the optional extra cost at low requested yaw.
     """
     if error_scale <= 0.0 or low_speed_yaw <= 0.0:
         raise ValueError("Height error_scale and low_speed_yaw must be positive.")
@@ -54,28 +55,53 @@ def yaw_pos_base_height_deficit_l2(
     height = data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
     command = env.command_manager.get_command(command_name)[:, 0].abs()
     low_speed = (1.0 - command / low_speed_yaw).clamp(0.0, 1.0)
-    deficit = (minimum_height - height).clamp_min(0.0)
+    minimum = torch.full_like(height, minimum_height)
+    if active_minimum_height is not None:
+        minimum = torch.where(command > deadband, active_minimum_height, minimum)
+    deficit = (minimum - height).clamp_min(0.0)
     all_envs = torch.ones_like(command, dtype=torch.bool)
     _accumulate(env, "_yaw_pos_base_height", height, all_envs)
     _accumulate(env, "_yaw_pos_low_speed_base_height", height, command < low_speed_yaw)
     _accumulate(env, "_yaw_pos_low_speed_height_deficit", deficit, command < low_speed_yaw)
+    _accumulate(env, "_yaw_pos_active_base_height_deficit", deficit, command > deadband)
+    env._yaw_pos_active_base_height_deficit = deficit.detach().clone()
     return (1.0 + (low_speed_multiplier - 1.0) * low_speed) * (deficit / error_scale).square()
 
 
-def yaw_pos_hipx_deviation_l2(env, asset_cfg: SceneEntityCfg, std: float = 0.15) -> torch.Tensor:
+def yaw_pos_hipx_deviation_l2(env, asset_cfg: SceneEntityCfg, std: float = 0.15, free_angle: float = 0.0) -> torch.Tensor:
     """Soft cost for HipX abduction in both modes, around the nominal joint pose."""
-    if std <= 0.0:
-        raise ValueError("HipX std must be positive.")
+    if std <= 0.0 or free_angle < 0.0:
+        raise ValueError("HipX std must be positive and free_angle nonnegative.")
     data = env.scene[asset_cfg.name].data
     error = data.joint_pos[:, asset_cfg.joint_ids] - data.default_joint_pos[:, asset_cfg.joint_ids]
     _accumulate(env, "_yaw_pos_hipx_abs_error", error.abs().mean(dim=1),
                 torch.ones(error.shape[0], dtype=torch.bool, device=error.device))
-    return (error / std).square().mean(dim=1)
+    return ((error.abs() - free_angle).clamp_min(0.) / std).square().mean(dim=1)
+
+
+def yaw_pos_base_height_tracking(
+    env, target_height: float, error_scale: float, command_name: str, deadband: float,
+    active_target_height: float | None = None, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Mode-dependent finite height target, preserving the existing curriculum height minimum."""
+    _, active, _ = yaw_pos_masks(env, command_name, deadband)
+    height = env.scene[asset_cfg.name].data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    if error_scale <= 0.:
+        raise ValueError("Height error_scale must be positive.")
+    if not hasattr(env, "_yaw_base_height_min"):
+        env._yaw_base_height_min = torch.full_like(height, torch.inf)
+    env._yaw_base_height_min = torch.minimum(env._yaw_base_height_min, height)
+    target = torch.full_like(height, target_height)
+    if active_target_height is not None:
+        target = torch.where(active, active_target_height, target)
+    error = (height - target).abs() / error_scale
+    return 1. - torch.where(error <= 1., .5 * error.square(), error - .5)
 
 
 def differential_rolling_score(
     target: torch.Tensor, measured: torch.Tensor, rolling_residual: torch.Tensor,
     motor_fraction: torch.Tensor, scale: torch.Tensor, minimum_speed_fraction: float,
+    motor_rolling_speed: torch.Tensor | None = None, motor_tracking_weight: float = 1.0,
 ) -> torch.Tensor:
     """Dense [0, 1] shaping with the worse wheel controlling each component.
 
@@ -89,7 +115,10 @@ def differential_rolling_score(
     tracking_cost = (torch.sqrt(1. + ((measured - target) / scale).square()) - 1.).amax(dim=1)
     rolling_cost = (torch.sqrt(1. + (rolling_residual / scale).square()) - 1.).amax(dim=1)
     participation = (motor_fraction / minimum_speed_fraction).clamp(0., 1.).amin(dim=1)
-    return 1. / (1. + tracking_cost + rolling_cost + 2. * (1. - participation))
+    motor_cost = 0.
+    if motor_rolling_speed is not None:
+        motor_cost = motor_tracking_weight * (torch.sqrt(1. + ((motor_rolling_speed - target) / scale).square()) - 1.).amax(dim=1)
+    return 1. / (1. + tracking_cost + rolling_cost + motor_cost + 2. * (1. - participation))
 
 
 def yaw_pos_differential_rolling(
@@ -97,6 +126,8 @@ def yaw_pos_differential_rolling(
     support_sensor_cfg: SceneEntityCfg, command_name: str, deadband: float, wheel_radius: float,
     contact_threshold: float = 1.0, relative_std: float = 0.25, speed_std: float = 0.05,
     minimum_speed_fraction: float = 0.5, settle_time: float = 0.5,
+    certification_speed_std: float | None = None, motor_tracking_weight: float = 0.0,
+    support_parent_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Shape both-wheel rolling densely; retain the strict settled certificate."""
     if wheel_radius <= 0 or relative_std <= 0 or speed_std <= 0 or settle_time < 0:
@@ -108,8 +139,8 @@ def yaw_pos_differential_rolling(
     data = robot.data
     target, measured, valid = differential_rolling_kinematics(
         data.body_quat_w[:, support_asset_cfg.body_ids],
-        data.body_pos_w[:, support_asset_cfg.body_ids],
-        data.body_link_lin_vel_w[:, support_asset_cfg.body_ids],
+        wheel_center_positions(robot, support_asset_cfg.body_ids),
+        wheel_center_velocities(robot, support_asset_cfg.body_ids),
         _yaw_whole_body_com_xy(robot), command,
     )
     motor_speed = data.joint_vel[:, support_joint_cfg.joint_ids].abs()
@@ -119,19 +150,31 @@ def yaw_pos_differential_rolling(
     _, _, heading_valid = ground_heading_axes(data.root_quat_w)
     valid = valid & heading_valid[:, None] & (target.abs() > 1.0e-4)
     scale = (relative_std * target.abs()).clamp_min(speed_std)
+    certificate_scale = (relative_std * target.abs()).clamp_min(
+        speed_std if certification_speed_std is None else certification_speed_std
+    )
     # Only magnitude participates: qdot sign depends on the joint convention.
     motor_fraction = wheel_radius * motor_speed / target.abs().clamp_min(1.0e-4)
     residual, _ = contacted_wheel_velocities(
         env, support_sensor_cfg, support_asset_cfg, support_joint_cfg, wheel_radius, contact_threshold
     )
+    motor_rolling = None
+    if motor_tracking_weight > 0.:
+        if support_parent_cfg is None:
+            raise ValueError("Signed motor tracking requires ordered parent shank bodies.")
+        body_ids = support_asset_cfg.body_ids
+        signs = robot._yaw_pos_wheel_motor_axis_signs[body_ids]
+        axle = rotate_vector(data.body_quat_w[:, body_ids], target.new_tensor((0., 1., 0.)))
+        parent_spin = (data.body_ang_vel_w[:, support_parent_cfg.body_ids] * axle).sum(dim=-1)
+        motor_rolling = wheel_radius * (signs * data.joint_vel[:, support_joint_cfg.joint_ids] + parent_spin)
     score = differential_rolling_score(target, measured, residual[..., 0], motor_fraction,
-                                       scale, minimum_speed_fraction)
+                                       scale, minimum_speed_fraction, motor_rolling, motor_tracking_weight)
     score *= (valid & contacts).all(dim=1)
     passing = (
         valid & contacts & (measured * target > 0.)
         & (measured.abs() >= minimum_speed_fraction * target.abs())
         & (motor_fraction >= minimum_speed_fraction)
-        & (residual[..., 0].abs() <= scale)
+        & (residual[..., 0].abs() <= certificate_scale)
     ).all(dim=1)
     if not hasattr(env, "_yaw_pos_active_age"):
         env._yaw_pos_active_age = torch.zeros_like(command)
@@ -154,11 +197,45 @@ def yaw_pos_differential_rolling(
         "differential_valid": valid.all(1).float(),
         "active_com_planar_speed": torch.linalg.vector_norm(com_velocity[:, :2], dim=1),
     }
+    if motor_rolling is not None:
+        metrics.update(differential_fl_motor_error=(motor_rolling[:, 0] - target[:, 0]).abs(),
+                       differential_hr_motor_error=(motor_rolling[:, 1] - target[:, 1]).abs())
     for name, value in metrics.items():
         _accumulate(env, f"_yaw_pos_{name}", value, active)
     env._yaw_pos_differential_metrics_current = {name: value.detach().clone() for name, value in metrics.items()}
     env._yaw_pos_differential_metrics_current["differential_pass"] = (settled & passing).detach().clone()
     return torch.where(active, score, 0.)
+
+
+def yaw_pos_active_translation(
+    env, command_name: str, deadband: float, speed_scale: float = 0.10, drift_scale: float = 0.05,
+    settle_time: float = 0.5, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Settled CoM speed/drift cost; acquisition remains free to recover its balance."""
+    if min(speed_scale, drift_scale) <= 0. or settle_time < 0.:
+        raise ValueError("Translation scales must be positive and settle_time nonnegative.")
+    _, active, _ = yaw_pos_masks(env, command_name, deadband)
+    robot = env.scene[asset_cfg.name]
+    com = _yaw_whole_body_com_xy(robot)
+    masses = robot.root_physx_view.get_masses().to(com.device)
+    velocity = (robot.data.body_com_lin_vel_w * masses[..., None]).sum(1) / masses.sum(1).clamp_min(1.e-6)[:, None]
+    speed = torch.linalg.vector_norm(velocity[:, :2], dim=-1)
+    age = getattr(env, "_yaw_pos_active_age", torch.zeros_like(speed))
+    settled = active & (age + 1.e-6 >= settle_time)
+    if not hasattr(env, "_yaw_pos_active_anchor"):
+        env._yaw_pos_active_anchor = torch.zeros_like(com)
+        env._yaw_pos_active_anchored = torch.zeros_like(active)
+    reset = (~active) | (env.episode_length_buf <= 1)
+    env._yaw_pos_active_anchored[reset] = False
+    latch = settled & ~env._yaw_pos_active_anchored
+    env._yaw_pos_active_anchor[latch] = com[latch]
+    env._yaw_pos_active_anchored |= latch
+    drift = torch.linalg.vector_norm(com - env._yaw_pos_active_anchor, dim=-1)
+    _accumulate(env, "_yaw_pos_active_com_position_drift", drift, settled)
+    env._yaw_pos_active_com_position_drift = torch.where(settled, drift, 0.).detach().clone()
+    cost = torch.sqrt(1. + (speed / speed_scale).square()) - 1.
+    cost += .5 * (torch.sqrt(1. + (drift / drift_scale).square()) - 1.)
+    return torch.where(settled, cost, 0.)
 
 
 def yaw_pos_neutral_velocity(
@@ -229,7 +306,7 @@ def _yaw_pos_heading_support_geometry(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """FL/HR x offsets from whole-body CoM and line alignment in the yaw-only heading frame."""
     robot = env.scene[asset_cfg.name]
-    support_xy = robot.data.body_pos_w[:, asset_cfg.body_ids, :2]
+    support_xy = wheel_center_positions(robot, asset_cfg.body_ids)[..., :2]
     if support_xy.shape[1] != 2:
         raise ValueError("POS heading geometry requires ordered FL and HR support wheels.")
 
@@ -283,7 +360,7 @@ def _yaw_pos_support_line_geometry(
     Wheel order is FL, HR in the POS configuration.
     """
     robot = env.scene[asset_cfg.name]
-    support_positions = robot.data.body_pos_w[:, asset_cfg.body_ids]
+    support_positions = wheel_center_positions(robot, asset_cfg.body_ids)
     if support_positions.shape[1] != 2:
         raise ValueError("POS support line geometry requires exactly two ordered support wheels.")
     masses = robot.root_physx_view.get_masses().to(robot.device)
@@ -431,6 +508,7 @@ def yaw_pos_gated_tracking(
     neutral_std: float | None = None,
     support_asset_cfg: SceneEntityCfg | None = None,
     support_joint_cfg: SceneEntityCfg | None = None,
+    tracking_relative_std: float | None = None, tracking_min_std: float = 0.04,
 ) -> torch.Tensor:
     command, active, neutral = yaw_pos_masks(env, command_name, deadband)
     robot = env.scene[asset_cfg.name]
@@ -438,8 +516,13 @@ def yaw_pos_gated_tracking(
     support = yaw_support_contact(env, support_sensor_cfg, contact_threshold)
     lift = _yaw_lift_progress(env, lifted_asset_cfg, wheel_radius, target_clearance).mean(dim=1)
     clearance_weight = clearance_gate_floor + (1.0 - clearance_gate_floor) * lift
-    tracking = torch.exp(-(yaw_rate - command).square() / std**2) * heading_valid
+    if std <= 0. or tracking_min_std <= 0. or (tracking_relative_std is not None and tracking_relative_std <= 0.):
+        raise ValueError("Yaw tracking std values must be positive.")
+    reward_std = std if tracking_relative_std is None else (command.abs() * tracking_relative_std).clamp_min(tracking_min_std)
+    tracking = torch.exp(-(yaw_rate - command).square() / reward_std**2) * heading_valid
     active_score = support * clearance_weight * tracking
+    # The existing promotion score retains its fixed std; only PPO shaping changes.
+    certification_score = support * clearance_weight * torch.exp(-(yaw_rate - command).square() / std**2) * heading_valid
     neutral_score = torch.exp(-yaw_rate.square() / (std if neutral_std is None else neutral_std) ** 2) * heading_valid
 
     if support_asset_cfg is not None and support_joint_cfg is not None:
@@ -451,7 +534,9 @@ def yaw_pos_gated_tracking(
 
     _accumulate(env, "_yaw_support_score", support, active)
     _accumulate(env, "_yaw_gate_open", support, active)
-    _accumulate(env, "_yaw_active_yaw_score", active_score, active)
+    _accumulate(env, "_yaw_active_yaw_score", certification_score, active)
+    _accumulate(env, "_yaw_pos_active_yaw_tracking_error", (yaw_rate - command).abs(), active)
+    env._yaw_pos_active_yaw_tracking_error = (yaw_rate - command).abs().detach().clone()
     _accumulate(env, "_yaw_command_abs", command.abs(), active)
     _accumulate(env, "_yaw_rate_abs_error", (yaw_rate - command).abs(), active)
     # Existing curriculum expects one common sample count for command/error.

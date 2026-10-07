@@ -46,10 +46,11 @@ def test_pos_entropy_is_unchanged_and_resume_logging_follows_load():
                and node.name == "VQRWheelYawFlatPOSPPORunnerCfg")
     assignments = {
         ast.unparse(node.targets[0]): ast.literal_eval(node.value)
-        for node in ast.walk(pos) if isinstance(node, ast.Assign)
+        for node in ast.walk(pos) if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
     }
     assert assignments["self.algorithm.entropy_coef"] == 0.0025
-    assert "self.policy.init_noise_std" not in assignments
+    assert "self.policy.init_noise_std = self.initial_leg_std" in ast.unparse(pos)
+    assert assignments["self.max_iterations"] == 60000
     assert "self.algorithm.entropy_coef" not in ast.unparse(next(
         node for node in tree.body if isinstance(node, ast.ClassDef)
         and node.name == "VQRWheelYawFlatPPORunnerCfg"

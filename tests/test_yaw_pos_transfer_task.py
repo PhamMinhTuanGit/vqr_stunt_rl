@@ -133,6 +133,9 @@ def modules(monkeypatch):
     # Execute the real reward functions without importing simulator extensions.
     baseline = types.ModuleType("transfer_test_mdp.rewards")
     baseline.__dict__.update(torch=torch, math=math, SceneEntityCfg=Entity)
+    wheel_helpers = load_module(monkeypatch, "transfer_test_mdp.wheel_contact_kinematics", MDP / "wheel_contact_kinematics.py")
+    baseline.__dict__.update(wheel_center_positions=wheel_helpers.wheel_center_positions,
+                             wheel_ground_clearance=wheel_helpers.wheel_ground_clearance)
     baseline.math_utils = NS(
         euler_xyz_from_quat=lambda q: (torch.zeros(len(q)), torch.zeros(len(q)), torch.zeros(len(q))),
         wrap_to_pi=lambda x: x,

@@ -53,7 +53,9 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import rl_training.tasks  # noqa: F401 - registers TASK_ID
 from rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_kinematics import ground_heading_axes
-from rl_training.tasks.manager_based.locomotion.velocity.mdp.wheel_contact_kinematics import rotate_vector
+from rl_training.tasks.manager_based.locomotion.velocity.mdp.wheel_contact_kinematics import (
+    rotate_vector, wheel_center_positions, wheel_center_velocities,
+)
 
 
 def _capture_rollout_audit(raw_env) -> None:
@@ -76,12 +78,13 @@ def _capture_rollout_audit(raw_env) -> None:
     tangent /= torch.linalg.vector_norm(tangent, dim=-1).clamp_min(1.e-6)[..., None]
     forces = raw_env.scene.sensors[sensor_cfg.name].data.net_forces_w[:, sensor_cfg.body_ids]
     force_norm = torch.linalg.vector_norm(forces, dim=-1)
-    center_vel = data.body_link_lin_vel_w[:, body_ids]
+    center_pos = wheel_center_positions(robot, body_ids)
+    center_vel = wheel_center_velocities(robot, body_ids)
     rolling = (center_vel * tangent).sum(-1)
     axial_omega = (data.body_ang_vel_w[:, body_ids] * axle).sum(-1)
     qdot = data.joint_vel[:, joint_ids]
     command = raw_env.command_manager.get_command("yaw_rate_cmd")[:, 0]
-    offset = data.body_pos_w[:, body_ids] - com_pos[:, None]
+    offset = center_pos - com_pos[:, None]
     target_vec = torch.stack((-offset[..., 1], offset[..., 0], torch.zeros_like(offset[..., 0])), -1)
     target = (command[:, None, None] * target_vec * tangent).sum(-1)
     radius = params["wheel_radius"]
@@ -119,7 +122,7 @@ def _capture_rollout_audit(raw_env) -> None:
             f"{prefix}_contact": (force_norm[:, i] > params["threshold"]).float(),
             f"{prefix}_contact_force": force_norm[:, i],
         })
-        vector(f"{name}_pos", data.body_pos_w[:, body_ids[i]])
+        vector(f"{name}_pos", center_pos[:, i])
         vector(f"{name}_vel", center_vel[:, i])
         vector(f"{name}_axle", axle[:, i])
         vector(f"{name}_tangent", tangent[:, i])
@@ -176,6 +179,10 @@ def _trace_row(raw_env, step: int, dt: float, command: float, done: bool) -> dic
         row[name] = float(value[0].item())
     for name, value in getattr(raw_env, "_yaw_pos_neutral_position_metrics_current", {}).items():
         row[f"neutral_hold_{name}"] = float(value[0].item())
+    for name in ("_yaw_pos_active_base_height_deficit", "_yaw_pos_active_yaw_tracking_error", "_yaw_pos_active_com_position_drift"):
+        value = getattr(raw_env, name, None)
+        if value is not None:
+            row[name.removeprefix("_yaw_pos_")] = float(value[0].item())
     neutral = getattr(raw_env, "_yaw_pos_neutral_position_metrics_current", {})
     if neutral:
         row["neutral_hold_pass"] = float(neutral["passed"][0].item())
@@ -259,6 +266,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg) -> No
             )
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        from rl_training.tasks.manager_based.locomotion.velocity.mdp.yaw_pos_contract import validate_pos_checkpoint
+        validate_pos_checkpoint(str(checkpoint), env_cfg.yaw_pos_contract)
         runner.load(str(checkpoint))
         policy = runner.get_inference_policy(device=env.unwrapped.device)
         checkpoint_state = torch.load(checkpoint, map_location="cpu", weights_only=True)

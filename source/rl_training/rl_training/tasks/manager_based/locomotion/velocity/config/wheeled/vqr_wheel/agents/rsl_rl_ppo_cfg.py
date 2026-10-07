@@ -94,10 +94,15 @@ class VQRWheelYawFlatPPORunnerCfg(VQRWheelFlatPPORunnerCfg):
 class VQRWheelYawFlatPOSPPORunnerCfg(VQRWheelYawFlatPPORunnerCfg):
     """Fresh runs and logs dedicated to neutral/positive command conditioning."""
 
+    initial_leg_std: float = 0.5
+    initial_wheel_std: float = 0.3
+
     def __post_init__(self):
         super().__post_init__()
         self.experiment_name = "vqr_wheel_yaw_flat_pos"
         self.resume = False
+        self.max_iterations = 60000
+        self.policy.init_noise_std = self.initial_leg_std
         self.algorithm.entropy_coef = 0.0025
 
 
